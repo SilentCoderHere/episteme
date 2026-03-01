@@ -86,6 +86,7 @@ import androidx.browser.customtabs.CustomTabsIntent
 import androidx.compose.foundation.clickable
 import androidx.compose.material.icons.filled.SelectAll
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -261,20 +262,43 @@ fun CustomTopAppBar(
 }
 
 @Composable
-fun DeleteConfirmationDialog(count: Int, onConfirm: () -> Unit, onDismiss: () -> Unit, isPermanentDelete: Boolean = false) {
+fun DeleteConfirmationDialog(
+    count: Int,
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit,
+    isPermanentDelete: Boolean = false,
+    containsFolderItems: Boolean = false // New parameter
+) {
     val title = if (isPermanentDelete) "Delete File(s) Permanently" else "Remove from Recents"
+
     val text = if (isPermanentDelete) {
-        "Do you want to permanently delete $count selected file(s) from your device? This action cannot be undone."
+        if (containsFolderItems) {
+            "Warning: Some selected items are synced from a local folder. Proceeding will delete the actual files from your device storage.\n\nThis action cannot be undone."
+        } else {
+            "Do you want to permanently delete $count selected file(s) from your device? This action cannot be undone."
+        }
     } else {
         "Do you want to remove $count selected file(s) from the recent files list? It will reappear if you open it again from the library."
     }
+
     val confirmText = if (isPermanentDelete) "Delete" else "Remove"
+
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text(title) },
-        text = { Text(text) },
+        text = {
+            Text(
+                text,
+                color = if (containsFolderItems && isPermanentDelete) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        },
         confirmButton = {
-            TextButton(onClick = onConfirm) { Text(confirmText) }
+            TextButton(
+                onClick = onConfirm,
+                colors = if (containsFolderItems && isPermanentDelete) ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error) else ButtonDefaults.textButtonColors()
+            ) {
+                Text(confirmText)
+            }
         },
         dismissButton = {
             TextButton(onClick = onDismiss) { Text("Cancel") }
@@ -430,7 +454,10 @@ fun EmptyState(
     title: String,
     message: String,
     onSelectFileClick: () -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    primaryButtonText: String = "Select a File",
+    secondaryButtonText: String? = null,
+    onSecondaryClick: (() -> Unit)? = null
 ) {
     Column(
         modifier = modifier
@@ -449,7 +476,8 @@ fun EmptyState(
         Text(
             text = title,
             style = MaterialTheme.typography.headlineSmall,
-            color = MaterialTheme.colorScheme.onSurface
+            color = MaterialTheme.colorScheme.onSurface,
+            textAlign = TextAlign.Center
         )
         Spacer(modifier = Modifier.height(8.dp))
         Text(
@@ -459,7 +487,15 @@ fun EmptyState(
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
         Spacer(modifier = Modifier.height(32.dp))
-        SelectFileButton(onClick = onSelectFileClick, text = "Select a File")
+
+        SelectFileButton(onClick = onSelectFileClick, text = primaryButtonText)
+
+        if (secondaryButtonText != null && onSecondaryClick != null) {
+            Spacer(modifier = Modifier.height(16.dp))
+            OutlinedButton(onClick = onSecondaryClick) {
+                Text(secondaryButtonText)
+            }
+        }
     }
 }
 

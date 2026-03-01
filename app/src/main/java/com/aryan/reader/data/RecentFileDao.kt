@@ -17,6 +17,7 @@
  *
  * mail: epistemereader@gmail.com
  */
+// RecentFileDao.kt
 package com.aryan.reader.data
 
 import androidx.room.Dao
@@ -32,6 +33,9 @@ interface RecentFileDao {
 
     @Query("SELECT * FROM recent_files WHERE isDeleted = 0 ORDER BY timestamp DESC")
     fun getRecentFiles(): Flow<List<RecentFileEntity>>
+
+    @Query("SELECT * FROM recent_files WHERE sourceFolderUri = :sourceFolderUri AND isDeleted = 0")
+    suspend fun getFilesBySourceFolder(sourceFolderUri: String): List<RecentFileEntity>
 
     @Query("SELECT * FROM recent_files")
     suspend fun getAllFiles(): List<RecentFileEntity>
@@ -57,6 +61,12 @@ interface RecentFileDao {
     @Query("SELECT * FROM recent_files WHERE uriString = :uriString")
     suspend fun getFileByUri(uriString: String): RecentFileEntity?
 
+    @Query("DELETE FROM recent_files WHERE sourceFolderUri = :sourceFolderUri")
+    suspend fun deleteFilesBySourceFolder(sourceFolderUri: String)
+
+    @Query("SELECT * FROM recent_files WHERE bookId LIKE :prefix || '%'")
+    suspend fun getFilesWithIdPrefix(prefix: String): List<RecentFileEntity>
+
     @Query("DELETE FROM recent_files")
     suspend fun clearAll()
 
@@ -74,4 +84,7 @@ interface RecentFileDao {
 
     @Query("UPDATE recent_files SET isRecent = 0, lastModifiedTimestamp = :timestamp WHERE bookId IN (:bookIds)")
     suspend fun markAsNotRecent(bookIds: List<String>, timestamp: Long)
+
+    @Query("SELECT * FROM recent_files WHERE sourceFolderUri IS NOT NULL AND coverImagePath IS NULL AND isDeleted = 0")
+    suspend fun getFolderBooksWithoutCovers(): List<RecentFileEntity>
 }

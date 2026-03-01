@@ -17,11 +17,13 @@
  *
  * mail: epistemereader@gmail.com
  */
+// RecentFilesRepository.kt
 package com.aryan.reader.data
 
 import android.content.Context
 import android.graphics.Bitmap
 import android.net.Uri
+import androidx.core.net.toUri
 import timber.log.Timber
 import com.aryan.reader.BookImporter
 import com.aryan.reader.paginatedreader.Locator
@@ -34,7 +36,7 @@ import java.io.FileOutputStream
 
 private const val COVER_CACHE_DIR = "cover_cache"
 
-class RecentFilesRepository(context: Context) {
+class RecentFilesRepository(private val context: Context) {
 
     private val recentFileDao = AppDatabase.getDatabase(context).recentFileDao()
     private val coverCacheDir = File(context.filesDir, COVER_CACHE_DIR)
@@ -58,6 +60,10 @@ class RecentFilesRepository(context: Context) {
 
     suspend fun getFileByUri(uriString: String): RecentFileItem? = withContext(Dispatchers.IO) {
         return@withContext recentFileDao.getFileByUri(uriString)?.toRecentFileItem()
+    }
+
+    suspend fun getFilesBySourceFolder(sourceFolderUri: String): List<RecentFileItem> = withContext(Dispatchers.IO) {
+        return@withContext recentFileDao.getFilesBySourceFolder(sourceFolderUri).map { it.toRecentFileItem() }
     }
 
     suspend fun getAllFilesForSync(): List<RecentFileItem> = withContext(Dispatchers.IO) {
@@ -109,6 +115,42 @@ class RecentFilesRepository(context: Context) {
         Timber.d("Added/Updated recent file in DB: ${item.displayName}")
     }
 
+    suspend fun syncLocalMetadataToFolder(bookId: String) = withContext(Dispatchers.IO) {
+        val entity = recentFileDao.getFileByBookId(bookId) ?: return@withContext
+        val folderUriString = entity.sourceFolderUri
+
+        if (folderUriString != null) {
+            Timber.d("Syncing metadata to local folder for book: $bookId")
+
+            val metadata = FolderBookMetadata(
+                bookId = entity.bookId,
+                title = entity.title,
+                author = entity.author,
+                displayName = entity.displayName,
+                type = entity.type.name,
+                lastChapterIndex = entity.lastChapterIndex,
+                lastPage = entity.lastPage,
+                lastPositionCfi = entity.lastPositionCfi,
+                progressPercentage = entity.progressPercentage ?: 0f,
+                isRecent = entity.isRecent,
+                lastModifiedTimestamp = entity.lastModifiedTimestamp,
+                bookmarksJson = entity.bookmarks,
+                locatorBlockIndex = entity.locatorBlockIndex,
+                locatorCharOffset = entity.locatorCharOffset
+            )
+
+            LocalSyncUtils.saveMetadataToFolder(
+                context = context, // Now correctly references the property
+                sourceFolderUri = folderUriString.toUri(),
+                metadata = metadata
+            )
+        }
+    }
+
+    suspend fun deleteFilesBySourceFolder(folderUriString: String) = withContext(Dispatchers.IO) {
+        recentFileDao.deleteFilesBySourceFolder(folderUriString)
+    }
+
     suspend fun updateEpubReadingPosition(uriString: String, locator: Locator, cfiForWebView: String?, progress: Float) = withContext(Dispatchers.IO) {
         val item = recentFileDao.getFileByUri(uriString)
         if (item != null) {
@@ -124,6 +166,10 @@ class RecentFilesRepository(context: Context) {
             )
             Timber.d("Updated EPUB reading position for ${item.bookId} to Locator: $locator, Progress: $progress%")
         }
+    }
+
+    suspend fun getFolderBooksWithoutCovers(): List<RecentFileItem> = withContext(Dispatchers.IO) {
+        return@withContext recentFileDao.getFolderBooksWithoutCovers().map { it.toRecentFileItem() }
     }
 
     suspend fun updateBookmarks(bookId: String, bookmarksJson: String) = withContext(Dispatchers.IO) {
@@ -171,7 +217,11 @@ class RecentFilesRepository(context: Context) {
             Timber.d("DeleteDebug: DAO - Permanently deleting ${itemsToRemove.size} files.")
             itemsToRemove.forEach { item ->
                 item.coverImagePath?.let { deleteCachedCover(it) }
-                item.uriString?.let { bookImporter.deleteBookByUriString(it) }
+                try {
+                    item.uriString?.let { bookImporter.deleteBookByUriString(it) }
+                } catch (e: Exception) {
+                    Timber.w("DeleteDebug: Physical file deletion failed (likely already gone) for ${item.bookId}: ${e.message}")
+                }
             }
             recentFileDao.deleteFilePermanently(itemsToRemove.map { it.bookId })
             Timber.d("Permanently removed recent files from DB.")

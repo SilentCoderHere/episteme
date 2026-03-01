@@ -17,6 +17,7 @@
  *
  * mail: epistemereader@gmail.com
  */
+// MainViewModel.kt
 @file:Suppress("DEPRECATION")
 
 package com.aryan.reader
@@ -39,7 +40,10 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.work.Constraints
 import androidx.work.ExistingPeriodicWorkPolicy
+import androidx.work.ExistingWorkPolicy
+import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.PeriodicWorkRequestBuilder
+import androidx.work.WorkInfo
 import androidx.work.WorkManager
 import com.aryan.reader.data.CloudflareRepository
 import com.aryan.reader.data.CustomFontEntity
@@ -99,6 +103,8 @@ import java.util.concurrent.CancellationException
 import java.util.concurrent.TimeUnit
 
 private const val KEY_RENDER_MODE = "render_mode"
+private const val KEY_FOLDER_SYNC_ENABLED = "folder_sync_enabled"
+private const val KEY_FOLDER_MIGRATION_COMPLETED = "folder_migration_completed_v2"
 
 data class BannerMessage(val message: String, val isError: Boolean = false)
 
@@ -176,17 +182,19 @@ data class ReaderScreenState(
     val isAuthMenuExpanded: Boolean = false,
     val isProUser: Boolean = false,
     val isSyncEnabled: Boolean = false,
+    val isFolderSyncEnabled: Boolean = false,
     val bannerMessage: BannerMessage? = null,
     val deviceLimitState: DeviceLimitReachedState = DeviceLimitReachedState(),
     val isReplacingDevice: Boolean = false,
     val isRequestingDrivePermission: Boolean = false,
     val downloadingBookIds: Set<String> = emptySet(),
     val uploadingBookIds: Set<String> = emptySet(),
-    val pendingSyncUpdate: SyncUpdateInfo? = null,
     val syncedFolderUri: String? = null,
     val lastFolderScanTime: Long? = null,
     val hasUnreadFeedback: Boolean = false,
     val searchQuery: String = "",
+    val showFolderMigrationDialog: Boolean = false,
+    val isRefreshing: Boolean = false,
 )
 
 open class MainViewModel(application: Application) : AndroidViewModel(application) {
@@ -263,6 +271,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
             },
             currentUser = authRepository.getSignedInUser(),
             isSyncEnabled = prefs.getBoolean(KEY_SYNC_ENABLED, false),
+            isFolderSyncEnabled = prefs.getBoolean(KEY_FOLDER_SYNC_ENABLED, false),
             syncedFolderUri = prefs.getString(KEY_SYNCED_FOLDER_URI, null),
             lastFolderScanTime = if (prefs.contains(KEY_LAST_FOLDER_SCAN_TIME)) prefs.getLong(
                 KEY_LAST_FOLDER_SCAN_TIME,
@@ -278,10 +287,10 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
         _prefsUpdateFlow
     ) { internalState, recentFilesFromDb, _ ->
         val validContextualItems = internalState.contextualActionItems.filter { contextItem ->
-                recentFilesFromDb.any { dbItem ->
-                    dbItem.uriString == contextItem.uriString
-                }
-            }.toSet()
+            recentFilesFromDb.any { dbItem ->
+                dbItem.uriString == contextItem.uriString
+            }
+        }.toSet()
 
         if (validContextualItems.size != internalState.contextualActionItems.size) {
             Timber.d(
@@ -322,15 +331,15 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
         val shelvedBookIds = mutableSetOf<String>()
 
         val shelvesFromPrefs = shelfNames.map { shelfName ->
-                val bookIds = prefs.getStringSet(
-                    "$KEY_SHELF_CONTENT_PREFIX$shelfName", emptySet()
-                ) ?: emptySet()
-                shelvedBookIds.addAll(bookIds)
-                val booksForShelf = sortedRecentFiles.filter {
-                    it.bookId in bookIds
-                }
-                Shelf(shelfName, booksForShelf)
-            }.sortedBy { it.name }
+            val bookIds = prefs.getStringSet(
+                "$KEY_SHELF_CONTENT_PREFIX$shelfName", emptySet()
+            ) ?: emptySet()
+            shelvedBookIds.addAll(bookIds)
+            val booksForShelf = sortedRecentFiles.filter {
+                it.bookId in bookIds
+            }
+            Shelf(shelfName, booksForShelf)
+        }.sortedBy { it.name }
 
         val unshelvedBooks = sortedRecentFiles.filter { it.bookId !in shelvedBookIds }
         val allShelves = shelvesFromPrefs + Shelf("Unshelved", unshelvedBooks)
@@ -338,8 +347,8 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
         val booksAvailableForAdding =
             if (internalState.isAddingBooksToShelf && internalState.viewingShelfName != null) {
                 val currentShelfBooksUris = allShelves.find {
-                        it.name == internalState.viewingShelfName
-                    }?.books?.map { it.uriString }?.toSet() ?: emptySet()
+                    it.name == internalState.viewingShelfName
+                }?.books?.map { it.uriString }?.toSet() ?: emptySet()
 
                 when (internalState.addBooksSource) {
                     AddBooksSource.UNSHELVED -> unshelvedBooks
@@ -358,10 +367,10 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
             booksAvailableForAdding = booksAvailableForAdding
         )
     }.stateIn(
-            scope = viewModelScope,
-            started = SharingStarted.WhileSubscribed(5000),
-            initialValue = ReaderScreenState()
-        )
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5000),
+        initialValue = ReaderScreenState()
+    )
 
     fun onSearchQueryChange(newQuery: String) {
         _internalState.update { it.copy(searchQuery = newQuery) }
@@ -520,6 +529,11 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
 
         remoteConfigRepository.init()
 
+        if (_internalState.value.syncedFolderUri != null) {
+            Timber.d("App Start: Triggering local folder metadata-only sync.")
+            syncFolderMetadata()
+        }
+
         viewModelScope.launch { billingClientWrapper.initializeConnection() }
 
         viewModelScope.launch {
@@ -569,15 +583,30 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                 }
             }
         }
+        val folderUri = _internalState.value.syncedFolderUri
+        val migrationCompleted = prefs.getBoolean(KEY_FOLDER_MIGRATION_COMPLETED, false)
+
+        if (folderUri != null && !migrationCompleted) {
+            Timber.tag("FolderSync").d("First time after refactor: Showing migration dialog.")
+            _internalState.update { it.copy(showFolderMigrationDialog = true) }
+        }
+    }
+
+    fun completeFolderMigration() {
+        Timber.tag("FolderSync").d("User accepted migration. Marking completed and starting scan.")
+        prefs.edit { putBoolean(KEY_FOLDER_MIGRATION_COMPLETED, true) }
+        _internalState.update { it.copy(showFolderMigrationDialog = false) }
+
+        scanSyncedFolder()
     }
 
     private val fontsRepository = FontsRepository(appContext)
 
     val customFonts = fontsRepository.getAllFonts().stateIn(
-            scope = viewModelScope,
-            started = SharingStarted.WhileSubscribed(5000),
-            initialValue = emptyList()
-        )
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5000),
+        initialValue = emptyList()
+    )
 
     private suspend fun syncFonts(userId: String) {
         Timber.d("Starting Font Sync...")
@@ -652,12 +681,12 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
             _internalState.update { it.copy(isLoading = true) }
             val result = fontsRepository.importFont(uri)
             result.onSuccess { font ->
-                    if (uiState.value.isSyncEnabled) {
-                        uploadNewFont(font)
-                    }
-                }.onFailure {
-                    showBanner("Failed to import font: ${it.message}", isError = true)
+                if (uiState.value.isSyncEnabled) {
+                    uploadNewFont(font)
                 }
+            }.onFailure {
+                showBanner("Failed to import font: ${it.message}", isError = true)
+            }
             _internalState.update { it.copy(isLoading = false) }
         }
     }
@@ -1003,8 +1032,10 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     private fun uploadSingleBookMetadata(book: RecentFileItem) {
-        if (!uiState.value.isSyncEnabled) {
-            Timber.tag("AnnotationSync").d("Sync disabled. Skipping upload.")
+        if (!uiState.value.isSyncEnabled) return
+
+        if (book.sourceFolderUri != null) {
+            Timber.d("Skipping metadata sync for local folder book: ${book.displayName}")
             return
         }
         val currentUser = uiState.value.currentUser ?: return
@@ -1095,9 +1126,9 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                 }
 
                 val metadataToSync = book.toBookMetadata().copy(
-                        lastModifiedTimestamp = System.currentTimeMillis(),
-                        hasAnnotations = hasAnyData
-                    )
+                    lastModifiedTimestamp = System.currentTimeMillis(),
+                    hasAnnotations = hasAnyData
+                )
 
                 firestoreRepository.syncBookMetadata(currentUser.uid, metadataToSync, deviceId)
                 Timber.tag("AnnotationSync")
@@ -1184,102 +1215,24 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                 isLoading = false,
                 errorMessage = null,
                 initialLocator = null,
-                initialPageInBook = null,
-                pendingSyncUpdate = null
+                initialPageInBook = null
             )
         }
 
         bookToSync?.let {
             if (uiState.value.uploadingBookIds.contains(it.bookId)) {
-                Timber.d(
-                    "Book closed, but initial upload is still in progress. Metadata will be synced upon upload completion."
-                )
                 return
             }
-            Timber.d("Book closed, triggering metadata sync for ${it.bookId}")
-            uploadSingleBookMetadata(it)
-        }
-    }
+            if (uiState.value.isSyncEnabled) {
+                Timber.d("Book closed, triggering metadata sync for ${it.bookId}")
+                uploadSingleBookMetadata(it)
+            }
 
-    private fun syncSingleBookMetadataOnOpen(bookId: String) {
-        if (!uiState.value.isSyncEnabled) return
-        val currentUser = uiState.value.currentUser ?: return
-
-        viewModelScope.launch {
-            try {
-                val remoteBookMetadata =
-                    firestoreRepository.getBookMetadata(currentUser.uid, bookId) ?: return@launch
-                val localBook = recentFilesRepository.getFileByBookId(bookId)
-
-                val showUpdatePrompt = if (localBook == null) {
-                    true
-                } else if (remoteBookMetadata.lastModifiedTimestamp > localBook.lastModifiedTimestamp) {
-                    val remoteLocator =
-                        if (remoteBookMetadata.lastChapterIndex != null && remoteBookMetadata.locatorBlockIndex != null && remoteBookMetadata.locatorCharOffset != null) {
-                            Locator(
-                                remoteBookMetadata.lastChapterIndex,
-                                remoteBookMetadata.locatorBlockIndex,
-                                remoteBookMetadata.locatorCharOffset
-                            )
-                        } else null
-
-                    val localLocator =
-                        if (localBook.lastChapterIndex != null && localBook.locatorBlockIndex != null && localBook.locatorCharOffset != null) {
-                            Locator(
-                                localBook.lastChapterIndex,
-                                localBook.locatorBlockIndex,
-                                localBook.locatorCharOffset
-                            )
-                        } else null
-
-                    val positionChanged = when (localBook.type) {
-                        FileType.PDF -> remoteBookMetadata.lastPage != localBook.lastPage
-                        FileType.EPUB, FileType.MOBI, FileType.MD, FileType.TXT, FileType.HTML -> remoteLocator != localLocator
-                    }
-
-                    val bookmarksChanged =
-                        remoteBookMetadata.bookmarksJson != localBook.bookmarksJson
-
-                    positionChanged || bookmarksChanged
-                } else {
-                    false
+            if (it.sourceFolderUri != null) {
+                Timber.d("Book closed (Folder Linked), syncing metadata to folder: ${it.bookId}")
+                viewModelScope.launch {
+                    recentFilesRepository.syncLocalMetadataToFolder(it.bookId)
                 }
-
-                if (showUpdatePrompt) {
-                    Timber.d("Remote metadata is newer for $bookId. Proposing update to user.")
-
-                    recentFilesRepository.addRecentFile(remoteBookMetadata.toRecentFileItem())
-
-                    val locator =
-                        if (remoteBookMetadata.lastChapterIndex != null && remoteBookMetadata.locatorBlockIndex != null && remoteBookMetadata.locatorCharOffset != null) {
-                            Locator(
-                                remoteBookMetadata.lastChapterIndex,
-                                remoteBookMetadata.locatorBlockIndex,
-                                remoteBookMetadata.locatorCharOffset
-                            )
-                        } else null
-
-                    _internalState.update {
-                        it.copy(
-                            pendingSyncUpdate = SyncUpdateInfo(
-                                bookId = bookId,
-                                locator = locator,
-                                page = remoteBookMetadata.lastPage,
-                                cfi = remoteBookMetadata.lastPositionCfi,
-                                bookmarksJson = remoteBookMetadata.bookmarksJson
-                            )
-                        )
-                    }
-                } else {
-                    Timber.d(
-                        "Local metadata is up-to-date for $bookId or remote data is identical. No prompt."
-                    )
-                    if (localBook != null && remoteBookMetadata.lastModifiedTimestamp > localBook.lastModifiedTimestamp) {
-                        recentFilesRepository.addRecentFile(remoteBookMetadata.toRecentFileItem())
-                    }
-                }
-            } catch (e: Exception) {
-                Timber.e(e, "Failed to sync single book metadata on open for bookId: $bookId")
             }
         }
     }
@@ -1312,19 +1265,25 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                     folderUri, Intent.FLAG_GRANT_READ_URI_PERMISSION
                 )
                 Timber.d("Persistable URI permission taken for folder: $folderUri")
-                prefs.edit { putString(KEY_SYNCED_FOLDER_URI, folderUri.toString()) }
-                _internalState.update { it.copy(syncedFolderUri = folderUri.toString()) }
-                // Trigger an initial scan
+                prefs.edit {
+                    putString(KEY_SYNCED_FOLDER_URI, folderUri.toString())
+                    putBoolean(KEY_FOLDER_MIGRATION_COMPLETED, true)
+                }
+
+                _internalState.update { it.copy(
+                    syncedFolderUri = folderUri.toString(),
+                    showFolderMigrationDialog = false
+                ) }
+
                 scanSyncedFolder()
 
-                // Schedule periodic sync
                 val workManager = WorkManager.getInstance(appContext)
                 val constraints = Constraints.Builder().setRequiresBatteryNotLow(true).build()
 
                 val syncRequest =
                     PeriodicWorkRequestBuilder<FolderSyncWorker>(4, TimeUnit.HOURS).setConstraints(
-                            constraints
-                        ).build()
+                        constraints
+                    ).build()
 
                 workManager.enqueueUniquePeriodicWork(
                     FolderSyncWorker.WORK_NAME, ExistingPeriodicWorkPolicy.REPLACE, syncRequest
@@ -1339,20 +1298,77 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    fun syncFolderMetadata() {
+        triggerFolderSyncWorker(metadataOnly = true)
+    }
+
+    fun scanSyncedFolder() {
+        triggerFolderSyncWorker(metadataOnly = false)
+    }
+
+    private fun triggerFolderSyncWorker(metadataOnly: Boolean) {
+        @Suppress("UnusedVariable", "Unused") val folderUriString = _internalState.value.syncedFolderUri ?: return
+        Timber.tag("FolderSync").d("Requesting folder sync (metadataOnly=$metadataOnly)")
+
+        val workManager = WorkManager.getInstance(appContext)
+        val data = androidx.work.Data.Builder()
+            .putBoolean(FolderSyncWorker.KEY_METADATA_ONLY, metadataOnly)
+            .build()
+
+        val request = OneTimeWorkRequestBuilder<FolderSyncWorker>()
+            .setInputData(data)
+            .build()
+
+        workManager.enqueueUniqueWork(
+            FolderSyncWorker.WORK_NAME_ONETIME,
+            ExistingWorkPolicy.REPLACE,
+            request
+        )
+
+        viewModelScope.launch {
+            workManager.getWorkInfoByIdFlow(request.id).collect { workInfo ->
+                if (workInfo != null) {
+                    when (workInfo.state) {
+                        WorkInfo.State.RUNNING, WorkInfo.State.ENQUEUED -> {
+                            val msg = if (metadataOnly) "Folder Sync: Updating metadata..." else "Folder Sync: Scanning files..."
+                            _internalState.update { it.copy(isLoading = true, bannerMessage = BannerMessage(msg)) }
+                        }
+                        WorkInfo.State.SUCCEEDED -> {
+                            _internalState.update { it.copy(
+                                isLoading = false,
+                                isRefreshing = false,
+                                bannerMessage = BannerMessage("Folder Sync: Scan complete."),
+                                lastFolderScanTime = System.currentTimeMillis()
+                            ) }
+                        }
+                        WorkInfo.State.FAILED, WorkInfo.State.CANCELLED -> {
+                            _internalState.update { it.copy(isLoading = false, isRefreshing = false, errorMessage = "Sync failed.") } // ADD isRefreshing = false
+                        }
+                        else -> Unit
+                    }
+                }
+            }
+        }
+    }
+
     fun disconnectSyncedFolder() {
         viewModelScope.launch {
             val folderUriString = _internalState.value.syncedFolderUri
             if (folderUriString != null) {
+                Timber.tag("FolderSync").d("Disconnecting folder. Removing all associated books from DB.")
+                recentFilesRepository.deleteFilesBySourceFolder(folderUriString) // New DAO method call
+
                 try {
                     val uri = folderUriString.toUri()
                     val contentResolver = appContext.contentResolver
                     val takeFlags: Int = Intent.FLAG_GRANT_READ_URI_PERMISSION
                     contentResolver.releasePersistableUriPermission(uri, takeFlags)
-                    Timber.d("Released persistable URI permission for folder: $uri")
+                    Timber.tag("FolderSync").d("Released permission for: $uri")
                 } catch (e: Exception) {
-                    Timber.e(e, "Failed to release persistable URI permission for $folderUriString")
+                    Timber.e(e, "Failed to release permission")
                 }
             }
+
             prefs.edit {
                 remove(KEY_SYNCED_FOLDER_URI)
                 remove(KEY_LAST_FOLDER_SCAN_TIME)
@@ -1360,90 +1376,6 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
             _internalState.update { it.copy(syncedFolderUri = null, lastFolderScanTime = null) }
 
             WorkManager.getInstance(appContext).cancelUniqueWork(FolderSyncWorker.WORK_NAME)
-            Timber.d("Cancelled folder sync worker.")
-        }
-    }
-
-    fun scanSyncedFolder() {
-        val folderUriString = _internalState.value.syncedFolderUri ?: return
-        val folderUri = folderUriString.toUri()
-
-        _internalState.update {
-            it.copy(
-                isLoading = true, bannerMessage = BannerMessage("Scanning folder for new books...")
-            )
-        }
-
-        viewModelScope.launch(Dispatchers.IO) {
-            val documentTree = DocumentFile.fromTreeUri(appContext, folderUri)
-            if (documentTree == null || !documentTree.isDirectory) {
-                withContext(Dispatchers.Main) {
-                    _internalState.update {
-                        it.copy(
-                            isLoading = false,
-                            errorMessage = "Could not read the synced folder. Please select it again."
-                        )
-                    }
-                }
-                return@launch
-            }
-
-            val filesToImport = mutableListOf<DocumentFile>()
-            val fileQueue = ArrayDeque<DocumentFile>()
-            documentTree.listFiles().let { fileQueue.addAll(it) }
-
-            while (fileQueue.isNotEmpty()) {
-                val file = fileQueue.removeAt(0)
-                if (file.isDirectory) {
-                    file.listFiles().let { fileQueue.addAll(it) }
-                } else if (file.isFile) {
-                    val fileName = file.name ?: ""
-                    if (fileName.endsWith(".pdf", true) ||
-                        fileName.endsWith(".epub", true) ||
-                        fileName.endsWith(".mobi", true) ||
-                        fileName.endsWith(".azw3", true) ||
-                        fileName.endsWith(".md", true)
-                    ) {
-                        filesToImport.add(file)
-                    }
-                }
-            }
-
-            var importedCount = 0
-            for (file in filesToImport) {
-                val importResult = prepareBookForImport(file.uri)
-                if (importResult != null) {
-                    val (internalUri, bookId, type) = importResult
-                    val displayName = getFileNameFromUri(file.uri, appContext) ?: "Unknown File"
-                    addFileToRecent(
-                        internalUri,
-                        type,
-                        bookId,
-                        customDisplayName = displayName,
-                        isRecent = false,
-                        sourceFolderUri = folderUriString
-                    )
-                    importedCount++
-                }
-            }
-
-            val scanTime = System.currentTimeMillis()
-            prefs.edit { putLong(KEY_LAST_FOLDER_SCAN_TIME, scanTime) }
-
-            withContext(Dispatchers.Main) {
-                val message = if (importedCount > 0) {
-                    "Successfully imported $importedCount new book(s) from your folder."
-                } else {
-                    "No new books found to import."
-                }
-                _internalState.update {
-                    it.copy(
-                        isLoading = false,
-                        bannerMessage = BannerMessage(message),
-                        lastFolderScanTime = scanTime
-                    )
-                }
-            }
         }
     }
 
@@ -1541,10 +1473,6 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                 }
             }
         }
-    }
-
-    fun clearPendingSyncUpdate() {
-        _internalState.update { it.copy(pendingSyncUpdate = null) }
     }
 
     fun deleteAllCloudAndLocalData() {
@@ -1730,10 +1658,10 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                 _internalState.update {
                     it.copy(
                         isLoading = false, deviceLimitState = DeviceLimitReachedState(
-                        isLimitReached = true,
-                        registeredDevices = deviceItems.sortedByDescending { item ->
-                            item.lastSeen
-                        }))
+                            isLimitReached = true,
+                            registeredDevices = deviceItems.sortedByDescending { item ->
+                                item.lastSeen
+                            }))
                 }
             } ?: run {
                 showBanner("Please sign in to test device management.", isError = true)
@@ -1772,6 +1700,15 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    fun setFolderSyncEnabled(enabled: Boolean) {
+        prefs.edit { putBoolean(KEY_FOLDER_SYNC_ENABLED, enabled) }
+        _internalState.update { it.copy(isFolderSyncEnabled = enabled) }
+
+        if (enabled && uiState.value.isSyncEnabled) {
+            viewModelScope.launch { syncWithCloud(showBanner = false) }
+        }
+    }
+
     private fun syncWithCloud(showBanner: Boolean = false) = viewModelScope.launch {
         val hasPermissions = googleDriveRepository.hasDrivePermissions(appContext)
         val currentUser = _internalState.value.currentUser
@@ -1785,7 +1722,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
 
         if (showBanner) {
             _internalState.update {
-                it.copy(bannerMessage = BannerMessage("Syncing library and fonts..."))
+                it.copy(bannerMessage = BannerMessage("Cloud Sync: Checking for updates..."))
             }
         }
 
@@ -1800,7 +1737,12 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                 firestoreRepository.getAllShelves(currentUser.uid)
             }
             val localBooks = withContext(Dispatchers.IO) {
-                recentFilesRepository.getAllFilesForSync()
+                val allFiles = recentFilesRepository.getAllFilesForSync()
+                if (_internalState.value.isFolderSyncEnabled) {
+                    allFiles
+                } else {
+                    allFiles.filter { it.sourceFolderUri == null }
+                }
             }
 
             val localShelfNames = prefs.getStringSet(KEY_SHELVES, emptySet()).orEmpty()
@@ -1830,8 +1772,8 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
 
                 if (local != null && remote != null) {
                     Timber.tag("AnnotationSync").d(
-                            "Checking $bookId. LocalTS: ${local.lastModifiedTimestamp}, RemoteTS: ${remote.lastModifiedTimestamp}, RemoteHasAnn: ${remote.hasAnnotations}"
-                        )
+                        "Checking $bookId. LocalTS: ${local.lastModifiedTimestamp}, RemoteTS: ${remote.lastModifiedTimestamp}, RemoteHasAnn: ${remote.hasAnnotations}"
+                    )
                 }
 
                 when {
@@ -1988,7 +1930,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
             if (showBanner) {
                 _internalState.update {
                     it.copy(
-                        isLoading = false, bannerMessage = BannerMessage("Sync complete.")
+                        isLoading = false, bannerMessage = BannerMessage("Cloud Sync: Complete.")
                     )
                 }
             }
@@ -2087,7 +2029,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
-    private fun addFileToRecent(
+    private suspend fun addFileToRecent(
         uri: Uri,
         type: FileType,
         bookId: String,
@@ -2095,109 +2037,107 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
         customDisplayName: String? = null,
         isRecent: Boolean,
         sourceFolderUri: String? = null
-    ) {
-        viewModelScope.launch {
-            val isNewBook = withContext(Dispatchers.IO) {
-                recentFilesRepository.getFileByBookId(bookId) == null
-            }
+    ) = withContext(Dispatchers.IO) {
+        val isNewBook = withContext(Dispatchers.IO) {
+            recentFilesRepository.getFileByBookId(bookId) == null
+        }
 
-            val existingItem = recentFilesRepository.getFileByBookId(bookId)
-            val displayName = customDisplayName ?: existingItem?.displayName ?: getFileNameFromUri(
-                uri,
-                appContext
-            ) ?: "Unknown File"
+        val existingItem = recentFilesRepository.getFileByBookId(bookId)
+        val displayName = customDisplayName ?: existingItem?.displayName ?: getFileNameFromUri(
+            uri,
+            appContext
+        ) ?: "Unknown File"
 
-            var coverPath: String? = null
-            var title: String? = null
-            var author: String? = null
-            var bookForMetadata = epubBook
+        var coverPath: String? = null
+        var title: String? = null
+        var author: String? = null
+        var bookForMetadata = epubBook
 
-            if (bookForMetadata == null && (type == FileType.EPUB || type == FileType.MOBI || type == FileType.MD || type == FileType.TXT || type == FileType.HTML)) {
-                Timber.d("Parsing downloaded book for cover/metadata: $displayName")
-                try {
-                    importMutex.withLock {
-                        bookForMetadata = withContext(Dispatchers.IO) {
-                            appContext.contentResolver.openInputStream(uri)?.use { inputStream ->
-                                when (type) {
-                                    FileType.EPUB -> {
-                                        epubParser.createEpubBook(
-                                            inputStream = inputStream,
-                                            originalBookNameHint = displayName,
-                                            parseContent = false
-                                        )
-                                    }
+        if (bookForMetadata == null && (type == FileType.EPUB || type == FileType.MOBI || type == FileType.MD || type == FileType.TXT || type == FileType.HTML)) {
+            Timber.d("Parsing downloaded book for cover/metadata: $displayName")
+            try {
+                importMutex.withLock {
+                    bookForMetadata = withContext(Dispatchers.IO) {
+                        appContext.contentResolver.openInputStream(uri)?.use { inputStream ->
+                            when (type) {
+                                FileType.EPUB -> {
+                                    epubParser.createEpubBook(
+                                        inputStream = inputStream,
+                                        originalBookNameHint = displayName,
+                                        parseContent = false
+                                    )
+                                }
 
-                                    FileType.MOBI -> {
-                                        mobiParser.createMobiBook(
-                                            inputStream = inputStream, originalBookNameHint = displayName
-                                        )
-                                    }
+                                FileType.MOBI -> {
+                                    mobiParser.createMobiBook(
+                                        inputStream = inputStream, originalBookNameHint = displayName
+                                    )
+                                }
 
-                                    else -> {
-                                        singleFileImporter.importSingleFile(
-                                            inputStream,
-                                            type,
-                                            originalBookNameHint = displayName
-                                        )
-                                    }
+                                else -> {
+                                    singleFileImporter.importSingleFile(
+                                        inputStream,
+                                        type,
+                                        originalBookNameHint = displayName
+                                    )
                                 }
                             }
                         }
                     }
-                } catch (e: Exception) {
-                    Timber.e(
-                        e,
-                        "Failed to parse metadata for book: $displayName. Proceeding with basic info."
-                    )
-                    bookForMetadata = null
                 }
+            } catch (e: Exception) {
+                Timber.e(
+                    e,
+                    "Failed to parse metadata for book: $displayName. Proceeding with basic info."
+                )
+                bookForMetadata = null
+            }
+        }
+
+        val finalBookMetadata = bookForMetadata
+
+        if ((type == FileType.EPUB || type == FileType.MOBI || type == FileType.MD || type == FileType.TXT || type == FileType.HTML) && finalBookMetadata != null) {
+            title = finalBookMetadata.title.takeIf { it.isNotBlank() && it != "content" } ?: displayName
+
+            author = finalBookMetadata.author.takeIf {
+                it.isNotBlank() && !it.equals("Unknown", ignoreCase = true)
             }
 
-            val finalBookMetadata = bookForMetadata
-
-            if ((type == FileType.EPUB || type == FileType.MOBI || type == FileType.MD || type == FileType.TXT || type == FileType.HTML) && finalBookMetadata != null) {
-                title = finalBookMetadata.title.takeIf { it.isNotBlank() && it != "content" } ?: displayName
-
-                author = finalBookMetadata.author.takeIf {
-                    it.isNotBlank() && !it.equals("Unknown", ignoreCase = true)
-                }
-
-                finalBookMetadata.coverImage?.let { cover ->
-                    coverPath = recentFilesRepository.saveCoverToCache(cover, uri)
-                }
-            } else if (type == FileType.PDF) {
-                title = displayName
-                val pdfCoverGenerator = PdfCoverGenerator(appContext)
-                val coverBitmap = pdfCoverGenerator.generateCover(uri)
-                if (coverBitmap != null) {
-                    coverPath = recentFilesRepository.saveCoverToCache(coverBitmap, uri)
-                }
+            finalBookMetadata.coverImage?.let { cover ->
+                coverPath = recentFilesRepository.saveCoverToCache(cover, uri)
             }
-
-            val newLastModifiedTimestamp =
-                existingItem?.lastModifiedTimestamp ?: System.currentTimeMillis()
-
-            val newItem = RecentFileItem(
-                bookId = bookId,
-                uriString = uri.toString(),
-                type = type,
-                displayName = displayName,
-                timestamp = System.currentTimeMillis(),
-                coverImagePath = coverPath,
-                title = title,
-                author = author,
-                isAvailable = true,
-                lastModifiedTimestamp = newLastModifiedTimestamp,
-                isDeleted = false,
-                isRecent = isRecent,
-                sourceFolderUri = sourceFolderUri
-            )
-            recentFilesRepository.addRecentFile(newItem)
-            Timber.i("Added/Updated $displayName ($type) to recent files via repository.")
-
-            if (isNewBook) {
-                uploadNewBookAndMetadata(newItem)
+        } else if (type == FileType.PDF) {
+            title = displayName
+            val pdfCoverGenerator = PdfCoverGenerator(appContext)
+            val coverBitmap = pdfCoverGenerator.generateCover(uri)
+            if (coverBitmap != null) {
+                coverPath = recentFilesRepository.saveCoverToCache(coverBitmap, uri)
             }
+        }
+
+        val newLastModifiedTimestamp =
+            existingItem?.lastModifiedTimestamp ?: System.currentTimeMillis()
+
+        val newItem = RecentFileItem(
+            bookId = bookId,
+            uriString = uri.toString(),
+            type = type,
+            displayName = displayName,
+            timestamp = System.currentTimeMillis(),
+            coverImagePath = coverPath,
+            title = title,
+            author = author,
+            isAvailable = true,
+            lastModifiedTimestamp = newLastModifiedTimestamp,
+            isDeleted = false,
+            isRecent = isRecent,
+            sourceFolderUri = sourceFolderUri
+        )
+        recentFilesRepository.addRecentFile(newItem)
+        Timber.i("Added/Updated $displayName ($type) to recent files via repository.")
+
+        if (isNewBook) {
+            uploadNewBookAndMetadata(newItem)
         }
     }
 
@@ -2555,9 +2495,12 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
     ) {
         Timber.d("Saving EPUB position locally: URI=$uri, Locator=$locator")
         viewModelScope.launch {
-            recentFilesRepository.getFileByUri(uri.toString())?.let {
+            recentFilesRepository.getFileByUri(uri.toString())?.let { _ ->
                 recentFilesRepository.updateEpubReadingPosition(
-                    uri.toString(), locator, cfiForWebView, progress
+                    uriString = uri.toString(),
+                    locator = locator,
+                    cfiForWebView = cfiForWebView,
+                    progress = progress
                 )
             }
         }
@@ -2600,10 +2543,46 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
             }
             Timber.d("Saving PDF position locally: URI=$currentPdfUri, Page=$page")
             viewModelScope.launch {
-                recentFilesRepository.getFileByUri(currentPdfUri.toString())?.let {
+                recentFilesRepository.getFileByUri(currentPdfUri.toString())?.let { _ ->
                     recentFilesRepository.updatePdfReadingPosition(
-                        currentPdfUri.toString(), page, progress
+                        uriString = currentPdfUri.toString(),
+                        page = page,
+                        progress = progress
                     )
+                }
+            }
+        }
+    }
+
+    fun refreshLibrary() {
+        val syncEnabled = _internalState.value.isSyncEnabled
+        val hasFolder = _internalState.value.syncedFolderUri != null // Check for URI instead of toggle
+
+        if (!syncEnabled && !hasFolder) {
+            Timber.d("Refresh skipped: No sync methods active.")
+            _internalState.update { it.copy(isRefreshing = false) } // Ensure indicator retracts immediately
+            return
+        }
+
+        viewModelScope.launch {
+            _internalState.update { it.copy(isRefreshing = true) }
+
+            try {
+                if (syncEnabled) {
+                    syncWithCloud(showBanner = false).join()
+                }
+
+                if (hasFolder) {
+                    // This triggers the worker which we observe above to clear isRefreshing
+                    syncFolderMetadata()
+                }
+            } catch (e: Exception) {
+                Timber.e(e, "Refresh failed")
+                _internalState.update { it.copy(isRefreshing = false) }
+            } finally {
+                // If folder sync isn't running, we must close the indicator here
+                if (!hasFolder) {
+                    _internalState.update { it.copy(isRefreshing = false) }
                 }
             }
         }
@@ -2630,23 +2609,43 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
             _internalState.update { it.copy(contextualActionItems = newSelection) }
             Timber.d("New selection size: ${newSelection.size}")
         } else {
+            if (item.sourceFolderUri != null && item.uriString != null) {
+                viewModelScope.launch {
+                    val exists = try {
+                        val uri = item.uriString.toUri()
+                        DocumentFile.fromSingleUri(appContext, uri)?.exists() == true
+                    } catch (_: Exception) { false }
+
+                    if (!exists) {
+                        Timber.tag("FolderSync").i("LazyCleanup: File ${item.displayName} missing. Removing.")
+                        recentFilesRepository.deleteFilePermanently(listOf(item.bookId))
+                        showBanner("File deleted from folder. Removed from library.")
+                        return@launch
+                    }
+
+                    Timber.d("Recent file clicked (opening): ${item.displayName}")
+                    if (item.isAvailable) {
+                        item.getUri()?.let { uri ->
+                            openBook(uri, item.bookId, item.type, item.displayName)
+                        } ?: run {
+                            _internalState.update { it.copy(errorMessage = "Could not find file location.") }
+                        }
+                    } else {
+                        downloadBook(item, openWhenComplete = true)
+                    }
+                }
+                return
+            }
+
             Timber.d("Recent file clicked (opening): ${item.displayName}")
             if (item.isAvailable) {
                 item.getUri()?.let { uri ->
                     openBook(uri, item.bookId, item.type, item.displayName)
                 } ?: run {
-                    _internalState.update {
-                        it.copy(
-                            errorMessage = "Could not find file location for ${item.displayName}."
-                        )
-                    }
+                    _internalState.update { it.copy(errorMessage = "Could not find file location.") }
                     return
                 }
-                syncSingleBookMetadataOnOpen(item.bookId)
             } else {
-                Timber.w(
-                    "Clicked on a book that is not available locally: ${item.displayName}, starting download."
-                )
                 downloadBook(item, openWhenComplete = true)
             }
         }
@@ -3035,76 +3034,131 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
     fun deleteContextualItemsPermanently() {
         val itemsToRemove = _internalState.value.contextualActionItems
         if (itemsToRemove.isNotEmpty()) {
-            val canSync = uiState.value.isSyncEnabled && googleDriveRepository.hasDrivePermissions(appContext)
-
             _internalState.update { it.copy(contextualActionItems = emptySet()) }
 
             viewModelScope.launch {
-                val currentUser = uiState.value.currentUser
+                val canSync = uiState.value.isSyncEnabled && googleDriveRepository.hasDrivePermissions(appContext)
 
-                if (canSync && currentUser != null) {
-                    _internalState.update {
-                        it.copy(
-                            isLoading = true,
-                            bannerMessage = BannerMessage("Deleting from all devices...")
-                        )
-                    }
-                    try {
-                        val accessToken = googleDriveRepository.getAccessToken(appContext) ?: throw Exception("No token")
-                        val deviceId = getInstallationId()
-                        val remoteFiles = withContext(Dispatchers.IO) {
-                            googleDriveRepository.getFiles(accessToken)?.files.orEmpty()
-                                .associateBy { it.name }
+                val (folderBooks, managedBooks) = itemsToRemove.partition { it.sourceFolderUri != null }
+
+                if (folderBooks.isNotEmpty()) {
+                    Timber.d("Processing ${folderBooks.size} folder books for deletion.")
+
+                    val idsToDeleteLocally = mutableListOf<String>()
+
+                    folderBooks.forEach { item ->
+                        idsToDeleteLocally.add(item.bookId)
+                        pdfTextRepository.clearBookText(item.bookId)
+
+                        if (item.uriString != null) {
+                            try {
+                                val fileUri = item.uriString.toUri()
+                                val fileDoc = DocumentFile.fromSingleUri(appContext, fileUri)
+                                if (fileDoc != null && fileDoc.exists()) {
+                                    if (fileDoc.delete()) {
+                                        Timber.i("Physically deleted folder file: ${item.displayName}")
+                                    } else {
+                                        Timber.e("Failed to delete folder file via SAF: ${item.displayName}")
+                                    }
+                                }
+                            } catch (e: Exception) {
+                                Timber.e(e, "Error deleting physical file for ${item.bookId}")
+                            }
                         }
 
-                        for (item in itemsToRemove) {
-                            recentFilesRepository.markAsDeleted(listOf(item.bookId))
-                            pdfTextRepository.clearBookText(item.bookId)
-                            val deletedItem =
-                                recentFilesRepository.getFileByBookId(item.bookId) ?: continue
+                        // 2. Try to delete the metadata JSON (.bookId.json)
+                        if (item.sourceFolderUri != null) {
+                            try {
+                                val rootUri = item.sourceFolderUri.toUri()
+                                val rootDoc = DocumentFile.fromTreeUri(appContext, rootUri)
+                                val syncDir = rootDoc?.findFile("episteme") ?: rootDoc?.findFile(".episteme")
 
-                            firestoreRepository.syncBookMetadata(
-                                currentUser.uid, deletedItem.toBookMetadata(), deviceId
+                                if (syncDir != null) {
+                                    // Try hidden first, then legacy
+                                    val metaFile = syncDir.findFile(".${item.bookId}.json")
+                                        ?: syncDir.findFile("${item.bookId}.json")
+
+                                    metaFile?.delete()
+                                }
+                            } catch (e: Exception) {
+                                Timber.e(e, "Error deleting metadata file for ${item.bookId}")
+                            }
+                        }
+                    }
+
+                    recentFilesRepository.deleteFilePermanently(idsToDeleteLocally)
+                }
+
+                if (managedBooks.isNotEmpty()) {
+                    val currentUser = uiState.value.currentUser
+
+                    if (canSync && currentUser != null) {
+                        _internalState.update {
+                            it.copy(
+                                isLoading = true,
+                                bannerMessage = BannerMessage("Deleting from all devices...")
                             )
+                        }
+                        try {
+                            val accessToken = googleDriveRepository.getAccessToken(appContext)
+                                ?: throw Exception("No token")
+                            val deviceId = getInstallationId()
 
-                            val fileExtension = item.type.name.lowercase()
-                            val fileName = "${item.bookId}.$fileExtension"
-                            remoteFiles[fileName]?.id?.let { fileId ->
-                                Timber.d("Deleting from Drive: $fileName")
-                                googleDriveRepository.deleteDriveFile(accessToken, fileId)
+                            val remoteFiles = withContext(Dispatchers.IO) {
+                                googleDriveRepository.getFiles(accessToken)?.files.orEmpty()
+                                    .associateBy { it.name }
                             }
 
-                            recentFilesRepository.deleteFilePermanently(listOf(item.bookId))
-                        }
-                        _internalState.update {
-                            it.copy(
-                                isLoading = false,
-                                bannerMessage = BannerMessage("Deletion complete.")
-                            )
-                        }
-                    } catch (e: Exception) {
-                        Timber.e(e, "Error during permanent deletion")
+                            for (item in managedBooks) {
+                                recentFilesRepository.markAsDeleted(listOf(item.bookId))
+                                pdfTextRepository.clearBookText(item.bookId)
 
-                        recentFilesRepository.deleteFilePermanently(itemsToRemove.map { it.bookId })
-                        itemsToRemove.forEach { item ->
-                            pdfTextRepository.clearBookText(item.bookId)
-                        }
+                                firestoreRepository.syncBookMetadata(
+                                    currentUser.uid, item.toBookMetadata().copy(isDeleted = true), deviceId
+                                )
 
-                        _internalState.update {
-                            it.copy(
-                                isLoading = false,
-                                errorMessage = "Cloud sync failed, deleted locally."
-                            )
+                                val fileExtension = item.type.name.lowercase()
+                                val fileName = "${item.bookId}.$fileExtension"
+                                remoteFiles[fileName]?.id?.let { fileId ->
+                                    Timber.d("Deleting from Drive: $fileName")
+                                    googleDriveRepository.deleteDriveFile(accessToken, fileId)
+                                }
+
+                                recentFilesRepository.deleteFilePermanently(listOf(item.bookId))
+                            }
+
+                            _internalState.update {
+                                it.copy(isLoading = false, bannerMessage = BannerMessage("Deletion complete."))
+                            }
+                        } catch (e: Exception) {
+                            Timber.e(e, "Error during permanent deletion")
+                            recentFilesRepository.deleteFilePermanently(managedBooks.map { it.bookId })
+                            managedBooks.forEach { item ->
+                                pdfTextRepository.clearBookText(item.bookId)
+                            }
+                            _internalState.update {
+                                it.copy(isLoading = false, errorMessage = "Cloud sync failed, deleted locally.")
+                            }
                         }
+                    } else {
+                        recentFilesRepository.deleteFilePermanently(managedBooks.map { it.bookId })
+                        managedBooks.forEach { item -> pdfTextRepository.clearBookText(item.bookId) }
                     }
-                } else {
-                    recentFilesRepository.deleteFilePermanently(itemsToRemove.map { it.bookId })
-                    itemsToRemove.forEach { item -> pdfTextRepository.clearBookText(item.bookId) }
                 }
+
+                val totalRemoved = folderBooks.size + managedBooks.size
+                _internalState.update { it.copy(isLoading = false, bannerMessage = BannerMessage("$totalRemoved books removed from library.")) }
             }
         } else {
             Timber.w("Attempted to remove contextual items, but none were selected.")
         }
+    }
+
+    fun navigateToFolderSync() {
+        // 1. Switch MainScreen to Library Tab (Index 1)
+        setMainScreenPage(1)
+        // 2. Switch LibraryScreen to Folder Tab (Index 2)
+        setLibraryScreenPage(2)
     }
 
     override fun onCleared() {

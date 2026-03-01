@@ -17,6 +17,7 @@
  *
  * mail: epistemereader@gmail.com
  */
+// HomeScreen
 @file:Suppress("DEPRECATION")
 
 package com.aryan.reader
@@ -53,6 +54,8 @@ import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.FolderSpecial
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.MoreVert
@@ -83,6 +86,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.material3.windowsizeclass.WindowSizeClass
 import androidx.compose.material3.windowsizeclass.WindowWidthSizeClass
@@ -253,6 +257,7 @@ fun HomeScreen(
                             }
                         },
                         navController = navController,
+                        onFolderSyncToggle = viewModel::setFolderSyncEnabled
                     )
                 }) {
                 Scaffold(
@@ -271,7 +276,8 @@ fun HomeScreen(
                                         drawerState.open()
                                     }
                                 },
-                                onShowDeviceManagement = viewModel::showDeviceManagementForDebug
+                                onShowDeviceManagement = viewModel::showDeviceManagementForDebug,
+                                onFolderSyncToggle = viewModel::setFolderSyncEnabled
                             )
                         } else {
                             ContextualTopAppBar(
@@ -291,14 +297,16 @@ fun HomeScreen(
                                 if (uiState.recentFiles.isEmpty()) {
                                     EmptyState(
                                         title = "Your Library is Empty",
-                                        message = "Select a PDF, EPUB, MOBI, or AZW3 file from your device to get started.",
+                                        message = "Select a file to read, or sync a local folder to automatically import books.",
                                         onSelectFileClick = onSelectFileClick,
-                                        modifier = Modifier.weight(1f)
+                                        modifier = Modifier.weight(1f),
+                                        secondaryButtonText = "Setup Folder Sync",
+                                        onSecondaryClick = { viewModel.navigateToFolderSync() }
                                     )
                                 } else {
                                     EmptyState(
                                         title = "No Recent Files",
-                                        message = "Open a file from your library to see it here, or select a new file to add.",
+                                        message = "Open a file from your library to see it here.",
                                         onSelectFileClick = onSelectFileClick,
                                         modifier = Modifier.weight(1f)
                                     )
@@ -310,8 +318,13 @@ fun HomeScreen(
                                     onItemClick = { item -> viewModel.onRecentFileClicked(item) },
                                     onItemLongClick = { item -> viewModel.onRecentItemLongPress(item) },
                                     onSelectFileClick = onSelectFileClick,
+                                    onNavigateToFolderSync = { viewModel.navigateToFolderSync() },
                                     windowSizeClass = windowSizeClass,
-                                    downloadingBookIds = uiState.downloadingBookIds
+                                    downloadingBookIds = uiState.downloadingBookIds,
+                                    onRefresh = { viewModel.refreshLibrary() },
+                                    isRefreshing = uiState.isRefreshing,
+                                    isSyncEnabled = uiState.isSyncEnabled,
+                                    hasSyncedFolder = uiState.syncedFolderUri != null
                                 )
                             }
                         }
@@ -389,9 +402,15 @@ fun HomeScreen(
                 )
             }
         }
+        if (uiState.showFolderMigrationDialog) {
+            FolderMigrationDialog(
+                onConfirm = { viewModel.completeFolderMigration() }
+            )
+        }
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun RecentFilesContent(
     recentFiles: List<RecentFileItem>,
@@ -399,29 +418,59 @@ private fun RecentFilesContent(
     onItemClick: (RecentFileItem) -> Unit,
     onItemLongClick: (RecentFileItem) -> Unit,
     onSelectFileClick: () -> Unit,
+    onNavigateToFolderSync: () -> Unit,
     windowSizeClass: WindowSizeClass,
     downloadingBookIds: Set<String>,
+    onRefresh: () -> Unit,
+    isRefreshing: Boolean,
+    isSyncEnabled: Boolean,
+    hasSyncedFolder: Boolean
 ) {
-    Box(modifier = Modifier.fillMaxSize()) {
-        RecentFilesGrid(
-            modifier = Modifier.padding(horizontal = 16.dp),
-            recentFiles = recentFiles,
-            selectedItemUris = selectedContextItems.mapNotNull { it.uriString }.toSet(),
-            onItemClick = onItemClick,
-            onItemLongClick = onItemLongClick,
-            windowSizeClass = windowSizeClass,
-            contentPadding = PaddingValues(top = 8.dp, bottom = 88.dp),
-            downloadingBookIds = downloadingBookIds
-        )
+    val canRefresh = isSyncEnabled || hasSyncedFolder
 
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .align(Alignment.BottomCenter)
-                .padding(vertical = 24.dp), contentAlignment = Alignment.Center
-        ) {
-            SelectFileButton(onClick = onSelectFileClick, text = "Select Another File")
+    val content = @Composable {
+        Box(modifier = Modifier.fillMaxSize()) {
+            RecentFilesGrid(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(horizontal = 16.dp),
+                recentFiles = recentFiles,
+                selectedItemUris = selectedContextItems.mapNotNull { it.uriString }.toSet(),
+                onItemClick = onItemClick,
+                onItemLongClick = onItemLongClick,
+                windowSizeClass = windowSizeClass,
+                contentPadding = PaddingValues(top = 8.dp, bottom = 100.dp),
+                downloadingBookIds = downloadingBookIds
+            )
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = 24.dp),
+                horizontalArrangement = Arrangement.spacedBy(16.dp, Alignment.CenterHorizontally),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                androidx.compose.material3.Button(onClick = onSelectFileClick) {
+                    Text("Select File")
+                }
+                androidx.compose.material3.OutlinedButton(onClick = onNavigateToFolderSync) {
+                    Text("Sync Folder")
+                }
+            }
         }
+    }
+
+    if (canRefresh) {
+        PullToRefreshBox(
+            isRefreshing = isRefreshing,
+            onRefresh = onRefresh,
+            modifier = Modifier.fillMaxSize()
+        ) {
+            content()
+        }
+    } else {
+        content()
     }
 }
 
@@ -509,6 +558,26 @@ fun RecentFileCard(
                         .fillMaxWidth(),
                 )
 
+                if (item.sourceFolderUri != null) {
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.TopEnd)
+                            .padding(8.dp)
+                            .background(
+                                color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.9f),
+                                shape = CircleShape
+                            )
+                            .padding(4.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Folder,
+                            contentDescription = "Local Folder",
+                            modifier = Modifier.size(16.dp),
+                            tint = MaterialTheme.colorScheme.onSecondaryContainer
+                        )
+                    }
+                }
+
                 if (!item.isAvailable) {
                     Box(
                         modifier = Modifier
@@ -576,7 +645,8 @@ fun DefaultTopAppBar(
     onClearCloudData: () -> Unit,
     onDrawerClick: () -> Unit,
     onAboutClick: () -> Unit,
-    onShowDeviceManagement: () -> Unit
+    onShowDeviceManagement: () -> Unit,
+    onFolderSyncToggle: (Boolean) -> Unit
 ) {
     var showOptionsMenu by remember { mutableStateOf(false) }
 
@@ -636,7 +706,8 @@ private fun AppDrawerContent(
     onUpgradeClick: () -> Unit,
     onSyncUpsellClick: () -> Unit,
     onFontsClick: () -> Unit,
-    navController: NavHostController
+    navController: NavHostController,
+    onFolderSyncToggle: (Boolean) -> Unit
 ) {
     val isOss = BuildConfig.FLAVOR == "oss"
 
@@ -682,10 +753,10 @@ private fun AppDrawerContent(
                     Spacer(modifier = Modifier.height(8.dp))
                     NavigationDrawerItem(
                         icon = {
-                        Icon(
-                            Icons.Outlined.AccountCircle, contentDescription = "Sign In"
-                        )
-                    },
+                            Icon(
+                                Icons.Outlined.AccountCircle, contentDescription = "Sign In"
+                            )
+                        },
                         label = { Text("Sign in with Google") },
                         selected = false,
                         onClick = onSignInClick,
@@ -705,10 +776,10 @@ private fun AppDrawerContent(
 
                 NavigationDrawerItem(
                     icon = {
-                    Icon(
-                        Icons.Default.VerifiedUser, contentDescription = "Episteme Pro"
-                    )
-                },
+                        Icon(
+                            Icons.Default.VerifiedUser, contentDescription = "Episteme Pro"
+                        )
+                    },
                     label = {
                         val text =
                             if (uiState.isProUser) "Episteme Pro" else "Upgrade to Episteme Pro"
@@ -723,34 +794,63 @@ private fun AppDrawerContent(
                 if (uiState.currentUser != null) {
                     NavigationDrawerItem(
                         icon = {
-                        Icon(
-                            painter = painterResource(id = R.drawable.sync),
-                            contentDescription = "Sync Library"
-                        )
-                    }, label = { Text("Sync Library") }, badge = {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            if (!uiState.isProUser) {
-                                Icon(
-                                    imageVector = Icons.Default.VerifiedUser,
-                                    contentDescription = "Pro Feature",
-                                    modifier = Modifier.size(20.dp),
-                                    tint = MaterialTheme.colorScheme.primary
-                                )
-                                Spacer(modifier = Modifier.width(8.dp))
-                            }
-                            Switch(
-                                checked = uiState.isSyncEnabled, onCheckedChange = {
-                                    if (uiState.isProUser) onSyncToggle(it) else onSyncUpsellClick()
-                                }, enabled = uiState.isProUser
+                            Icon(
+                                painter = painterResource(id = R.drawable.sync),
+                                contentDescription = "Sync Library"
                             )
-                        }
-                    }, selected = false, onClick = {
-                        if (uiState.isProUser) {
-                            onSyncToggle(!uiState.isSyncEnabled)
-                        } else {
-                            onSyncUpsellClick()
-                        }
-                    }, modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)
+                        }, label = { Text("Sync Library") }, badge = {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                if (!uiState.isProUser) {
+                                    Icon(
+                                        imageVector = Icons.Default.VerifiedUser,
+                                        contentDescription = "Pro Feature",
+                                        modifier = Modifier.size(20.dp),
+                                        tint = MaterialTheme.colorScheme.primary
+                                    )
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                }
+                                Switch(
+                                    checked = uiState.isSyncEnabled, onCheckedChange = {
+                                        if (uiState.isProUser) onSyncToggle(it) else onSyncUpsellClick()
+                                    }, enabled = uiState.isProUser
+                                )
+                            }
+                        }, selected = false, onClick = {
+                            if (uiState.isProUser) {
+                                onSyncToggle(!uiState.isSyncEnabled)
+                            } else {
+                                onSyncUpsellClick()
+                            }
+                        }, modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)
+                    )
+                }
+                if (uiState.currentUser != null && uiState.isSyncEnabled) {
+                    NavigationDrawerItem(
+                        icon = {
+                            Icon(
+                                imageVector = Icons.Default.FolderSpecial,
+                                contentDescription = "Backup Local Folders"
+                            )
+                        },
+                        label = {
+                            Column {
+                                Text("Cloud sync for Local Folders")
+                                Text(
+                                    "Upload books from your synced folders to Google Drive).",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        },
+                        badge = {
+                            Switch(
+                                checked = uiState.isFolderSyncEnabled,
+                                onCheckedChange = { onFolderSyncToggle(it) }
+                            )
+                        },
+                        selected = false,
+                        onClick = { onFolderSyncToggle(!uiState.isFolderSyncEnabled) },
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)
                     )
                 }
             } else {
@@ -774,11 +874,11 @@ private fun AppDrawerContent(
 
             NavigationDrawerItem(
                 icon = {
-                Icon(
-                    painter = painterResource(id = R.drawable.fonts),
-                    contentDescription = "Custom Fonts"
-                )
-            },
+                    Icon(
+                        painter = painterResource(id = R.drawable.fonts),
+                        contentDescription = "Custom Fonts"
+                    )
+                },
                 label = { Text("Custom Fonts") },
                 selected = false,
                 onClick = onFontsClick,
@@ -788,11 +888,11 @@ private fun AppDrawerContent(
             if (!isOss) {
                 NavigationDrawerItem(
                     icon = {
-                    Icon(
-                        painter = painterResource(id = R.drawable.feedback),
-                        contentDescription = "Feedback"
-                    )
-                },
+                        Icon(
+                            painter = painterResource(id = R.drawable.feedback),
+                            contentDescription = "Feedback"
+                        )
+                    },
                     label = { Text("Help & Feedback") },
                     badge = {
                         if (uiState.hasUnreadFeedback) {
@@ -807,11 +907,11 @@ private fun AppDrawerContent(
                 if (uiState.currentUser != null) {
                     NavigationDrawerItem(
                         icon = {
-                        Icon(
-                            painter = painterResource(id = R.drawable.logout),
-                            contentDescription = "Sign Out"
-                        )
-                    },
+                            Icon(
+                                painter = painterResource(id = R.drawable.logout),
+                                contentDescription = "Sign Out"
+                            )
+                        },
                         label = { Text("Sign Out") },
                         selected = false,
                         onClick = onSignOutClick,
@@ -1034,5 +1134,32 @@ fun FpsMonitor(modifier: Modifier = Modifier) {
         modifier = modifier
             .background(Color.Black.copy(alpha = 0.5f))
             .padding(4.dp)
+    )
+}
+
+@Composable
+private fun FolderMigrationDialog(onConfirm: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = { }, // Force acknowledgment
+        icon = { Icon(Icons.Default.FolderSpecial, contentDescription = null) },
+        title = { Text("Folder Sync Refactored") },
+        text = {
+            Column {
+                Text(
+                    "We've completely rebuilt how Folder Sync works! Books from the folder are now read directly from your folder instead of being copied to app storage."
+                )
+                Spacer(modifier = Modifier.height(12.dp))
+                Text(
+                    "We'll now perform a one-time scan to migrate your existing progress and bookmarks. This will also free up internal storage space on your device.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onConfirm) {
+                Text("Start Migration")
+            }
+        }
     )
 }
