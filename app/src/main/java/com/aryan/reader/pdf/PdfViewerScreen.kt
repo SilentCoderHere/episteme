@@ -27,11 +27,7 @@ import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.Context
 import android.content.pm.PackageManager
-import androidx.compose.foundation.gestures.awaitEachGesture
-import androidx.compose.foundation.gestures.awaitFirstDown
-import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import android.graphics.Bitmap
-import kotlin.math.max
 import android.graphics.RectF
 import android.net.Uri
 import android.os.Build
@@ -59,8 +55,11 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
+import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -137,10 +136,8 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
-import androidx.compose.material3.SnackbarDuration
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
-import androidx.compose.material3.SnackbarResult
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
@@ -286,6 +283,7 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
+import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
 import kotlin.random.Random
@@ -1843,26 +1841,6 @@ fun PdfViewerScreen(
             verticalReaderState.currentPage
         }
         onToggleBookmark(currentPage)
-    }
-
-    LaunchedEffect(reflowInfo) {
-        if (reflowInfo?.state == WorkInfo.State.SUCCEEDED &&
-            reflowInfo?.tags?.contains("book_$bookId") == true) {
-
-            val result = snackbarHostState.showSnackbar(
-                message = "Text View generation complete!",
-                actionLabel = "OPEN",
-                duration = SnackbarDuration.Long
-            )
-
-            if (result == SnackbarResult.ActionPerformed) {
-                snackbarHostState.currentSnackbarData?.dismiss()
-                val item = uiState.recentFiles.find { it.bookId == reflowBookId }
-                if (item != null) {
-                    viewModel.onRecentFileClicked(item)
-                }
-            }
-        }
     }
 
     LaunchedEffect(pdfUri) { debugPdfLinks(context, pdfUri, pdfiumCore, this) }
@@ -4979,13 +4957,14 @@ fun PdfViewerScreen(
                                                 if (hasReflowFile) {
                                                     val item = uiState.recentFiles.find { it.bookId == reflowBookId }
                                                     if (item != null) {
-                                                        viewModel.onRecentFileClicked(item)
+                                                        viewModel.switchToFileSeamlessly(item, currentPage)
                                                     }
                                                 } else {
                                                     viewModel.generateAndImportReflowFile(
                                                         pdfBookId = bookId,
                                                         pdfUri = pdfUri,
-                                                        originalTitle = originalFileName
+                                                        originalTitle = originalFileName,
+                                                        autoOpenPage = currentPage
                                                     )
                                                 }
                                             },

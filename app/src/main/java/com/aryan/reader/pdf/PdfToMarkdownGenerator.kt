@@ -3,11 +3,9 @@ package com.aryan.reader.pdf
 
 import android.content.Context
 import android.net.Uri
-import com.tom_roush.pdfbox.io.MemoryUsageSetting
-import com.tom_roush.pdfbox.pdmodel.PDDocument
-import com.tom_roush.pdfbox.pdmodel.PDPage
-import com.tom_roush.pdfbox.text.PDFTextStripper
-import com.tom_roush.pdfbox.text.TextPosition
+import io.legere.pdfiumandroid.PdfiumCore
+import io.legere.pdfiumandroid.suspend.PdfiumCoreKt
+import io.legere.pdfiumandroid.suspend.PdfDocumentKt
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import timber.log.Timber
@@ -15,8 +13,6 @@ import java.io.File
 import kotlin.math.roundToInt
 
 object PdfToMarkdownGenerator {
-
-    // Unique delimiter to split pages reliably
     const val PAGE_DELIMITER = "\n\n[[PAGE_BREAK]]\n\n"
 
     suspend fun generateMarkdownFile(
@@ -26,109 +22,252 @@ object PdfToMarkdownGenerator {
         startPage: Int = 1,
         onProgress: (Float) -> Unit
     ): Boolean = withContext(Dispatchers.IO) {
+        val methodStartTime = System.currentTimeMillis()
+        Timber.tag("PdfToMdPerf").d("generateMarkdownFile NATIVE START | uri=$pdfUri | startPage=$startPage")
+
+        val pdfiumCore = PdfiumCoreKt(Dispatchers.Default)
+        val pfd = context.contentResolver.openFileDescriptor(pdfUri, "r")
+        if (pfd == null) {
+            Timber.tag("PdfToMdPerf").e("Failed to open ParcelFileDescriptor")
+            return@withContext false
+        }
+
         try {
-            context.contentResolver.openInputStream(pdfUri)?.use { inputStream ->
-                // Setup mixed memory usage to handle larger files without OOM
-                PDDocument.load(inputStream, MemoryUsageSetting.setupMixed(50 * 1024 * 1024)).use { doc ->
-                    val totalPages = doc.numberOfPages
+            val doc = pdfiumCore.newDocument(pfd)
+            val totalPages = doc.getPageCount()
+            Timber.tag("PdfToMdPerf").d("Document loaded natively. Total Pages: $totalPages")
 
-                    // Configure stripper for linear processing
-                    val stripper = MarkdownStripper(totalPages, onProgress)
-                    stripper.startPage = startPage
-                    stripper.endPage = totalPages
+            destFile.bufferedWriter().use { writer ->
+                for (pageIdx in (startPage - 1) until totalPages) {
+                    val pageMd = extractPageMarkdown(doc, pageIdx)
+                    writer.write(pageMd)
+                    writer.write(PAGE_DELIMITER)
 
-                    // Write directly to file stream (O(N) complexity)
-                    destFile.bufferedWriter().use { writer ->
-                        stripper.writeText(doc, writer)
+                    if (pageIdx % 5 == 0 || pageIdx == totalPages - 1) {
+                        onProgress((pageIdx + 1).toFloat() / totalPages.toFloat())
                     }
                 }
             }
+
+            doc.close()
+            pfd.close()
+
+            Timber.tag("PdfToMdPerf").d("generateMarkdownFile NATIVE SUCCESS | totalTime=${System.currentTimeMillis() - methodStartTime}ms")
             return@withContext true
         } catch (e: Exception) {
-            Timber.e(e, "Failed to generate Markdown from PDF")
+            Timber.e(e, "Failed to generate Markdown from PDF natively")
+            pfd.close()
             return@withContext false
         }
     }
 
-    private class MarkdownStripper(
-        private val totalPages: Int,
-        private val onProgress: (Float) -> Unit
-    ) : PDFTextStripper() {
-        private var currentPageBaseFontSize = 0f
+    private suspend fun extractPageMarkdown(doc: PdfDocumentKt, pageIdx: Int): String {
+        return try {
+            doc.openPage(pageIdx).use { page ->
+                page.openTextPage().use { textPage ->
+                    val charCount = textPage.textPageCountChars()
+                    if (charCount <= 0) return@use ""
 
-        init {
-            sortByPosition = true
-            suppressDuplicateOverlappingText = true
-            paragraphStart = ""
-            paragraphEnd = "\n\n"
-        }
+                    val text = textPage.textPageGetText(0, charCount) ?: ""
+                    val actualCount = minOf(charCount, text.length)
 
-        // Override endPage to update progress and insert delimiter
-        override fun endPage(page: PDPage?) {
-            super.endPage(page)
+                    val rawPtr = textPage.page.pagePtr
 
-            try {
-                // Insert our custom delimiter so importer can split chapters
-                output.write(PAGE_DELIMITER)
+                    val sizes: FloatArray?
+                    val weights: IntArray?
+                    val flags: IntArray?
 
-                // Update progress
-                val current = currentPageNo // inherited from PDFTextStripper
-                if (totalPages > 0) {
-                    onProgress(current.toFloat() / totalPages.toFloat())
+                    synchronized(PdfiumCore.lock) {
+                        sizes = NativePdfiumBridge.getPageFontSizes(rawPtr, actualCount)
+                        weights = NativePdfiumBridge.getPageFontWeights(rawPtr, actualCount)
+                        flags = NativePdfiumBridge.getPageFontFlags(rawPtr, actualCount)
+                    }
+
+                    if (sizes == null || weights == null || flags == null) {
+                        return@use text
+                    }
+
+                    buildMarkdown(text, sizes, weights, flags, actualCount)
                 }
-            } catch (e: Exception) {
-                Timber.e(e, "Error writing page delimiter")
+            }
+        } catch (e: Exception) {
+            Timber.w(e, "Error extracting page $pageIdx")
+            ""
+        }
+    }
+
+    private data class TextSpan(
+        val text: String,
+        val size: Float,
+        val isBold: Boolean,
+        val isItalic: Boolean
+    )
+
+    private data class TextLine(
+        val spans: List<TextSpan>
+    )
+
+    private fun fixKerning(text: String): String {
+        val pattern = Regex("\\b(?:[A-Za-z0-9] ){2,}[A-Za-z0-9]\\b")
+        return pattern.replace(text) { matchResult ->
+            matchResult.value.replace(" ", "")
+        }
+    }
+
+    private fun buildMarkdown(text: String, sizes: FloatArray, weights: IntArray, flags: IntArray, count: Int): String {
+        if (count == 0) return ""
+
+        val sizeFrequency = HashMap<Int, Int>()
+        for (i in 0 until count) {
+            val s = sizes[i].roundToInt()
+            sizeFrequency[s] = (sizeFrequency[s] ?: 0) + 1
+        }
+        val baseSize = sizeFrequency.maxByOrNull { it.value }?.key ?: 12
+
+        val lines = mutableListOf<TextLine>()
+        @Suppress("CanBeVal") var currentSpans = mutableListOf<TextSpan>()
+        val currentSpanText = StringBuilder()
+
+        var currentSize = -1f
+        var currentBold = false
+        var currentItalic = false
+
+        for (i in 0 until count) {
+            val c = text[i]
+            if (c == '\u0000') continue
+
+            if (c == '\n' || c == '\r') {
+                if (c == '\n' && i > 0 && text[i - 1] == '\r') continue
+
+                if (currentSpanText.isNotEmpty()) {
+                    currentSpans.add(TextSpan(currentSpanText.toString(), currentSize, currentBold, currentItalic))
+                    currentSpanText.clear()
+                }
+                lines.add(TextLine(currentSpans.toList()))
+                currentSpans.clear()
+                continue
+            }
+
+            val isSpace = c.isWhitespace()
+            val size = sizes[i]
+            val bold = weights[i] > 600
+            val italic = (flags[i] and 64) != 0
+
+            if (currentSpanText.isEmpty()) {
+                currentSize = size
+                currentBold = bold
+                currentItalic = italic
+                currentSpanText.append(c)
+            } else {
+                if (!isSpace && (currentSize != size || currentBold != bold || currentItalic != italic)) {
+                    currentSpans.add(TextSpan(currentSpanText.toString(), currentSize, currentBold, currentItalic))
+                    currentSpanText.clear()
+                    currentSize = size
+                    currentBold = bold
+                    currentItalic = italic
+                }
+                currentSpanText.append(c)
             }
         }
 
-        override fun startPage(page: PDPage?) {
-            currentPageBaseFontSize = 0f
-            super.startPage(page)
+        if (currentSpanText.isNotEmpty()) {
+            currentSpans.add(TextSpan(currentSpanText.toString(), currentSize, currentBold, currentItalic))
+        }
+        if (currentSpans.isNotEmpty()) {
+            lines.add(TextLine(currentSpans))
         }
 
-        private fun calculateBaseFontSize(textPositions: List<TextPosition>) {
-            val sizeCounts = mutableMapOf<Float, Int>()
-            textPositions.forEach { pos ->
-                val size = pos.fontSizeInPt.roundToInt().toFloat()
-                sizeCounts[size] = (sizeCounts[size] ?: 0) + 1
+        val validLines = lines.filter { it.spans.isNotEmpty() }
+        val lineLengths = validLines.map { line -> line.spans.sumOf { it.text.length } }.filter { it > 10 }.sorted()
+
+        val typicalLineLen = if (lineLengths.isNotEmpty()) {
+            lineLengths[(lineLengths.size * 0.8).toInt().coerceAtMost(lineLengths.size - 1)]
+        } else {
+            80
+        }
+
+        val wrapThreshold = (typicalLineLen * 0.85).toInt()
+
+        val sb = StringBuilder()
+
+        for (i in lines.indices) {
+            val line = lines[i]
+            if (line.spans.isEmpty()) {
+                sb.append("\n")
+                continue
             }
-            currentPageBaseFontSize = sizeCounts.maxByOrNull { it.value }?.key ?: 12f
-        }
 
-        override fun writeString(text: String?, textPositions: MutableList<TextPosition>?) {
-            if (text.isNullOrBlank() || textPositions.isNullOrEmpty()) return
+            val maxFontSize = line.spans.filter { it.text.isNotBlank() }.maxOfOrNull { it.size } ?: baseSize.toFloat()
+            val charBigHeader = maxFontSize > baseSize * 1.5f
+            val charHeader = maxFontSize > baseSize * 1.2f
 
-            if (currentPageBaseFontSize == 0f) {
-                calculateBaseFontSize(textPositions)
+            var prefix = ""
+            if (charBigHeader) prefix = "## "
+            else if (charHeader) prefix = "### "
+
+            val rawLineText = line.spans.joinToString("") { it.text }
+            val trimmedRaw = rawLineText.trim()
+            val lineLen = trimmedRaw.length
+
+            val isList = trimmedRaw.startsWith("•") ||
+                    trimmedRaw.startsWith("- ") ||
+                    trimmedRaw.startsWith("▪") ||
+                    trimmedRaw.matches(Regex("^[0-9]+\\.\\s.*")) ||
+                    trimmedRaw.matches(Regex("^[a-zA-Z]\\)\\s.*"))
+
+            if (prefix.isNotEmpty() && !isList) {
+                sb.append(prefix)
             }
 
-            val firstPos = textPositions[0]
-            val fontSize = firstPos.fontSizeInPt
-            val fontDescriptor = firstPos.font?.fontDescriptor
+            for (span in line.spans) {
+                var spanText = span.text
+                spanText = fixKerning(spanText)
 
-            val isBold = fontDescriptor?.isForceBold == true ||
-                    (firstPos.font?.name?.contains("Bold", ignoreCase = true) == true)
-            val isItalic = fontDescriptor?.isItalic == true ||
-                    (firstPos.font?.name?.contains("Italic", ignoreCase = true) == true)
+                val leadingSpaces = spanText.takeWhile { it.isWhitespace() }
+                val trailingSpaces = spanText.takeLastWhile { it.isWhitespace() }
+                val trimmedText = spanText.trim()
 
-            // Header detection logic
-            val isHeader = fontSize > currentPageBaseFontSize * 1.2
-            val isBigHeader = fontSize > currentPageBaseFontSize * 1.5
+                if (trimmedText.isEmpty()) {
+                    sb.append(spanText)
+                    continue
+                }
 
-            val sb = StringBuilder()
+                sb.append(leadingSpaces)
 
-            if (isBigHeader) sb.append("## ")
-            else if (isHeader) sb.append("### ")
+                var tag = ""
+                if (span.isBold && span.isItalic) tag = "***"
+                else if (span.isBold) tag = "**"
+                else if (span.isItalic) tag = "*"
 
-            if (isBold && !isHeader) sb.append("**")
-            if (isItalic) sb.append("*")
+                sb.append(tag).append(trimmedText).append(tag)
+                sb.append(trailingSpaces)
+            }
 
-            text.forEach { char -> sb.append(char) }
+            var isParagraphBreak = false
 
-            if (isItalic) sb.append("*")
-            if (isBold && !isHeader) sb.append("**")
+            if (prefix.isNotEmpty() || isList) {
+                isParagraphBreak = true
+            } else if (lineLen < wrapThreshold) {
+                isParagraphBreak = true
+            } else if (trimmedRaw.matches(Regex(".*[.!?\"'”’;:*]$"))) {
+                isParagraphBreak = true
+            } else {
+                val nextLine = lines.subList(i + 1, lines.size).firstOrNull { it.spans.isNotEmpty() }
+                if (nextLine != null) {
+                    val nextRaw = nextLine.spans.joinToString("") { it.text }.trimStart()
+                    if (nextRaw.startsWith("\"") || nextRaw.startsWith("“") || nextRaw.startsWith("-")) {
+                        isParagraphBreak = true
+                    }
+                }
+            }
 
-            writeString(sb.toString())
+            if (isParagraphBreak) {
+                sb.append("\n\n")
+            } else {
+                sb.append("\n")
+            }
         }
+
+        return sb.toString().replace(Regex("\\n{3,}"), "\n\n").trim()
     }
 }
