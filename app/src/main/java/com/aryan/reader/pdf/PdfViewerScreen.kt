@@ -201,6 +201,7 @@ import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.text.AnnotatedString
@@ -244,6 +245,7 @@ import com.aryan.reader.R
 import com.aryan.reader.SearchResult
 import com.aryan.reader.SearchTopBar
 import com.aryan.reader.SummarizationPopup
+import com.aryan.reader.TooltipIconButton
 import com.aryan.reader.SummarizationResult
 import com.aryan.reader.TtsSettingsSheet
 import com.aryan.reader.countWords
@@ -322,6 +324,8 @@ private const val PDF_FULL_SCREEN_PREFIX = "pdf_fs_local_"
 private const val PDF_MUSICIAN_MODE_KEY = "pdf_musician_mode_enabled"
 private const val PREF_USE_ONLINE_DICT = "use_online_dictionary"
 private const val PREF_EXTERNAL_DICT_PKG = "external_dictionary_package"
+private const val PREF_EXTERNAL_TRANSLATE_PKG = "external_translate_package"
+private const val PREF_EXTERNAL_SEARCH_PKG = "external_search_package"
 
 private fun loadUseOnlineDict(context: Context): Boolean {
     @Suppress("KotlinConstantConditions") if (BuildConfig.FLAVOR == "oss") return false
@@ -342,6 +346,26 @@ private fun loadExternalDictPackage(context: Context): String? {
 private fun saveExternalDictPackage(context: Context, packageName: String) {
     val prefs = context.getSharedPreferences(SETTINGS_PREFS_NAME, Context.MODE_PRIVATE)
     prefs.edit { putString(PREF_EXTERNAL_DICT_PKG, packageName) }
+}
+
+private fun loadExternalTranslatePackage(context: Context): String? {
+    val prefs = context.getSharedPreferences(SETTINGS_PREFS_NAME, Context.MODE_PRIVATE)
+    return prefs.getString(PREF_EXTERNAL_TRANSLATE_PKG, null)
+}
+
+private fun saveExternalTranslatePackage(context: Context, packageName: String) {
+    val prefs = context.getSharedPreferences(SETTINGS_PREFS_NAME, Context.MODE_PRIVATE)
+    prefs.edit { putString(PREF_EXTERNAL_TRANSLATE_PKG, packageName) }
+}
+
+private fun loadExternalSearchPackage(context: Context): String? {
+    val prefs = context.getSharedPreferences(SETTINGS_PREFS_NAME, Context.MODE_PRIVATE)
+    return prefs.getString(PREF_EXTERNAL_SEARCH_PKG, null)
+}
+
+private fun saveExternalSearchPackage(context: Context, packageName: String) {
+    val prefs = context.getSharedPreferences(SETTINGS_PREFS_NAME, Context.MODE_PRIVATE)
+    prefs.edit { putString(PREF_EXTERNAL_SEARCH_PKG, packageName) }
 }
 
 private fun savePdfMusicianMode(context: Context, isEnabled: Boolean) {
@@ -780,6 +804,8 @@ fun PdfViewerScreen(
     var showDictionarySettingsSheet by remember { mutableStateOf(false) }
     var useOnlineDictionary by remember { mutableStateOf(loadUseOnlineDict(context)) }
     var selectedDictPackage by remember { mutableStateOf(loadExternalDictPackage(context)) }
+    var selectedTranslatePackage by remember { mutableStateOf(loadExternalTranslatePackage(context)) }
+    var selectedSearchPackage by remember { mutableStateOf(loadExternalSearchPackage(context)) }
 
     var showDeviceVoiceSettingsSheet by remember { mutableStateOf(false) }
 
@@ -1127,7 +1153,7 @@ fun PdfViewerScreen(
                 withContext(NonCancellable) {
                     saveMutex.withLock {
                         withContext(Dispatchers.IO) {
-                            var didSave = false
+                            @Suppress("VariableNeverRead") var didSave = false
 
                             if (force || annotsHash != lastSavedHashes[0]) {
                                 annotationRepository.saveAnnotations(bookId, annots)
@@ -2131,13 +2157,35 @@ fun PdfViewerScreen(
                         showDictionaryUpsellDialog = true
                     }
                 } else {
-                    if (selectedDictPackage != null) {
+                    if (!selectedDictPackage.isNullOrEmpty()) {
                         ExternalDictionaryHelper.launchDictionary(context, selectedDictPackage!!, text)
                     } else {
                         Toast.makeText(context, "Please select a dictionary app first.", Toast.LENGTH_SHORT).show()
                         showDictionarySettingsSheet = true
                     }
                 }
+            }
+        }
+    }
+
+    val onTranslateTextStable = remember(selectedTranslatePackage) {
+        { text: String ->
+            if (!selectedTranslatePackage.isNullOrEmpty()) {
+                ExternalDictionaryHelper.launchTranslate(context, selectedTranslatePackage!!, text)
+            } else {
+                Toast.makeText(context, "Please select a translate app first.", Toast.LENGTH_SHORT).show()
+                showDictionarySettingsSheet = true
+            }
+        }
+    }
+
+    val onSearchTextStable = remember(selectedSearchPackage) {
+        { text: String ->
+            if (!selectedSearchPackage.isNullOrEmpty()) {
+                ExternalDictionaryHelper.launchSearch(context, selectedSearchPackage!!, text)
+            } else {
+                Toast.makeText(context, "Please select a search app first.", Toast.LENGTH_SHORT).show()
+                showDictionarySettingsSheet = true
             }
         }
     }
@@ -3874,6 +3922,8 @@ fun PdfViewerScreen(
                                                     }
                                                 },
                                                 onWordSelectedForAiDefinition = onDictionaryLookupStable,
+                                                onTranslateText = onTranslateTextStable,
+                                                onSearchText = onSearchTextStable,
                                                 onOcrStateChange = onOcrStateChange,
                                                 onLinkClicked = { url -> clickedLinkUrl = url },
                                                 onInternalLinkClicked = onInternalLinkNav,
@@ -4244,6 +4294,8 @@ fun PdfViewerScreen(
                                             isProUser = isProUser,
                                             onShowDictionaryUpsellDialog = onShowDictionaryUpsellDialogStable,
                                             onWordSelectedForAiDefinition = onDictionaryLookupStable,
+                                            onTranslateText = onTranslateTextStable,
+                                            onSearchText = onSearchTextStable,
                                             ttsHighlightData = ttsHighlightData,
                                             ttsReadingPage = ttsPageData?.pageIndex,
                                             userHighlights = userHighlights,
@@ -4774,7 +4826,11 @@ fun PdfViewerScreen(
                                         focusManager.clearFocus()
                                     })
                             } else {
-                                IconButton(onClick = { saveStateAndExit() }) {
+                                TooltipIconButton(
+                                    text = stringResource(R.string.tooltip_back),
+                                    description = stringResource(R.string.tooltip_back_desc),
+                                    onClick = { saveStateAndExit() }
+                                ) {
                                     Icon(
                                         imageVector = Icons.AutoMirrored.Filled.ArrowBack,
                                         contentDescription = "Back"
@@ -4804,7 +4860,17 @@ fun PdfViewerScreen(
                                         .testTag("PageNumberIndicator")
                                 )
 
-                                IconButton(onClick = { isPdfDarkMode = !isPdfDarkMode }) {
+                                TooltipIconButton(
+                                    text = if (isPdfDarkMode)
+                                        stringResource(R.string.tooltip_dark_mode_off)
+                                    else
+                                        stringResource(R.string.tooltip_dark_mode_on),
+                                    description = if (isPdfDarkMode)
+                                        stringResource(R.string.tooltip_dark_mode_off_desc)
+                                    else
+                                        stringResource(R.string.tooltip_dark_mode_on_desc),
+                                    onClick = { isPdfDarkMode = !isPdfDarkMode }
+                                ) {
                                     Icon(
                                         painter = painterResource(id = R.drawable.dark_mode),
                                         contentDescription = if (isPdfDarkMode) "Disable Dark Mode"
@@ -4814,10 +4880,20 @@ fun PdfViewerScreen(
                                     )
                                 }
 
-                                IconButton(onClick = {
-                                    isScrollLocked = !isScrollLocked
-                                    savePdfScrollLocked(context, bookId, isScrollLocked)
-                                }) {
+                                TooltipIconButton(
+                                    text = if (isScrollLocked)
+                                        stringResource(R.string.tooltip_unlock_pan)
+                                    else
+                                        stringResource(R.string.tooltip_lock_pan),
+                                    description = if (isScrollLocked)
+                                        stringResource(R.string.tooltip_unlock_pan_desc)
+                                    else
+                                        stringResource(R.string.tooltip_lock_pan_desc),
+                                    onClick = {
+                                        isScrollLocked = !isScrollLocked
+                                        savePdfScrollLocked(context, bookId, isScrollLocked)
+                                    }
+                                ) {
                                     Icon(
                                         imageVector = if (isScrollLocked) Icons.Default.Lock else Icons.Default.LockOpen,
                                         contentDescription = if (isScrollLocked) "Unlock Panning" else "Lock Panning",
@@ -4825,10 +4901,14 @@ fun PdfViewerScreen(
                                     )
                                 }
 
-                                IconButton(onClick = {
-                                    isFullScreen = true
-                                    savePdfFullScreen(context, bookId, true)
-                                }) {
+                                TooltipIconButton(
+                                    text = stringResource(R.string.tooltip_fullscreen),
+                                    description = stringResource(R.string.tooltip_fullscreen_desc),
+                                    onClick = {
+                                        isFullScreen = true
+                                        savePdfFullScreen(context, bookId, true)
+                                    }
+                                ) {
                                     Icon(
                                         imageVector = Icons.Default.Fullscreen,
                                         contentDescription = "Enter Full Screen",
@@ -4836,7 +4916,11 @@ fun PdfViewerScreen(
                                     )
                                 }
 
-                                IconButton(onClick = { showDictionarySettingsSheet = true }) {
+                                TooltipIconButton(
+                                    text = stringResource(R.string.tooltip_dictionary),
+                                    description = stringResource(R.string.tooltip_dictionary_desc),
+                                    onClick = { showDictionarySettingsSheet = true }
+                                ) {
                                     Icon(
                                         painter = painterResource(id = R.drawable.dictionary),
                                         contentDescription = "Dictionary Settings",
@@ -4845,7 +4929,7 @@ fun PdfViewerScreen(
                                 }
 
                                 if (BuildConfig.DEBUG) {
-                                    IconButton(onClick = { showPenPlayground = true }) {
+                                    TooltipIconButton(text = "Pen Playground", onClick = { showPenPlayground = true }) {
                                         Icon(
                                             imageVector = Icons.Default.Star,
                                             contentDescription = "Open Pen Playground",
@@ -4853,7 +4937,7 @@ fun PdfViewerScreen(
                                         )
                                     }
 
-                                    IconButton(onClick = {
+                                    TooltipIconButton(text = "Import SVG", onClick = {
                                         val page = if (displayMode == DisplayMode.PAGINATION) pagerState.currentPage else verticalReaderState.currentPage
 
                                         coroutineScope.launch(Dispatchers.IO) {
@@ -4890,7 +4974,11 @@ fun PdfViewerScreen(
 
                                 Box {
                                     var showMoreMenu by remember { mutableStateOf(false) }
-                                    IconButton(onClick = { showMoreMenu = true }) {
+                                    TooltipIconButton(
+                                        text = stringResource(R.string.tooltip_more_options),
+                                        description = stringResource(R.string.tooltip_more_options_desc),
+                                        onClick = { showMoreMenu = true }
+                                    ) {
                                         Icon(
                                             imageVector = Icons.Default.MoreVert,
                                             contentDescription = "More Options"
@@ -5350,7 +5438,9 @@ fun PdfViewerScreen(
                             horizontalArrangement = Arrangement.SpaceAround
                         ) {
                             // Slider Navigation Trigger
-                            IconButton(
+                            TooltipIconButton(
+                                text = stringResource(R.string.tooltip_slider),
+                                description = stringResource(R.string.tooltip_slider_desc),
                                 onClick = {
                                     val currentPage = if (displayMode == DisplayMode.PAGINATION) {
                                         pagerState.currentPage
@@ -5369,7 +5459,9 @@ fun PdfViewerScreen(
                                 )
                             }
 
-                            IconButton(
+                            TooltipIconButton(
+                                text = stringResource(R.string.tooltip_toc),
+                                description = stringResource(R.string.tooltip_toc_desc),
                                 onClick = { coroutineScope.launch { drawerState.open() } },
                                 enabled = !(ttsState.isPlaying || ttsState.isLoading),
                                 modifier = Modifier.testTag("TocButton")
@@ -5381,7 +5473,9 @@ fun PdfViewerScreen(
                             }
 
                             // Search Button
-                            IconButton(
+                            TooltipIconButton(
+                                text = stringResource(R.string.tooltip_search),
+                                description = stringResource(R.string.tooltip_search_desc),
                                 onClick = {
                                     executeWithOcrCheck {
                                         searchState.isSearchActive = true
@@ -5397,11 +5491,19 @@ fun PdfViewerScreen(
                                 )
                             }
 
-                            IconButton(
+                            TooltipIconButton(
+                                text = if (showAllTextHighlights)
+                                    stringResource(R.string.tooltip_highlights_off)
+                                else
+                                    stringResource(R.string.tooltip_highlights),
+                                description = if (showAllTextHighlights)
+                                    stringResource(R.string.tooltip_highlights_off_desc)
+                                else
+                                    stringResource(R.string.tooltip_highlights_desc),
                                 onClick = {
                                     val newState = !showAllTextHighlights
                                     if (newState) {
-                                        if (isHighlightingLoading) return@IconButton
+                                        if (isHighlightingLoading) return@TooltipIconButton
                                         showAllTextHighlights = true
                                         isHighlightingLoading = true
                                     } else {
@@ -5424,7 +5526,11 @@ fun PdfViewerScreen(
                             // AI feat
                             Box {
                                 var showAiFeaturesMenu by remember { mutableStateOf(false) }
-                                IconButton(onClick = { showAiFeaturesMenu = true }) {
+                                TooltipIconButton(
+                                    text = stringResource(R.string.tooltip_ai),
+                                    description = stringResource(R.string.tooltip_ai_desc),
+                                    onClick = { showAiFeaturesMenu = true }
+                                ) {
                                     Icon(
                                         painter = painterResource(id = R.drawable.ai),
                                         contentDescription = "AI Features"
@@ -5458,7 +5564,15 @@ fun PdfViewerScreen(
                             }
 
                             // Edit Button
-                            IconButton(
+                            TooltipIconButton(
+                                text = if (isEditMode)
+                                    stringResource(R.string.tooltip_edit_mode_exit)
+                                else
+                                    stringResource(R.string.tooltip_edit_mode),
+                                description = if (isEditMode)
+                                    stringResource(R.string.tooltip_edit_mode_exit_desc)
+                                else
+                                    stringResource(R.string.tooltip_edit_mode_desc),
                                 onClick = {
                                     val newEditMode = !isEditMode
                                     val currentActivePage = richTextController?.activePageIndex ?: -1
@@ -5486,7 +5600,15 @@ fun PdfViewerScreen(
                             }
 
                             // TTS
-                            IconButton(
+                            TooltipIconButton(
+                                text = if (isTtsSessionActive)
+                                    stringResource(R.string.tooltip_tts_stop)
+                                else
+                                    stringResource(R.string.tooltip_tts_start),
+                                description = if (isTtsSessionActive)
+                                    stringResource(R.string.tooltip_tts_stop_desc)
+                                else
+                                    stringResource(R.string.tooltip_tts_start_desc),
                                 onClick = {
                                     if (isTtsSessionActive) {
                                         Timber.d("TTS button clicked: Stopping TTS")
@@ -5526,7 +5648,15 @@ fun PdfViewerScreen(
 
                             // TTS Pause/Resume Button
                             if (isTtsSessionActive) {
-                                IconButton(
+                                TooltipIconButton(
+                                    text = if (ttsState.isPlaying)
+                                        stringResource(R.string.tooltip_tts_pause)
+                                    else
+                                        stringResource(R.string.tooltip_tts_resume),
+                                    description = if (ttsState.isPlaying)
+                                        stringResource(R.string.tooltip_tts_pause_desc)
+                                    else
+                                        stringResource(R.string.tooltip_tts_resume_desc),
                                     onClick = {
                                         if (ttsState.isPlaying) {
                                             ttsController.pause()
@@ -6264,7 +6394,7 @@ fun PdfViewerScreen(
                         isMainTtsActive = isTtsSessionActive,
                         onOpenExternalDictionary = {
                             selectedTextForAi?.let { text ->
-                                if (selectedDictPackage != null) {
+                                if (!selectedDictPackage.isNullOrEmpty()) {
                                     ExternalDictionaryHelper.launchDictionary(context, selectedDictPackage!!, text)
                                 } else {
                                     Toast.makeText(context, "Select an offline dictionary first.", Toast.LENGTH_SHORT).show()
@@ -6413,10 +6543,20 @@ fun PdfViewerScreen(
                             useOnlineDictionary = newState
                             saveUseOnlineDict(context, newState)
                         },
-                        selectedPackageName = selectedDictPackage,
-                        onSelectPackage = { pkg ->
+                        selectedDictionaryPackageName = selectedDictPackage,
+                        onSelectDictionaryPackage = { pkg ->
                             selectedDictPackage = pkg
                             saveExternalDictPackage(context, pkg)
+                        },
+                        selectedTranslatePackageName = selectedTranslatePackage,
+                        onSelectTranslatePackage = { pkg ->
+                            selectedTranslatePackage = pkg
+                            saveExternalTranslatePackage(context, pkg)
+                        },
+                        selectedSearchPackageName = selectedSearchPackage,
+                        onSelectSearchPackage = { pkg ->
+                            selectedSearchPackage = pkg
+                            saveExternalSearchPackage(context, pkg)
                         }
                     )
                 }
