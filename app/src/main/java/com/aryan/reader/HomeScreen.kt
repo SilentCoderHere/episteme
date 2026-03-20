@@ -54,8 +54,10 @@ import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.FolderSpecial
+import androidx.compose.material.icons.filled.FormatListNumbered
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.MoreVert
@@ -157,6 +159,8 @@ fun HomeScreen(
         var showUpgradeDialog by remember { mutableStateOf(false) }
         var showSignOutConfirmDialog by remember { mutableStateOf(false) }
         var showAboutDialog by remember { mutableStateOf(false) }
+        var showInfoDialog by remember { mutableStateOf(false) }
+        var itemForInfoDialog by remember { mutableStateOf<RecentFileItem?>(null) }
 
         var showClearBookCacheDialog by remember { mutableStateOf(false) }
         var showClearReflowCacheDialog by remember { mutableStateOf(false) }
@@ -304,12 +308,19 @@ fun HomeScreen(
                                 },
                                 onShowDeviceManagement = viewModel::showDeviceManagementForDebug,
                                 onFolderSyncToggle = viewModel::setFolderSyncEnabled,
-                                onClearReflowCache = { showClearReflowCacheDialog = true }
+                                onClearReflowCache = { showClearReflowCacheDialog = true },
+                                onRecentFilesLimitChange = viewModel::setRecentFilesLimit
                             )
                         } else {
                             ContextualTopAppBar(
                                 selectedItemCount = selectedContextItems.size,
                                 onNavIconClick = { viewModel.clearContextualAction() },
+                                onInfoClick = {
+                                    if (selectedContextItems.size == 1) {
+                                        itemForInfoDialog = selectedContextItems.first()
+                                        showInfoDialog = true
+                                    }
+                                },
                                 onPinClick = { viewModel.togglePinForContextualItems(isHome = true) },
                                 onDeleteClick = { showDeleteConfirmDialog = true },
                                 onSelectAllClick = { viewModel.selectAllRecentFiles() })
@@ -405,6 +416,21 @@ fun HomeScreen(
                             },
                             onDismiss = { showClearBookCacheDialog = false }
                         )
+                    }
+
+                    itemForInfoDialog?.let { item ->
+                        if (showInfoDialog) {
+                            FileInfoDialog(
+                                item = item,
+                                onDismiss = {
+                                    showInfoDialog = false
+                                    itemForInfoDialog = null
+                                },
+                                onUpdateName = { newName ->
+                                    viewModel.updateCustomName(item.bookId, newName)
+                                }
+                            )
+                        }
                     }
 
                     if (showClearReflowCacheDialog) {
@@ -680,7 +706,7 @@ fun RecentFileCard(
                 verticalArrangement = Arrangement.Center
             ) {
                 Text(
-                    text = if ((item.type == FileType.EPUB || item.type == FileType.MOBI) && !item.title.isNullOrBlank()) {
+                    text = item.customName ?: if ((item.type == FileType.EPUB || item.type == FileType.MOBI) && !item.title.isNullOrBlank()) {
                         item.title
                     } else {
                         item.displayName
@@ -719,9 +745,11 @@ fun DefaultTopAppBar(
     onDrawerClick: () -> Unit,
     onAboutClick: () -> Unit,
     onShowDeviceManagement: () -> Unit,
-    onFolderSyncToggle: (Boolean) -> Unit
+    onFolderSyncToggle: (Boolean) -> Unit,
+    onRecentFilesLimitChange: (Int) -> Unit
 ) {
     var showOptionsMenu by remember { mutableStateOf(false) }
+    var showLimitMenu by remember { mutableStateOf(false) }
 
     CustomTopAppBar(title = { }, navigationIcon = {
         IconButton(onClick = onDrawerClick) {
@@ -735,6 +763,30 @@ fun DefaultTopAppBar(
             }
         }
     }, actions = {
+        // Recent Files Limit Menu
+        Box {
+            IconButton(onClick = { showLimitMenu = true }) {
+                Icon(Icons.Default.FormatListNumbered, contentDescription = "Recent Files Limit")
+            }
+            DropdownMenu(
+                expanded = showLimitMenu, onDismissRequest = { showLimitMenu = false }
+            ) {
+                val limitOptions = listOf(0, 10, 20, 50, 100)
+                limitOptions.forEach { limit ->
+                    DropdownMenuItem(
+                        text = { Text(if (limit == 0) "No limit" else "$limit files") },
+                        onClick = {
+                            onRecentFilesLimitChange(limit)
+                            showLimitMenu = false
+                        },
+                        trailingIcon = if (uiState.recentFilesLimit == limit) {
+                            { Icon(Icons.Default.Check, contentDescription = "Selected") }
+                        } else null
+                    )
+                }
+            }
+        }
+
         // Options Menu (MoreVert)
         Box {
             IconButton(onClick = { showOptionsMenu = true }) {
@@ -964,25 +1016,20 @@ private fun AppDrawerContent(
                 modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)
             )
 
-            if (!isOss) {
-                NavigationDrawerItem(
-                    icon = {
-                        Icon(
-                            painter = painterResource(id = R.drawable.feedback),
-                            contentDescription = "Feedback"
-                        )
-                    },
-                    label = { Text("Help & Feedback") },
-                    badge = {
-                        if (uiState.hasUnreadFeedback) {
-                            Badge()
-                        }
-                    },
-                    selected = false,
-                    onClick = { navController.navigate("feedback_screen_route") },
-                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)
-                )
+            NavigationDrawerItem(
+                icon = {
+                    Icon(
+                        painter = painterResource(id = R.drawable.feedback),
+                        contentDescription = "Feedback"
+                    )
+                },
+                label = { Text("Help & Feedback") },
+                selected = false,
+                onClick = { navController.navigate("feedback_screen_route") },
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)
+            )
 
+            if (!isOss) {
                 if (uiState.currentUser != null) {
                     NavigationDrawerItem(
                         icon = {
