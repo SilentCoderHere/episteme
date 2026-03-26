@@ -206,6 +206,17 @@ private const val AUTO_SCROLL_LOCAL_SPEED_PREFIX = "auto_scroll_local_speed_"
 private const val AUTO_SCROLL_LOCAL_MIN_PREFIX = "auto_scroll_local_min_"
 private const val AUTO_SCROLL_LOCAL_MAX_PREFIX = "auto_scroll_local_max_"
 private const val MUSICIAN_MODE_KEY = "musician_mode_enabled"
+private const val KEEP_SCREEN_ON_KEY = "keep_screen_on_enabled"
+
+private fun saveKeepScreenOn(context: Context, isEnabled: Boolean) {
+    val prefs = context.getSharedPreferences("reader_prefs", Context.MODE_PRIVATE)
+    prefs.edit { putBoolean(KEEP_SCREEN_ON_KEY, isEnabled) }
+}
+
+private fun loadKeepScreenOn(context: Context): Boolean {
+    val prefs = context.getSharedPreferences("reader_prefs", Context.MODE_PRIVATE)
+    return prefs.getBoolean(KEEP_SCREEN_ON_KEY, false)
+}
 
 private fun saveMusicianMode(context: Context, isEnabled: Boolean) {
     val prefs = context.getSharedPreferences("reader_prefs", Context.MODE_PRIVATE)
@@ -385,10 +396,16 @@ fun EpubReaderScreen(
         initialLocator = initialLocator,
         initialCfi = initialCfi,
         initialBookmarksJson = initialBookmarksJson,
+        initialHighlightsJson = uiState.initialHighlightsJson,
         isProUser = isProUser,
         onNavigateBack = onNavigateBack,
         onSavePosition = onSavePosition,
         onBookmarksChanged = onBookmarksChanged,
+        onHighlightsChanged = { json ->
+            uiState.selectedBookId?.let { id ->
+                viewModel.saveHighlights(id, json)
+            }
+        },
         onNavigateToPro = onNavigateToPro,
         coverImagePath = coverImagePath,
         onRenderModeChange = onRenderModeChange,
@@ -419,10 +436,12 @@ fun EpubReaderHost(
     initialLocator: Locator?,
     initialCfi: String?,
     initialBookmarksJson: String?,
+    initialHighlightsJson: String?,
     isProUser: Boolean,
     onNavigateBack: () -> Unit,
     onSavePosition: (locator: Locator, cfiForWebView: String?, progress: Float) -> Unit,
     onBookmarksChanged: (bookmarksJson: String) -> Unit,
+    onHighlightsChanged: (highlightsJson: String) -> Unit,
     onNavigateToPro: () -> Unit,
     coverImagePath: String?,
     onRenderModeChange: (RenderMode) -> Unit,
@@ -479,9 +498,22 @@ fun EpubReaderHost(
         )
     }
 
-    val userHighlights = remember {
+    val userHighlights = remember(epubBook.title) {
         mutableStateListOf<UserHighlight>().apply {
-            addAll(loadHighlightsFromPrefs(context, epubBook.title))
+            if (initialHighlightsJson != null) {
+                addAll(parseHighlightsJson(initialHighlightsJson))
+            } else {
+                addAll(loadHighlightsFromPrefs(context, epubBook.title))
+            }
+        }
+    }
+
+    LaunchedEffect(userHighlights.size, userHighlights.toList()) {
+        val json = highlightsToJson(userHighlights)
+        onHighlightsChanged(json)
+
+        if (initialHighlightsJson == null && userHighlights.isNotEmpty()) {
+            clearHighlightsFromPrefs(context, epubBook.title)
         }
     }
 
@@ -584,10 +616,6 @@ fun EpubReaderHost(
             currentHighlightPalette = newList
             saveHighlightPalette(context, newList)
         }
-    }
-
-    LaunchedEffect(userHighlights.size, userHighlights.toList()) {
-        saveHighlightsToPrefs(context, epubBook.title, userHighlights)
     }
 
     // Dictionary
@@ -735,6 +763,7 @@ fun EpubReaderHost(
 
     var searchHighlightTarget by remember { mutableStateOf<SearchResult?>(null) }
     var lastHighlightClickTime by remember { mutableLongStateOf(0L) }
+    var lastScrollHideTime by remember { mutableLongStateOf(0L) }
 
     var webViewRefForTts by remember { mutableStateOf<WebView?>(null) }
 
@@ -932,6 +961,15 @@ fun EpubReaderHost(
     var isMusicianMode by remember { mutableStateOf(loadMusicianMode(context)) }
     var autoScrollUseSlider by remember { mutableStateOf(loadAutoScrollUseSlider(context)) }
 
+    var isKeepScreenOn by remember { mutableStateOf(loadKeepScreenOn(context)) }
+
+    DisposableEffect(isKeepScreenOn) {
+        view.keepScreenOn = isKeepScreenOn
+        onDispose {
+            view.keepScreenOn = false
+        }
+    }
+
     DisposableEffect(Unit) {
         onDispose {
             Timber.d("Disposing sample MediaPlayer.")
@@ -997,6 +1035,15 @@ fun EpubReaderHost(
         } else activeTheme.textColor
     }
     val activeTextureId = activeTheme.textureId
+
+    val infoBarBgColor = remember(effectiveBg, isDarkTheme) {
+        val overlayAlpha = if (isDarkTheme) 0.08f else 0.06f
+        val overlayColor = if (isDarkTheme) Color.White else Color.Black
+        val outR = overlayColor.red * overlayAlpha + effectiveBg.red * (1 - overlayAlpha)
+        val outG = overlayColor.green * overlayAlpha + effectiveBg.green * (1 - overlayAlpha)
+        val outB = overlayColor.blue * overlayAlpha + effectiveBg.blue * (1 - overlayAlpha)
+        Color(outR, outG, outB).copy(alpha = 0.95f)
+    }
 
     val currentChapterInPaginatedMode by remember {
         derivedStateOf {
@@ -2201,20 +2248,26 @@ fun EpubReaderHost(
                                                     if (volumeScrollEnabled && !searchState.isSearchActive) {
                                                         containerFocusRequester.requestFocus()
                                                     }
-                                                    if (showBars || showFormatAdjustmentBars) {
-                                                        showBars = false
-                                                        showFormatAdjustmentBars = false
-                                                        Timber.d("Chapter tapped, hiding all bars.")
+
+                                                    if (System.currentTimeMillis() - lastScrollHideTime < 250) {
+                                                        Timber.d("Ignoring tap toggle because bars were just hidden by scroll (sloppy tap).")
                                                     } else {
-                                                        showBars = true
-                                                        Timber.d("Chapter tapped, showing main bars.")
+                                                        if (showBars || showFormatAdjustmentBars) {
+                                                            showBars = false
+                                                            showFormatAdjustmentBars = false
+                                                            Timber.d("Chapter tapped, hiding all bars.")
+                                                        } else {
+                                                            showBars = true
+                                                            Timber.d("Chapter tapped, showing main bars.")
+                                                        }
                                                     }
                                                 }
                                             },
                                             onPotentialScroll = {
-                                                if (showBars) {
+                                                if (showBars || showFormatAdjustmentBars) {
                                                     showBars = false
                                                     showFormatAdjustmentBars = false
+                                                    lastScrollHideTime = System.currentTimeMillis() // Added
                                                     Timber.d("Scroll/Drag detected, hiding bars.")
                                                 }
                                                 if (isAutoScrollModeActive && isAutoScrollPlaying) {
@@ -2947,7 +3000,7 @@ fun EpubReaderHost(
                         modifier = Modifier
                             .fillMaxWidth()
                             .height(PAGE_INFO_BAR_HEIGHT)
-                            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.85f))
+                            .background(infoBarBgColor)
                             .padding(bottom = bottomPadding)
                             .padding(horizontal = 16.dp),
                         contentAlignment = Alignment.Center
@@ -2958,7 +3011,7 @@ fun EpubReaderHost(
                         Text(
                             text = "$chapterTitle ($currentPageInChapter/$totalPagesInCurrentChapter)",
                             style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            color = effectiveText.copy(alpha = 0.8f),
                             textAlign = TextAlign.Center,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
@@ -2971,7 +3024,7 @@ fun EpubReaderHost(
                             Text(
                                 text = "%.1f%%".format(currentBookProgress),
                                 style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                color = effectiveText.copy(alpha = 0.8f),
                                 textAlign = TextAlign.End,
                                 modifier = Modifier.align(Alignment.CenterEnd)
                             )
@@ -2990,7 +3043,7 @@ fun EpubReaderHost(
                         modifier = Modifier
                             .fillMaxWidth()
                             .height(PAGE_INFO_BAR_HEIGHT)
-                            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.85f))
+                            .background(infoBarBgColor)
                             .padding(bottom = bottomPadding)
                             .padding(horizontal = 16.dp),
                         contentAlignment = Alignment.Center
@@ -3019,7 +3072,7 @@ fun EpubReaderHost(
                         Text(
                             text = textToShow,
                             style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            color = effectiveText.copy(alpha = 0.8f),
                             textAlign = TextAlign.Center,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
@@ -3053,7 +3106,7 @@ fun EpubReaderHost(
                                 Text(
                                     text = "%.1f%%".format(displayProgress),
                                     style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    color = effectiveText.copy(alpha = 0.8f),
                                     textAlign = TextAlign.End,
                                     modifier = Modifier.align(Alignment.CenterEnd)
                                 )
@@ -3068,7 +3121,7 @@ fun EpubReaderHost(
                                 Text(
                                     text = "%.1f%%".format(percentage),
                                     style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    color = effectiveText.copy(alpha = 0.8f),
                                     textAlign = TextAlign.End,
                                     modifier = Modifier.align(Alignment.CenterEnd)
                                 )
@@ -3283,6 +3336,11 @@ fun EpubReaderHost(
                     volumeScrollEnabled = volumeScrollEnabled,
                     isPageTurnAnimationEnabled = isPageTurnAnimationEnabled,
                     onNavigateBack = { triggerSaveAndExit() },
+                    isKeepScreenOn = isKeepScreenOn,
+                    onToggleKeepScreenOn = { enabled ->
+                        isKeepScreenOn = enabled
+                        saveKeepScreenOn(context, enabled)
+                    },
                     onCloseSearch = {
                         searchState.isSearchActive = false
                         searchState.onQueryChange("")

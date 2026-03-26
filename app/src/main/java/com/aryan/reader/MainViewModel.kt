@@ -192,6 +192,7 @@ data class ReaderScreenState(
     val initialLocator: Locator? = null,
     val initialCfi: String? = null,
     val initialBookmarksJson: String? = null,
+    val initialHighlightsJson: String? = null,
     val initialPageInBook: Int? = null,
     val shelves: List<Shelf> = emptyList(),
     val viewingShelfName: String? = null,
@@ -225,6 +226,7 @@ data class ReaderScreenState(
     val reflowProgress: Float? = null,
     val recentFiles: List<RecentFileItem> = emptyList(),
     val allRecentFiles: List<RecentFileItem> = emptyList(),
+    val rawLibraryFiles: List<RecentFileItem> = emptyList(),
     val pinnedHomeBookIds: Set<String> = emptySet(),
     val pinnedLibraryBookIds: Set<String> = emptySet(),
     val libraryFilters: LibraryFilters = LibraryFilters(),
@@ -421,6 +423,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
         internalState.copy(
             recentFiles = visibleRecentFiles,
             allRecentFiles = sortedLibraryFiles,
+            rawLibraryFiles = baseVisibleFiles,
             contextualActionItems = validContextualItems,
             shelves = allShelves,
             booksAvailableForAdding = booksAvailableForAdding
@@ -2565,6 +2568,19 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    fun saveHighlights(bookId: String, highlightsJson: String) {
+        viewModelScope.launch {
+            val currentBookUri = _internalState.value.selectedPdfUri ?: _internalState.value.selectedEpubUri
+            if (currentBookUri != null) {
+                recentFilesRepository.getFileByUri(currentBookUri.toString())?.let { item ->
+                    recentFilesRepository.updateHighlights(item.bookId, highlightsJson)
+                }
+            } else if (bookId.isNotBlank()) {
+                recentFilesRepository.updateHighlights(bookId, highlightsJson)
+            }
+        }
+    }
+
     val reflowWorkInfo: Flow<WorkInfo?> =
         WorkManager.getInstance(appContext).getWorkInfosByTagFlow(ReflowWorker.WORK_NAME)
             .map { list ->
@@ -2646,6 +2662,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                             ),
                             initialCfi = null,
                             initialBookmarksJson = item.bookmarksJson,
+                            initialHighlightsJson = item.highlightsJson,
                             isLoading = false
                         )
                     }
@@ -2847,7 +2864,8 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                             selectedEpubUri = uri,
                             initialLocator = locator,
                             initialCfi = recentItem?.lastPositionCfi,
-                            initialBookmarksJson = recentItem?.bookmarksJson
+                            initialBookmarksJson = recentItem?.bookmarksJson,
+                            initialHighlightsJson = recentItem?.highlightsJson,
                         )
                     }
 
