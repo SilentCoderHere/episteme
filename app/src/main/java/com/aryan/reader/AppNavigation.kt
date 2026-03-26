@@ -73,7 +73,7 @@ fun AppNavigation(
     LaunchedEffect(uiState.selectedFileType, uiState.isLoading, uiState.selectedEpubBook, uiState.selectedPdfUri) {
         if (!uiState.isLoading) {
             when (uiState.selectedFileType) {
-                FileType.PDF -> {
+                FileType.PDF, FileType.CBZ, FileType.CBR, FileType.CB7 -> {
                     if (uiState.selectedPdfUri != null) {
                         if (navController.currentDestination?.route != AppDestinations.PDF_VIEWER_ROUTE) {
                             navController.navigate(AppDestinations.PDF_VIEWER_ROUTE) {
@@ -82,7 +82,7 @@ fun AppNavigation(
                         }
                     }
                 }
-                FileType.EPUB, FileType.MOBI, FileType.MD, FileType.TXT, FileType.HTML -> {
+                FileType.EPUB, FileType.MOBI, FileType.MD, FileType.TXT, FileType.HTML, FileType.FB2 -> {
                     if (uiState.selectedEpubBook != null) {
                         if (navController.currentDestination?.route != AppDestinations.EPUB_READER_ROUTE) {
                             navController.navigate(AppDestinations.EPUB_READER_ROUTE) {

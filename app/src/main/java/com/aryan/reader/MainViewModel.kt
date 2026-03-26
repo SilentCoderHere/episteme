@@ -111,6 +111,7 @@ import java.util.Date
 import java.util.UUID
 import java.util.concurrent.CancellationException
 import java.util.concurrent.TimeUnit
+import androidx.core.graphics.createBitmap
 
 private const val KEY_RENDER_MODE = "render_mode"
 private const val KEY_FOLDER_SYNC_ENABLED = "folder_sync_enabled"
@@ -134,7 +135,7 @@ enum class AddBooksSource(val displayName: String) {
 }
 
 enum class FileType {
-    PDF, EPUB, MOBI, MD, TXT, HTML
+    PDF, EPUB, MOBI, MD, TXT, HTML, FB2, CBZ, CBR, CB7
 }
 
 enum class RenderMode {
@@ -239,6 +240,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
     private val bookCacheDao = BookCacheDatabase.getDatabase(application).bookCacheDao()
     private val epubParser = EpubParser(appContext)
     private val mobiParser = MobiParser(appContext)
+    private val fb2Parser = com.aryan.reader.epub.Fb2Parser(appContext)
     private val singleFileImporter = SingleFileImporter(appContext)
     private val bookImporter = BookImporter(appContext)
     private val prefs: SharedPreferences =
@@ -2327,7 +2329,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
         var author: String? = null
         var bookForMetadata = epubBook
 
-        if (bookForMetadata == null && (type == FileType.EPUB || type == FileType.MOBI || type == FileType.MD || type == FileType.TXT || type == FileType.HTML)) {
+        if (bookForMetadata == null && (type == FileType.EPUB || type == FileType.MOBI || type == FileType.FB2 || type == FileType.MD || type == FileType.TXT || type == FileType.HTML)) {
             Timber.d("Parsing downloaded book for cover/metadata: $displayName")
             Timber.tag("FileOpenPerf")
                 .d("[$bookId] addFileToRecent: Starting metadata parsing (no book provided)")
@@ -2347,6 +2349,13 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
 
                                 FileType.MOBI -> {
                                     mobiParser.createMobiBook(
+                                        inputStream = inputStream,
+                                        originalBookNameHint = displayName
+                                    )
+                                }
+
+                                FileType.FB2 -> {
+                                    fb2Parser.createFb2Book(
                                         inputStream = inputStream,
                                         originalBookNameHint = displayName
                                     )
@@ -2379,7 +2388,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
 
         val finalBookMetadata = bookForMetadata
 
-        if ((type == FileType.EPUB || type == FileType.MOBI || type == FileType.MD || type == FileType.TXT || type == FileType.HTML) && finalBookMetadata != null) {
+        if ((type == FileType.EPUB || type == FileType.MOBI || type == FileType.FB2 || type == FileType.MD || type == FileType.TXT || type == FileType.HTML) && finalBookMetadata != null) {
             title =
                 finalBookMetadata.title.takeIf { it.isNotBlank() && it != "content" } ?: displayName
 
@@ -2390,12 +2399,45 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
             finalBookMetadata.coverImage?.let { cover ->
                 coverPath = recentFilesRepository.saveCoverToCache(cover, uri)
             }
-        } else if (type == FileType.PDF) {
+        } else if (type == FileType.PDF || type == FileType.CBZ || type == FileType.CBR || type == FileType.CB7) {
             title = displayName
-            val pdfCoverGenerator = PdfCoverGenerator(appContext)
-            val coverBitmap = pdfCoverGenerator.generateCover(uri)
-            if (coverBitmap != null) {
-                coverPath = recentFilesRepository.saveCoverToCache(coverBitmap, uri)
+
+            if (type == FileType.PDF) {
+                val pdfCoverGenerator = PdfCoverGenerator(appContext)
+                val coverBitmap = pdfCoverGenerator.generateCover(uri)
+                if (coverBitmap != null) {
+                    coverPath = recentFilesRepository.saveCoverToCache(coverBitmap, uri)
+                }
+            } else if (type == FileType.CBZ || type == FileType.CBR || type == FileType.CB7) {
+                try {
+                    val cacheFile = File(appContext.cacheDir, "temp_archive_cover_${System.currentTimeMillis()}.${type.name.lowercase()}")
+                    withContext(Dispatchers.IO) {
+                        appContext.contentResolver.openInputStream(uri)?.use { input ->
+                            cacheFile.outputStream().use { output -> input.copyTo(output) }
+                        }
+                    }
+                    val archiveDoc = com.aryan.reader.pdf.ArchiveDocumentWrapper(cacheFile)
+                    if (archiveDoc.getPageCount() > 0) {
+                        val page = archiveDoc.openPage(0)
+                        if (page != null) {
+                            val w = page.getPageWidthPoint()
+                            val h = page.getPageHeightPoint()
+                            if (w > 0 && h > 0) {
+                                val targetHeight = 800
+                                val targetWidth = (targetHeight * (w.toFloat() / h.toFloat())).toInt()
+                                if (targetWidth > 0) {
+                                    val bitmap = createBitmap(targetWidth, targetHeight)
+                                    page.renderPageBitmap(bitmap, 0, 0, targetWidth, targetHeight, false)
+                                    coverPath = recentFilesRepository.saveCoverToCache(bitmap, uri)
+                                }
+                            }
+                            page.close()
+                        }
+                    }
+                    archiveDoc.close()
+                } catch (e: Exception) {
+                    Timber.e(e, "Error generating CBZ cover")
+                }
             }
         }
 
@@ -2553,7 +2595,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
             val type = item.type
             val bookId = item.bookId
 
-            if (type == FileType.PDF) {
+            if (type == FileType.PDF || type == FileType.CBZ || type == FileType.CBR || type == FileType.CB7) {
                 _internalState.update {
                     it.copy(
                         selectedEpubUri = null,
@@ -2750,7 +2792,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                 )
             }
 
-            if (type == FileType.PDF) {
+            if (type == FileType.PDF || type == FileType.CBZ || type == FileType.CBR || type == FileType.CB7) {
                 viewModelScope.launch {
                     val recentItem = recentFilesRepository.getFileByBookId(bookId)
 
@@ -2779,7 +2821,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                         sourceFolderUri = null
                     )
                 }
-            } else if (type == FileType.EPUB || type == FileType.MOBI || type == FileType.MD || type == FileType.TXT || type == FileType.HTML) {
+            } else if (type == FileType.EPUB || type == FileType.MOBI || type == FileType.FB2 || type == FileType.MD || type == FileType.TXT || type == FileType.HTML) {
                 viewModelScope.launch {
                     val recentItem = recentFilesRepository.getFileByBookId(bookId)
                     if (recentItem?.sourceFolderUri != null) {
@@ -2818,12 +2860,51 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                             loadMobi(uri, bookId, customDisplayName = originalDisplayName)
                         }
 
+                        FileType.FB2 -> {
+                            loadFb2(uri, bookId, customDisplayName = originalDisplayName)
+                        }
+
                         else -> {
                             loadSingleFile(
                                 uri, bookId, type, customDisplayName = originalDisplayName
                             )
                         }
                     }
+                }
+            }
+        }
+    }
+
+    private fun loadFb2(uri: Uri, bookId: String, customDisplayName: String? = null) {
+        val loadStart = System.currentTimeMillis()
+        Timber.tag("FileOpenPerf").d("[$bookId] loadFb2 START")
+        viewModelScope.launch {
+            if (!_internalState.value.isLoading) {
+                _internalState.update { it.copy(isLoading = true, errorMessage = null) }
+            }
+            Timber.d("Starting FB2 parsing for URI: $uri")
+            try {
+                val fb2Book = withContext(Dispatchers.IO) {
+                    appContext.contentResolver.openInputStream(uri).use { inputStream ->
+                        if (inputStream == null) throw Exception("Could not open input stream")
+                        fb2Parser.createFb2Book(
+                            inputStream,
+                            originalBookNameHint = customDisplayName ?: getFileNameFromUri(uri, appContext) ?: "unknown.fb2"
+                        )
+                    }
+                }
+                Timber.i("FB2 parsing successful. Title: ${fb2Book.title}")
+                Timber.tag("FileOpenPerf").d("[$bookId] loadFb2 completed | chapters=${fb2Book.chapters.size} | elapsed=${System.currentTimeMillis() - loadStart}ms")
+
+                addFileToRecent(
+                    uri, FileType.FB2, bookId, fb2Book, customDisplayName, isRecent = true, sourceFolderUri = null
+                )
+
+                _internalState.update { it.copy(selectedEpubBook = fb2Book, isLoading = false) }
+            } catch (e: Exception) {
+                Timber.e(e, "Error parsing FB2 for URI: $uri")
+                _internalState.update {
+                    it.copy(errorMessage = "Failed to load FB2: ${e.message}", isLoading = false)
                 }
             }
         }
@@ -2896,8 +2977,18 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
         Timber.d("Determining type for: $uri | Mime: $mimeType | Name: $fileName")
 
         return when (mimeType) {
+            "application/zip", "application/vnd.comicbook+zip", "application/x-cbz" -> {
+                if (fileName?.endsWith(".cbz", ignoreCase = true) == true) FileType.CBZ else null
+            }
+            "application/vnd.comicbook-rar", "application/x-cbr", "application/x-rar-compressed" -> {
+                if (fileName?.endsWith(".cbr", ignoreCase = true) == true) FileType.CBR else null
+            }
+            "application/x-cb7", "application/x-7z-compressed" -> {
+                if (fileName?.endsWith(".cb7", ignoreCase = true) == true) FileType.CB7 else null
+            }
             "application/pdf" -> FileType.PDF
             "application/epub+zip" -> FileType.EPUB
+            "application/x-fictionbook+xml", "application/x-zip-compressed-fb2" -> FileType.FB2
             "application/x-mobipocket-ebook", "application/vnd.amazon.ebook", "application/vnd.amazon.mobi8-ebook" -> FileType.MOBI
             "text/markdown", "text/x-markdown" -> FileType.MD
             "text/html", "application/xhtml+xml" -> FileType.HTML
@@ -2915,6 +3006,9 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
 
             else -> {
                 when {
+                    fileName?.endsWith(".cbz", ignoreCase = true) == true -> FileType.CBZ
+                    fileName?.endsWith(".cbr", ignoreCase = true) == true -> FileType.CBR
+                    fileName?.endsWith(".cb7", ignoreCase = true) == true -> FileType.CB7
                     fileName?.endsWith(".pdf", ignoreCase = true) == true -> FileType.PDF
                     fileName?.endsWith(".epub", ignoreCase = true) == true -> FileType.EPUB
                     fileName?.endsWith(
@@ -2937,6 +3031,13 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                     ) == true -> FileType.MD
 
                     fileName?.endsWith(".txt", ignoreCase = true) == true -> FileType.TXT
+                    fileName?.endsWith(
+                        ".fb2",
+                        ignoreCase = true
+                    ) == true || fileName?.endsWith(
+                        ".fb2.zip",
+                        ignoreCase = true
+                    ) == true -> FileType.FB2
                     fileName?.endsWith(
                         ".html",
                         ignoreCase = true
