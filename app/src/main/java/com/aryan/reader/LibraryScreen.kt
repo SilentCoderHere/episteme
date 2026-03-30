@@ -20,6 +20,7 @@
 // LibraryScreen.kt
 package com.aryan.reader
 
+import android.net.Uri
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -32,6 +33,10 @@ import androidx.compose.material.icons.filled.PushPin
 import androidx.compose.material.icons.filled.FilterList
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.rememberModalBottomSheetState
+import com.aryan.reader.opds.OpdsViewModel
+import com.aryan.reader.opds.OpdsEntry
+import com.aryan.reader.opds.OpdsCatalog
+import org.jsoup.Jsoup
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.AssistChip
@@ -40,6 +45,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -53,15 +59,22 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.PagerState
 import androidx.compose.foundation.pager.rememberPagerState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Cloud
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.FolderSpecial
 import androidx.compose.material.icons.filled.Info
@@ -72,6 +85,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExtendedFloatingActionButton
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -103,13 +117,18 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.viewmodel.compose.viewModel
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
 import com.aryan.reader.data.RecentFileItem
+import com.aryan.reader.opds.OpdsAcquisition
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -137,7 +156,7 @@ fun LibraryScreen(
     val rawLibraryFiles = uiState.rawLibraryFiles
     val pagerState = rememberPagerState(
         initialPage = uiState.libraryScreenStartPage,
-        pageCount = { 3 }
+        pageCount = { 4 }
     )
 
     val containsFolderItems = remember(selectedItems) {
@@ -281,6 +300,20 @@ fun LibraryScreen(
             lastFolderScanTime = uiState.lastFolderScanTime,
             isLoading = uiState.isLoading,
             isRefreshing = uiState.isRefreshing,
+            onOpdsBookDownloaded = { uri, title ->
+                viewModel.showBanner("Downloaded $title")
+                viewModel.onFileSelected(uri, isFromRecent = false)
+            },
+            onStreamOpdsBook = { entry, catalog ->
+                viewModel.streamOpdsBook(
+                    bookId = entry.id,
+                    title = entry.title,
+                    urlTemplate = entry.pseUrlTemplate!!,
+                    pageCount = entry.pseCount!!,
+                    catalogId = catalog?.id
+                )
+            },
+            onDeleteCatalogStreams = viewModel::deleteStreamedBooksForCatalog
         )
 
 
@@ -502,11 +535,14 @@ fun LibraryScreenContent(
     isRefreshing: Boolean,
     syncedFolders: List<SyncedFolder>,
     onRemoveFolderClick: (SyncedFolder) -> Unit,
+    onOpdsBookDownloaded: (Uri, String) -> Unit,
+    onStreamOpdsBook: (OpdsEntry, OpdsCatalog?) -> Unit,
+    onDeleteCatalogStreams: (String) -> Unit,
 ) {
     val isBookContextualModeActive = selectedItems.isNotEmpty()
     val isShelfContextualModeActive = selectedShelves.isNotEmpty()
     var showSortMenu by remember { mutableStateOf(false) }
-    val tabTitles = listOf("All Books", "Shelves", "Folders")
+    val tabTitles = listOf("All Books", "Shelves", "Folders", "Catalogs")
     val searchFocusRequester = remember { FocusRequester() }
 
     var textFieldValue by remember(isSearchActive) {
@@ -767,6 +803,15 @@ fun LibraryScreenContent(
                         onScanNowClick = onScanNowClick,
                         onSyncMetadataClick = onSyncMetadataClick,
                         isLoading = isLoading || isRefreshing
+                    )
+                }
+                3 -> {
+                    OpdsTab(
+                        localLibraryFiles = rawLibraryFiles,
+                        onBookDownloaded = onOpdsBookDownloaded,
+                        onReadBook = onItemClick,
+                        onStreamBook = onStreamOpdsBook,
+                        onDeleteCatalogStreams = onDeleteCatalogStreams
                     )
                 }
             }
@@ -1302,6 +1347,16 @@ private fun LibraryListItem(
                         )
                         Spacer(modifier = Modifier.width(4.dp))
                     }
+                    val isOpdsStream = item.uriString?.startsWith("opds-pse://") == true
+                    if (isOpdsStream) {
+                        Icon(
+                            imageVector = Icons.Default.Cloud,
+                            contentDescription = "OPDS Stream",
+                            modifier = Modifier.size(16.dp),
+                            tint = MaterialTheme.colorScheme.tertiary
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                    }
 
                     if (isPinned) {
                         Icon(
@@ -1503,7 +1558,7 @@ private fun FolderSyncScreen(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
-                    androidx.compose.material3.FilledTonalButton(
+                    FilledTonalButton(
                         onClick = onScanNowClick,
                         enabled = !isLoading,
                         modifier = Modifier.weight(1f),
@@ -1819,6 +1874,854 @@ fun LibraryFilterSheet(
                 }
             }
             Spacer(modifier = Modifier.height(32.dp))
+        }
+    }
+}
+
+@Composable
+fun OpdsTab(
+    localLibraryFiles: List<RecentFileItem>,
+    onBookDownloaded: (Uri, String) -> Unit,
+    onReadBook: (RecentFileItem) -> Unit,
+    onStreamBook: (OpdsEntry, OpdsCatalog?) -> Unit,
+    onDeleteCatalogStreams: (String) -> Unit,
+    opdsViewModel: OpdsViewModel = viewModel()
+) {
+    val uiState by opdsViewModel.uiState.collectAsStateWithLifecycle()
+    val downloadingState by opdsViewModel.downloadingState.collectAsStateWithLifecycle()
+    val downloadingEntries by opdsViewModel.downloadingEntries.collectAsStateWithLifecycle()
+    val context = LocalContext.current
+    var selectedEntry by remember { mutableStateOf<OpdsEntry?>(null) }
+    var showCatalogDialog by remember { mutableStateOf(false) }
+    var editingCatalog by remember { mutableStateOf<OpdsCatalog?>(null) }
+    var catalogToDelete by remember { mutableStateOf<OpdsCatalog?>(null) }
+
+    BackHandler(enabled = uiState.isViewingCatalog) {
+        opdsViewModel.navigateBack()
+    }
+
+    Box(modifier = Modifier.fillMaxSize()) {
+        if (!uiState.isViewingCatalog) {
+            Box(modifier = Modifier.fillMaxSize()) {
+                LazyColumn(
+                    modifier = Modifier.fillMaxSize(),
+                    contentPadding = PaddingValues(
+                        start = 16.dp,
+                        end = 16.dp,
+                        top = 16.dp,
+                        bottom = 88.dp
+                    ),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    items(uiState.catalogs, key = { it.id }) { catalog ->
+                        OpdsCatalogCard(
+                            catalog = catalog,
+                            onClick = { opdsViewModel.openCatalog(catalog) },
+                            onEdit = if (catalog.isDefault) null else {
+                                {
+                                    editingCatalog = catalog
+                                    showCatalogDialog = true
+                                }
+                            },
+                            onDelete = if (catalog.isDefault) null else {
+                                { catalogToDelete = catalog }
+                            })
+                    }
+                }
+
+                ExtendedFloatingActionButton(
+                    text = { Text("Add Catalog") },
+                    icon = { Icon(Icons.Default.Add, "Add") },
+                    onClick = {
+                        editingCatalog = null
+                        showCatalogDialog = true
+                    },
+                    modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp)
+                )
+            }
+        } else {
+            // Screen 2: Viewing a specific feed/catalog
+            Box(modifier = Modifier.fillMaxSize()) {
+                Column(modifier = Modifier.fillMaxSize()) {
+                    Surface(
+                        color = MaterialTheme.colorScheme.surface,
+                        tonalElevation = 2.dp,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        var showSearch by remember { mutableStateOf(false) }
+                        var query by remember { mutableStateOf("") }
+
+                        val searchFocusRequester = remember { FocusRequester() }
+
+                        LaunchedEffect(showSearch) {
+                            if (showSearch) {
+                                delay(100)
+                                searchFocusRequester.requestFocus()
+                            }
+                        }
+
+                        Box(modifier = Modifier.fillMaxWidth()) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier.fillMaxWidth().height(64.dp)
+                                    .padding(horizontal = 4.dp)
+                            ) {
+                                IconButton(onClick = {
+                                    if (showSearch) {
+                                        showSearch = false
+                                        query = ""
+                                    } else {
+                                        opdsViewModel.navigateBack()
+                                    }
+                                }) {
+                                    Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back")
+                                }
+
+                                if (showSearch) {
+                                    OutlinedTextField(
+                                        value = query,
+                                        onValueChange = { query = it },
+                                        placeholder = { Text("Search catalog...") },
+                                        modifier = Modifier.weight(1f).padding(vertical = 4.dp)
+                                            .focusRequester(searchFocusRequester),
+                                        singleLine = true,
+                                        colors = TextFieldDefaults.colors(
+                                            focusedContainerColor = Color.Transparent,
+                                            unfocusedContainerColor = Color.Transparent,
+                                            disabledContainerColor = Color.Transparent,
+                                            focusedIndicatorColor = Color.Transparent,
+                                            unfocusedIndicatorColor = Color.Transparent,
+                                        ),
+                                        trailingIcon = {
+                                            IconButton(onClick = {
+                                                if (query.isNotBlank()) {
+                                                    opdsViewModel.search(query)
+                                                    showSearch = false
+                                                    query = ""
+                                                }
+                                            }) {
+                                                Icon(Icons.Default.Search, "Search")
+                                            }
+                                        },
+                                        keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                                            imeAction = androidx.compose.ui.text.input.ImeAction.Search
+                                        ),
+                                        keyboardActions = androidx.compose.foundation.text.KeyboardActions(
+                                            onSearch = {
+                                                if (query.isNotBlank()) {
+                                                    opdsViewModel.search(query)
+                                                    showSearch = false
+                                                    query = ""
+                                                }
+                                            })
+                                    )
+                                } else {
+                                    Text(
+                                        text = uiState.currentFeed?.title ?: "Loading...",
+                                        style = MaterialTheme.typography.titleLarge,
+                                        fontWeight = FontWeight.SemiBold,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.weight(1f).padding(horizontal = 8.dp)
+                                    )
+                                    if (uiState.searchUrlTemplate != null) {
+                                        IconButton(onClick = { showSearch = true }) {
+                                            Icon(Icons.Default.Search, "Search")
+                                        }
+                                    }
+                                }
+                            }
+
+                            if (uiState.isLoading) {
+                                androidx.compose.material3.LinearProgressIndicator(
+                                    modifier = Modifier.fillMaxWidth().align(Alignment.BottomCenter)
+                                )
+                            }
+                        }
+                    }
+
+                    if (uiState.currentFeed?.entries?.isEmpty() == true && !uiState.isLoading) {
+                        Box(
+                            modifier = Modifier.fillMaxSize(),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text("This feed is empty.")
+                        }
+                    } else {
+                        val facets = uiState.currentFeed?.facets ?: emptyList()
+                        if (facets.isNotEmpty()) {
+                            val groups = facets.groupBy { it.group }
+                            LazyRow(
+                                modifier = Modifier.fillMaxWidth()
+                                    .padding(horizontal = 16.dp, vertical = 8.dp),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                groups.forEach { (groupName, groupFacets) ->
+                                    item(key = groupName) {
+                                        var expanded by remember { mutableStateOf(false) }
+                                        val activeFacet = groupFacets.find { it.isActive }
+                                            ?: groupFacets.firstOrNull()
+
+                                        Box {
+                                            FilterChip(
+                                                selected = activeFacet?.isActive == true,
+                                                onClick = { expanded = true },
+                                                label = { Text("${groupName}: ${activeFacet?.title ?: "Select"}") },
+                                                trailingIcon = {
+                                                    Icon(
+                                                        Icons.Default.ArrowDropDown,
+                                                        null
+                                                    )
+                                                })
+                                            DropdownMenu(
+                                                expanded = expanded,
+                                                onDismissRequest = { expanded = false }) {
+                                                groupFacets.forEach { facet ->
+                                                    DropdownMenuItem(
+                                                        text = { Text(facet.title) },
+                                                        onClick = {
+                                                            expanded = false
+                                                            opdsViewModel.openFeedUrl(facet.url)
+                                                        },
+                                                        trailingIcon = if (facet.isActive) {
+                                                            { Icon(Icons.Default.Check, null) }
+                                                        } else null)
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        LazyColumn(
+                            modifier = Modifier.fillMaxSize(),
+                            contentPadding = PaddingValues(16.dp),
+                            verticalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            val entries = uiState.currentFeed?.entries ?: emptyList()
+                            itemsIndexed(
+                                entries,
+                                key = { index, item -> "${item.id}_$index" }) { index, entry ->
+
+                                if (index == entries.lastIndex) {
+                                    LaunchedEffect(index) { opdsViewModel.loadNextPage() }
+                                }
+
+                                if (entry.isNavigation) {
+                                    OpdsNavigationCard(entry) { opdsViewModel.openFeedUrl(it) }
+                                } else {
+                                    OpdsBookCard(
+                                        entry = entry,
+                                        localLibraryFiles = localLibraryFiles,
+                                        downloadState = downloadingState[entry.id],
+                                        onDownloadClick = { acquisition ->
+                                            opdsViewModel.downloadBook(
+                                                entry, acquisition, context
+                                            ) { downloadedUri ->
+                                                onBookDownloaded(downloadedUri, entry.title)
+                                            }
+                                        },
+                                        onReadClick = onReadBook,
+                                        onStreamClick = {
+                                            onStreamBook(
+                                                entry,
+                                                uiState.currentCatalog
+                                            )
+                                        },
+                                        onClick = { selectedEntry = entry })
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Error Banner overlay
+        uiState.errorMessage?.let { error ->
+            LaunchedEffect(error) {
+                delay(4000)
+                opdsViewModel.clearError()
+            }
+            Surface(
+                color = MaterialTheme.colorScheme.errorContainer,
+                shape = MaterialTheme.shapes.medium,
+                modifier = Modifier.align(Alignment.BottomCenter).padding(16.dp)
+                    .padding(bottom = 70.dp)
+            ) {
+                Text(
+                    text = error,
+                    color = MaterialTheme.colorScheme.onErrorContainer,
+                    modifier = Modifier.padding(16.dp)
+                )
+            }
+        }
+
+        if (selectedEntry != null) {
+            OpdsBookDetailsSheet(
+                entry = selectedEntry!!,
+                localLibraryFiles = localLibraryFiles,
+                downloadState = downloadingState[selectedEntry!!.id],
+                onDownloadFormat = { acquisition ->
+                    opdsViewModel.downloadBook(selectedEntry!!, acquisition, context) { downloadedUri ->
+                        onBookDownloaded(downloadedUri, selectedEntry!!.title)
+                    }
+                },
+                onReadClick = onReadBook,
+                onStreamClick = { selectedEntry?.let { onStreamBook(it, uiState.currentCatalog) } },
+                onAuthorOrCategoryClick = { url, fallbackName ->
+                    if (url != null) opdsViewModel.openFeedUrl(url)
+                    else opdsViewModel.search(fallbackName)
+                    selectedEntry = null
+                },
+                onDismiss = { selectedEntry = null }
+            )
+        }
+    }
+
+    // Dynamic Add/Edit Dialog
+    if (showCatalogDialog) {
+        var newTitle by remember(editingCatalog) { mutableStateOf(editingCatalog?.title ?: "") }
+        var newUrl by remember(editingCatalog) { mutableStateOf(editingCatalog?.url ?: "") }
+        var newUsername by remember(editingCatalog) { mutableStateOf(editingCatalog?.username ?: "") }
+        var newPassword by remember(editingCatalog) { mutableStateOf(editingCatalog?.password ?: "") }
+
+        val isEditMode = editingCatalog != null
+
+        AlertDialog(
+            onDismissRequest = {
+                showCatalogDialog = false
+                editingCatalog = null
+            },
+            title = { Text(if (isEditMode) "Edit Catalog" else "Add OPDS Catalog") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(
+                        value = newTitle,
+                        onValueChange = { newTitle = it },
+                        label = { Text("Catalog Name") },
+                        singleLine = true
+                    )
+                    OutlinedTextField(
+                        value = newUrl,
+                        onValueChange = { newUrl = it },
+                        label = { Text("URL") },
+                        placeholder = { Text("e.g. http://192.168.1.50:8080/opds") },
+                        singleLine = true
+                    )
+                    Text(
+                        "Authentication (Optional)",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.padding(top = 8.dp)
+                    )
+                    OutlinedTextField(
+                        value = newUsername,
+                        onValueChange = { newUsername = it },
+                        label = { Text("Username") },
+                        singleLine = true
+                    )
+                    OutlinedTextField(
+                        value = newPassword,
+                        onValueChange = { newPassword = it },
+                        label = { Text("Password") },
+                        singleLine = true,
+                        visualTransformation = PasswordVisualTransformation(),
+                        keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = KeyboardType.Password)
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        if (isEditMode) {
+                            opdsViewModel.updateCatalog(editingCatalog!!.id, newTitle, newUrl, newUsername, newPassword)
+                        } else {
+                            opdsViewModel.addCatalog(newTitle, newUrl, newUsername, newPassword)
+                        }
+                        showCatalogDialog = false
+                        editingCatalog = null
+                    },
+                    enabled = newTitle.isNotBlank() && newUrl.isNotBlank()
+                ) { Text("Save") }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    showCatalogDialog = false
+                    editingCatalog = null
+                }) { Text("Cancel") }
+            }
+        )
+    }
+
+    if (catalogToDelete != null) {
+        val streamedBooksCount = localLibraryFiles.count { it.uriString?.contains("catalogId=${catalogToDelete!!.id}") == true }
+        AlertDialog(
+            onDismissRequest = { catalogToDelete = null },
+            title = { Text("Delete Catalog") },
+            text = {
+                Column {
+                    Text("Are you sure you want to delete '${catalogToDelete!!.title}'?")
+                    if (streamedBooksCount > 0) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(
+                            "Deleting this catalog will also permanently remove $streamedBooksCount streaming books associated with it from your library.",
+                            color = MaterialTheme.colorScheme.error
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        opdsViewModel.removeCatalog(catalogToDelete!!.id)
+                        if (streamedBooksCount > 0) {
+                            onDeleteCatalogStreams(catalogToDelete!!.id)
+                        }
+                        catalogToDelete = null
+                    },
+                    colors = androidx.compose.material3.ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)
+                ) { Text("Delete") }
+            },
+            dismissButton = {
+                TextButton(onClick = { catalogToDelete = null }) { Text("Cancel") }
+            }
+        )
+    }
+}
+
+@Composable
+fun OpdsCatalogCard(catalog: OpdsCatalog, onClick: () -> Unit, onEdit: (() -> Unit)?, onDelete: (() -> Unit)?) {
+    Surface(
+        onClick = onClick,
+        shape = MaterialTheme.shapes.medium,
+        color = MaterialTheme.colorScheme.surfaceContainer,
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.padding(16.dp)
+        ) {
+            Icon(Icons.Default.FolderSpecial, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+            Spacer(modifier = Modifier.width(16.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(catalog.title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                    if (catalog.isDefault) {
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Surface(
+                            color = MaterialTheme.colorScheme.secondaryContainer,
+                            shape = MaterialTheme.shapes.small
+                        ) {
+                            Text(
+                                text = "Preset",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSecondaryContainer,
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                            )
+                        }
+                    }
+                }
+                Text(catalog.url, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            if (onEdit != null) {
+                IconButton(onClick = onEdit) {
+                    Icon(Icons.Default.Edit, contentDescription = "Edit")
+                }
+            }
+            if (onDelete != null) {
+                IconButton(onClick = onDelete) {
+                    Icon(Icons.Default.Delete, contentDescription = "Remove")
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun OpdsNavigationCard(entry: OpdsEntry, onClick: (String) -> Unit) {
+    Surface(
+        onClick = { entry.navigationUrl?.let { onClick(it) } },
+        shape = MaterialTheme.shapes.medium,
+        color = MaterialTheme.colorScheme.surfaceContainerLow,
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.padding(16.dp)
+        ) {
+            Icon(Icons.Default.Folder, contentDescription = null, tint = MaterialTheme.colorScheme.secondary)
+            Spacer(modifier = Modifier.width(16.dp))
+            Column {
+                Text(entry.title, style = MaterialTheme.typography.titleMedium)
+                entry.summary?.let {
+                    val cleanSummary = remember(it) { Jsoup.parse(it).text() }
+                    Text(cleanSummary, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun OpdsBookCard(
+    entry: OpdsEntry,
+    localLibraryFiles: List<RecentFileItem>,
+    downloadState: OpdsViewModel.DownloadState?,
+    onDownloadClick: (OpdsAcquisition) -> Unit,
+    onReadClick: (RecentFileItem) -> Unit,
+    onStreamClick: () -> Unit,
+    onClick: () -> Unit
+) {
+    val libraryItem = remember(entry, localLibraryFiles) {
+        localLibraryFiles.find { it.title.equals(entry.title, ignoreCase = true) || it.displayName.equals(entry.title, ignoreCase = true) }
+    }
+    val isDownloading = downloadState?.isDownloading == true
+    val progress = downloadState?.progress
+    val uniqueAcquisitions = remember(entry.acquisitions) {
+        entry.acquisitions.distinctBy { it.formatName }.sortedByDescending { it.priority }
+    }
+    var showFormatMenu by remember { mutableStateOf(false) }
+
+    Surface(
+        onClick = onClick,
+        shape = MaterialTheme.shapes.medium,
+        color = MaterialTheme.colorScheme.surfaceContainerLow,
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Row(modifier = Modifier.padding(12.dp)) {
+            AsyncImage(
+                model = entry.coverUrl,
+                contentDescription = null,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier
+                    .size(width = 70.dp, height = 100.dp)
+                    .clip(MaterialTheme.shapes.small)
+                    .background(MaterialTheme.colorScheme.surfaceVariant)
+            )
+            Spacer(modifier = Modifier.width(16.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(entry.title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                entry.author?.let {
+                    Text(it, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
+                }
+                entry.summary?.let {
+                    val cleanSummary = remember(it) { Jsoup.parse(it).text() }
+                    Text(cleanSummary, style = MaterialTheme.typography.bodySmall, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(top = 4.dp))
+                }
+                Spacer(modifier = Modifier.height(8.dp))
+
+                if (libraryItem != null) {
+                    androidx.compose.material3.OutlinedButton(
+                        onClick = { onReadClick(libraryItem) },
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp)
+                    ) {
+                        Icon(Icons.Default.Check, null, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Read")
+                    }
+                } else if (isDownloading) {
+                    Column(modifier = Modifier.fillMaxWidth()) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text("Downloading...", style = MaterialTheme.typography.labelMedium)
+                            Spacer(modifier = Modifier.weight(1f))
+                            if (progress != null) {
+                                Text("${(progress * 100).toInt()}%", style = MaterialTheme.typography.labelMedium)
+                            }
+                        }
+                        Spacer(modifier = Modifier.height(4.dp))
+                        if (progress != null) {
+                            androidx.compose.material3.LinearProgressIndicator(progress = { progress }, modifier = Modifier.fillMaxWidth())
+                        } else {
+                            androidx.compose.material3.LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                        }
+                    }
+                } else {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        if (entry.isStreamable) {
+                            FilledTonalButton(
+                                onClick = onStreamClick,
+                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp)
+                            ) {
+                                Icon(painterResource(id = R.drawable.play), null, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text("Stream")
+                            }
+                        }
+
+                        Box {
+                            FilledTonalButton(
+                                onClick = {
+                                    if (uniqueAcquisitions.size == 1) {
+                                        onDownloadClick(uniqueAcquisitions.first())
+                                    } else if (uniqueAcquisitions.size > 1) {
+                                        showFormatMenu = true
+                                    }
+                                },
+                                enabled = uniqueAcquisitions.isNotEmpty(),
+                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp)
+                            ) {
+                                if (uniqueAcquisitions.isEmpty()) {
+                                    Icon(Icons.Default.Info, null, modifier = Modifier.size(16.dp))
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text("Unavailable")
+                                } else {
+                                    Icon(Icons.Default.Add, null, modifier = Modifier.size(16.dp))
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text("Download")
+                                }
+                            }
+                        }
+                        DropdownMenu(
+                            expanded = showFormatMenu,
+                            onDismissRequest = { showFormatMenu = false }
+                        ) {
+                            uniqueAcquisitions.forEach { acq ->
+                                DropdownMenuItem(
+                                    text = { Text(acq.formatName) },
+                                    onClick = {
+                                        showFormatMenu = false
+                                        onDownloadClick(acq)
+                                    }
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun OpdsBookDetailsSheet(
+    entry: OpdsEntry,
+    localLibraryFiles: List<RecentFileItem>,
+    downloadState: OpdsViewModel.DownloadState?,
+    onDownloadFormat: (OpdsAcquisition) -> Unit,
+    onReadClick: (RecentFileItem) -> Unit,
+    onStreamClick: () -> Unit,
+    onAuthorOrCategoryClick: (String?, String) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    val libraryItem = remember(entry, localLibraryFiles) {
+        localLibraryFiles.find { it.title.equals(entry.title, ignoreCase = true) || it.displayName.equals(entry.title, ignoreCase = true) }
+    }
+    val isDownloading = downloadState?.isDownloading == true
+    val progress = downloadState?.progress
+    val uniqueAcquisitions = remember(entry.acquisitions) {
+        entry.acquisitions.distinctBy { it.formatName }.sortedByDescending { it.priority }
+    }
+
+    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = sheetState) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 24.dp, vertical = 8.dp)
+                .verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                AsyncImage(
+                    model = entry.coverUrl,
+                    contentDescription = null,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier
+                        .size(width = 110.dp, height = 160.dp)
+                        .clip(MaterialTheme.shapes.medium)
+                        .background(MaterialTheme.colorScheme.surfaceVariant)
+                )
+
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = entry.title,
+                        style = MaterialTheme.typography.titleLarge,
+                        fontWeight = FontWeight.Bold,
+                        lineHeight = 28.sp
+                    )
+
+                    if (entry.authors.isNotEmpty()) {
+                        Spacer(modifier = Modifier.height(4.dp))
+                        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            entry.authors.forEach { author ->
+                                Text(
+                                    text = author.name,
+                                    style = MaterialTheme.typography.titleMedium,
+                                    color = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.clickable {
+                                        onAuthorOrCategoryClick(author.url, author.name)
+                                    }
+                                )
+                            }
+                        }
+                    }
+
+                    entry.series?.takeIf { it.isNotBlank() }?.let { series ->
+                        Spacer(modifier = Modifier.height(8.dp))
+                        val seriesText = if (!entry.seriesIndex.isNullOrBlank()) "$series #${entry.seriesIndex}" else series
+                        Text(
+                            text = seriesText,
+                            style = MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.primary,
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.clickable {
+                                onAuthorOrCategoryClick(null, series)
+                            }
+                        )
+                    }
+                }
+            }
+
+            if (libraryItem != null) {
+                androidx.compose.material3.Button(
+                    onClick = {
+                        onDismiss()
+                        onReadClick(libraryItem)
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = MaterialTheme.shapes.medium
+                ) {
+                    Icon(Icons.Default.Check, contentDescription = "Read")
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("Read", fontWeight = FontWeight.Bold)
+                }
+            }
+
+            if (isDownloading) {
+                Column(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("Downloading...", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                        Spacer(modifier = Modifier.weight(1f))
+                        if (progress != null) {
+                            Text("${(progress * 100).toInt()}%", style = MaterialTheme.typography.titleMedium)
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                    if (progress != null) {
+                        androidx.compose.material3.LinearProgressIndicator(progress = { progress }, modifier = Modifier.fillMaxWidth().height(8.dp))
+                    } else {
+                        androidx.compose.material3.LinearProgressIndicator(modifier = Modifier.fillMaxWidth().height(8.dp))
+                    }
+                }
+            } else if (uniqueAcquisitions.isNotEmpty() || entry.isStreamable) {
+                if (entry.isStreamable) {
+                    androidx.compose.material3.Button(
+                        onClick = {
+                            onStreamClick()
+                            onDismiss()
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = MaterialTheme.shapes.medium
+                    ) {
+                        Icon(painterResource(id = R.drawable.play), null, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Stream Now", fontWeight = FontWeight.Bold)
+                    }
+                    Spacer(modifier = Modifier.height(16.dp))
+                }
+
+                if (uniqueAcquisitions.isNotEmpty()) {
+                    Text(
+                        "Download Format",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        uniqueAcquisitions.forEach { acq ->
+                            FilledTonalButton(onClick = { onDownloadFormat(acq) }) {
+                                Icon(Icons.Default.Add, null, modifier = Modifier.size(18.dp))
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(acq.formatName, fontWeight = FontWeight.Bold)
+                            }
+                        }
+                    }
+                }
+            } else {
+                Text("No supported formats available.", color = MaterialTheme.colorScheme.error)
+            }
+
+            if (entry.categories.isNotEmpty()) {
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    entry.categories.distinct().forEach { category ->
+                        Surface(
+                            shape = MaterialTheme.shapes.small,
+                            color = MaterialTheme.colorScheme.surfaceVariant,
+                            onClick = { onAuthorOrCategoryClick(null, category) }
+                        ) {
+                            Text(
+                                text = category,
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                            )
+                        }
+                    }
+                }
+            }
+
+            val hasSecondaryMeta = !entry.publisher.isNullOrBlank() || !entry.published.isNullOrBlank() || !entry.language.isNullOrBlank()
+            if (hasSecondaryMeta) {
+                Surface(
+                    shape = MaterialTheme.shapes.medium,
+                    color = MaterialTheme.colorScheme.surfaceContainer,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Row(
+                        modifier = Modifier.padding(16.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        entry.publisher?.takeIf { it.isNotBlank() }?.let {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("PUBLISHER", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                Text(it, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                            }
+                        }
+                        entry.published?.takeIf { it.isNotBlank() }?.let {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("PUBLISHED", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                val cleanDate = it.substringBefore("T")
+                                Text(cleanDate, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
+                            }
+                        }
+                        entry.language?.takeIf { it.isNotBlank() }?.let {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("LANGUAGE", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                Text(it.uppercase(), style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (!entry.summary.isNullOrBlank()) {
+                Text("Synopsis", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+
+                val cleanSummary = remember(entry.summary) {
+                    val preProcessed = entry.summary
+                        .replace("<br>", "\n")
+                        .replace("</p>", "\n\n")
+                    Jsoup.parse(preProcessed).text().trim()
+                }
+
+                Text(
+                    text = cleanSummary,
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    lineHeight = 24.sp,
+                    modifier = Modifier.padding(bottom = 48.dp)
+                )
+            } else {
+                Spacer(modifier = Modifier.height(48.dp))
+            }
         }
     }
 }

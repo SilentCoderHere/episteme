@@ -455,6 +455,46 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    fun streamOpdsBook(
+        bookId: String,
+        title: String,
+        urlTemplate: String,
+        pageCount: Int,
+        catalogId: String?
+    ) {
+        val encodedUrl = Uri.encode(urlTemplate)
+        val safeId = Uri.encode(bookId)
+        val catId = catalogId?.let { "&catalogId=${Uri.encode(it)}" } ?: ""
+
+        val uriString = "opds-pse://stream?id=$safeId&count=$pageCount&url=$encodedUrl$catId"
+        openBook(uriString.toUri(), bookId, FileType.CBZ, title)
+    }
+
+    fun deleteStreamedBooksForCatalog(catalogId: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val filesToDelete = recentFilesRepository.getAllFilesForSync().filter {
+                it.uriString?.contains("catalogId=$catalogId") == true
+            }
+            if (filesToDelete.isNotEmpty()) {
+                val ids = filesToDelete.map { it.bookId }
+                ids.forEach { bookId ->
+                    pdfTextRepository.clearBookText(bookId)
+                    clearImportedFileCache(bookId)
+                    try {
+                        val cacheDir = File(appContext.cacheDir, "opds_stream_${bookId.hashCode()}")
+                        if (cacheDir.exists()) cacheDir.deleteRecursively()
+                    } catch (e: Exception) {
+                        Timber.e(e, "Failed to clean stream cache for $bookId")
+                    }
+                }
+                recentFilesRepository.deleteFilePermanently(ids)
+                withContext(Dispatchers.Main) {
+                    showBanner("Removed ${filesToDelete.size} streaming books.")
+                }
+            }
+        }
+    }
+
     private val _reviewRequestEvent = Channel<Unit>(Channel.BUFFERED)
     val reviewRequestEvent = _reviewRequestEvent.receiveAsFlow()
     private var hasRequestedReviewInThisSession = false
@@ -1168,6 +1208,11 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
 
     private fun uploadSingleBookMetadata(book: RecentFileItem) {
         if (!uiState.value.isSyncEnabled) return
+
+        if (book.uriString?.startsWith("opds-pse") == true) {
+            Timber.d("Skipping metadata sync for OPDS stream book: ${book.displayName}")
+            return
+        }
 
         if (book.sourceFolderUri != null) {
             Timber.d("Skipping metadata sync for local folder book: ${book.displayName}")
@@ -2027,11 +2072,12 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
             }
             val localBooks = withContext(Dispatchers.IO) {
                 val allFiles = recentFilesRepository.getAllFilesForSync()
-                if (_internalState.value.isFolderSyncEnabled) {
+                val filtered = if (_internalState.value.isFolderSyncEnabled) {
                     allFiles
                 } else {
                     allFiles.filter { it.sourceFolderUri == null }
                 }
+                filtered.filterNot { it.uriString?.startsWith("opds-pse") == true }
             }
 
             val localShelfNames = prefs.getStringSet(KEY_SHELVES, emptySet()).orEmpty()
@@ -2424,7 +2470,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                 if (coverBitmap != null) {
                     coverPath = recentFilesRepository.saveCoverToCache(coverBitmap, uri)
                 }
-            } else if (type == FileType.CBZ || type == FileType.CBR || type == FileType.CB7) {
+            } else if (uri.scheme != "opds-pse" && (type == FileType.CBZ || type == FileType.CBR || type == FileType.CB7)) {
                 var cacheFile: File? = null
                 try {
                     cacheFile = File(appContext.cacheDir, "temp_archive_cover_${System.currentTimeMillis()}.${type.name.lowercase()}")
@@ -2524,6 +2570,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
 
                 val oneHourAgo = System.currentTimeMillis() - TimeUnit.HOURS.toMillis(1)
                 val allDbIds = recentFilesRepository.getAllFilesForSync().map { it.bookId }.toSet()
+                val validStreamHashes = allDbIds.map { it.hashCode().toString() }.toSet()
 
                 cacheDir.listFiles()?.forEach { file ->
                     val name = file.name
@@ -2537,6 +2584,12 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                         if (bookId !in allDbIds) {
                             val deleted = file.deleteRecursively()
                             if (deleted) Timber.d("Sweeper cleaned orphaned extracted cache for: $bookId")
+                        }
+                    } else if (name.startsWith("opds_stream_")) {
+                        val bookIdHash = name.removePrefix("opds_stream_")
+                        if (bookIdHash !in validStreamHashes) {
+                            val deleted = if (file.isDirectory) file.deleteRecursively() else file.delete()
+                            if (deleted) Timber.d("Sweeper cleaned orphaned OPDS stream cache for hash: $bookIdHash")
                         }
                     }
                 }
@@ -2837,20 +2890,22 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
         Timber.tag("FileOpenPerf")
             .d("[$bookId] openBook START | type=$type | displayName=$originalDisplayName")
 
-        try {
-            val cursor = appContext.contentResolver.query(uri, null, null, null, null)
-            cursor?.use {
-                if (it.moveToFirst()) {
-                    val sizeIndex = it.getColumnIndex(OpenableColumns.SIZE)
-                    val nameIndex = it.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                    val size = if (sizeIndex != -1) it.getLong(sizeIndex) else -1L
-                    val name = if (nameIndex != -1) it.getString(nameIndex) else "unknown"
-                    Timber.tag("FileOpenPerf")
-                        .d("[$bookId] File details | name=$name | size=${size} bytes | sizeMB=${size / (1024.0 * 1024)}")
+        if (uri.scheme != "opds-pse") {
+            try {
+                val cursor = appContext.contentResolver.query(uri, null, null, null, null)
+                cursor?.use {
+                    if (it.moveToFirst()) {
+                        val sizeIndex = it.getColumnIndex(OpenableColumns.SIZE)
+                        val nameIndex = it.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                        val size = if (sizeIndex != -1) it.getLong(sizeIndex) else -1L
+                        val name = if (nameIndex != -1) it.getString(nameIndex) else "unknown"
+                        Timber.tag("FileOpenPerf")
+                            .d("[$bookId] File details | name=$name | size=${size} bytes | sizeMB=${size / (1024.0 * 1024)}")
+                    }
                 }
+            } catch (e: Exception) {
+                Timber.tag("FileOpenPerf").e(e, "[$bookId] Failed to get file details")
             }
-        } catch (e: Exception) {
-            Timber.tag("FileOpenPerf").e(e, "[$bookId] Failed to get file details")
         }
 
         viewModelScope.launch {
