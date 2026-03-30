@@ -779,7 +779,7 @@ fun EpubReaderHost(
 
     var currentChapterIndex by rememberSaveable(epubBook.title) {
         mutableIntStateOf(
-            initialLocator?.chapterIndex?.coerceIn(0, chapters.size - 1) ?: 0
+            initialLocator?.chapterIndex?.coerceIn(0, max(0, chapters.size - 1)) ?: 0
         )
     }
 
@@ -1353,7 +1353,8 @@ fun EpubReaderHost(
         view = view,
         showBars = showBars,
         initialIsAppearanceLightStatusBars = initialIsAppearanceLightStatusBars,
-        initialSystemBarsBehavior = initialSystemBarsBehavior
+        initialSystemBarsBehavior = initialSystemBarsBehavior,
+        isDarkTheme = isDarkTheme
     )
 
     var isPagerInitialized by remember(initialLocator) { mutableStateOf(initialLocator == null) }
@@ -2249,7 +2250,7 @@ fun EpubReaderHost(
                                                         containerFocusRequester.requestFocus()
                                                     }
 
-                                                    if (System.currentTimeMillis() - lastScrollHideTime < 250) {
+                                                    if (System.currentTimeMillis() - lastScrollHideTime < 400) {
                                                         Timber.d("Ignoring tap toggle because bars were just hidden by scroll (sloppy tap).")
                                                     } else {
                                                         if (showBars || showFormatAdjustmentBars) {

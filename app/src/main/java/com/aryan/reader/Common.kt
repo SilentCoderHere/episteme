@@ -1661,7 +1661,7 @@ fun DeviceVoiceSettingsSheet(
                                 ) {
                                     items(
                                         filteredVoices.size,
-                                        key = { filteredVoices[it].name }) { index ->
+                                        key = { "${filteredVoices[it].name}_$it" }) { index ->
                                         val voice = filteredVoices[index]
                                         val isSelected = voice.name == savedVoiceName
                                         val friendlyName = numberedVoiceNames[voice.name]
@@ -1692,6 +1692,11 @@ fun DeviceVoiceSettingsSheet(
                                             trailingContent = {
                                                 IconButton(onClick = {
                                                     val params = android.os.Bundle()
+                                                    try {
+                                                        ttsEngine?.language = voice.locale
+                                                    } catch (e: Exception) {
+                                                        Timber.e(e, "Failed to set language for sample")
+                                                    }
                                                     ttsEngine?.voice = voice
                                                     val sampleText =
                                                         "This is a sample of ${voice.locale.displayLanguage}."

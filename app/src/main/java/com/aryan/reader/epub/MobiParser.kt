@@ -125,7 +125,12 @@ class MobiParser(private val context: Context) {
         return File(parentDir, bookIdentifier)
     }
 
-    suspend fun createMobiBook(inputStream: InputStream, originalBookNameHint: String): EpubBook? = withContext(Dispatchers.IO) {
+    suspend fun createMobiBook(
+        inputStream: InputStream,
+        bookId: String,
+        originalBookNameHint: String,
+        parseContent: Boolean = true
+    ): EpubBook? = withContext(Dispatchers.IO) {
         val tempFile = File.createTempFile("temp_mobi_", ".mobi", context.cacheDir)
         try {
             tempFile.outputStream().use { output ->
@@ -157,25 +162,25 @@ class MobiParser(private val context: Context) {
         val bookTitle = parsedData.title ?: originalBookNameHint
         val bookAuthor = parsedData.author ?: "Unknown Author"
 
-        val bookIdentifier = bookTitle.asFileName() + "_" + UUID.randomUUID().toString().substring(0, 8)
-        val extractionDir = getBookExtractionDir(bookIdentifier)
+        val extractionDir = File(context.cacheDir, "imported_file_$bookId")
         extractionDir.mkdirs()
 
-        // This map is the key. It maps the 1-based sequential index of an image to its new path.
         val sequentialImageMap = parsedData.resources
             .filter { it.mediaType.startsWith("image/") }
-            .sortedBy { it.uid } // Sort by UID to ensure order is correct
+            .sortedBy { it.uid }
             .mapIndexed { index, resource -> (index + 1) to resource.path }
             .toMap()
 
-        parsedData.resources.forEach { resource ->
-            try {
-                val file = File(extractionDir, resource.path)
-                file.parentFile?.mkdirs()
-                file.writeBytes(resource.data)
-                Timber.d("Wrote resource to disk -> Path: ${file.absolutePath}, Type: ${resource.mediaType}, Size: ${resource.data.size}")
-            } catch (e: Exception) {
-                Timber.e(e, "Parser: FAILED to write resource to disk: ${resource.path}")
+        if (parseContent) {
+            parsedData.resources.forEach { resource ->
+                try {
+                    val file = File(extractionDir, resource.path)
+                    file.parentFile?.mkdirs()
+                    file.writeBytes(resource.data)
+                    Timber.d("Wrote resource to disk -> Path: ${file.absolutePath}")
+                } catch (e: Exception) {
+                    Timber.e(e, "Parser: FAILED to write resource to disk: ${resource.path}")
+                }
             }
         }
 
@@ -250,26 +255,28 @@ class MobiParser(private val context: Context) {
 
         Timber.d("Successfully split content into ${chapterHtmlParts.size} chapters.")
 
-        val epubChapters = chapterHtmlParts.mapIndexedNotNull { index, (chapterHtml, title) ->
-            try {
-                val rewrittenHtml = processChapterHtml(chapterHtml)
-                val doc = Jsoup.parse(rewrittenHtml)
-                val chapterFileName = "chapter_$index.html"
-                val chapterFile = File(extractionDir, chapterFileName)
-                chapterFile.writeText(rewrittenHtml)
-                EpubChapter(
-                    chapterId = "mobi_chapter_$index",
-                    title = title,
-                    absPath = chapterFileName,
-                    htmlFilePath = chapterFileName,
-                    htmlContent = rewrittenHtml,
-                    plainTextContent = doc.text()
-                )
-            } catch (e: Exception) {
-                Timber.e(e, "Failed to process split chapter $index")
-                null
+        val epubChapters = if (parseContent) {
+            chapterHtmlParts.mapIndexedNotNull { index, (chapterHtml, title) ->
+                try {
+                    val rewrittenHtml = processChapterHtml(chapterHtml)
+                    val doc = Jsoup.parse(rewrittenHtml)
+                    val chapterFileName = "chapter_$index.html"
+                    val chapterFile = File(extractionDir, chapterFileName)
+                    chapterFile.writeText(rewrittenHtml)
+                    EpubChapter(
+                        chapterId = "mobi_chapter_$index",
+                        title = title,
+                        absPath = chapterFileName,
+                        htmlFilePath = chapterFileName,
+                        htmlContent = rewrittenHtml,
+                        plainTextContent = doc.text()
+                    )
+                } catch (e: Exception) {
+                    Timber.e(e, "Failed to process split chapter $index")
+                    null
+                }
             }
-        }
+        } else emptyList()
 
         val images = parsedData.resources
             .filter { it.mediaType.startsWith("image/") }

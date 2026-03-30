@@ -12,6 +12,7 @@ import com.aryan.reader.pdf.PdfCoverGenerator
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import timber.log.Timber
+import java.io.File
 
 class MetadataExtractionWorker(
     private val appContext: Context,
@@ -65,6 +66,7 @@ class MetadataExtractionWorker(
                             FileType.EPUB -> {
                                 val book = epubParser.createEpubBook(
                                     inputStream = inputStream,
+                                    bookId = item.bookId,
                                     originalBookNameHint = item.displayName,
                                     parseContent = false
                                 )
@@ -73,7 +75,12 @@ class MetadataExtractionWorker(
                                 book.coverImage?.let { coverPath = recentFilesRepository.saveCoverToCache(it, uri) }
                             }
                             FileType.MOBI -> {
-                                val book = mobiParser.createMobiBook(inputStream, item.displayName)
+                                val book = mobiParser.createMobiBook(
+                                    inputStream = inputStream,
+                                    bookId = item.bookId,
+                                    originalBookNameHint = item.displayName,
+                                    parseContent = false
+                                )
                                 book?.let {
                                     title = it.title.takeIf { t -> t.isNotBlank() && t != "content" }
                                     author = it.author.takeIf { a -> a.isNotBlank() && !a.equals("Unknown", ignoreCase = true) }
@@ -105,6 +112,16 @@ class MetadataExtractionWorker(
 
                 } catch (e: Exception) {
                     Timber.tag("MetadataWorker").e(e, "Failed to extract metadata for ${item.displayName}")
+                } finally {
+                    try {
+                        val cacheDir = File(appContext.cacheDir, "imported_file_${item.bookId}")
+                        if (cacheDir.exists()) {
+                            val deleted = cacheDir.deleteRecursively()
+                            if (deleted) Timber.tag("MetadataWorker").d("Cleaned up extraction cache for ${item.bookId}")
+                        }
+                    } catch (e: Exception) {
+                        Timber.tag("MetadataWorker").e(e, "Failed to clean up extraction cache for ${item.bookId}")
+                    }
                 }
             }
 
