@@ -30,8 +30,8 @@ android {
         applicationId = "com.aryan.reader"
         minSdk = 26
         targetSdk = 35
-        versionCode = 40
-        versionName = "1.0.39"
+        versionCode = 41
+        versionName = "1.0.40"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         externalNativeBuild {
@@ -217,6 +217,7 @@ dependencies {
     implementation("androidx.browser:browser:1.8.0")
 
     implementation("io.legere:pdfiumandroid:2.0.0")
+    implementation("org.zwobble.mammoth:mammoth:1.4.2")
 }
 
 spotless {

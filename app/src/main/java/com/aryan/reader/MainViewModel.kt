@@ -136,7 +136,7 @@ enum class AddBooksSource(val displayName: String) {
 }
 
 enum class FileType {
-    PDF, EPUB, MOBI, MD, TXT, HTML, FB2, CBZ, CBR, CB7
+    PDF, EPUB, MOBI, MD, TXT, HTML, FB2, CBZ, CBR, CB7, DOCX
 }
 
 enum class RenderMode {
@@ -161,9 +161,13 @@ data class Shelf(val name: String, val books: List<RecentFileItem>) {
 }
 
 enum class SortOrder(val displayName: String) {
-    RECENT("Recent"), TITLE_ASC("Title A-Z"), AUTHOR_ASC("Author A-Z"), PERCENT_ASC("Percent complete 0-100"), PERCENT_DESC(
-        "Percent complete 100-0"
-    )
+    RECENT("Recent"),
+    TITLE_ASC("Title A-Z"),
+    AUTHOR_ASC("Author A-Z"),
+    PERCENT_ASC("Percent complete 0-100"),
+    PERCENT_DESC("Percent complete 100-0"),
+    SIZE_ASC("Size (Smallest)"),
+    SIZE_DESC("Size (Biggest)")
 }
 
 enum class ReadStatusFilter(val displayName: String) {
@@ -372,6 +376,8 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                 SortOrder.AUTHOR_ASC -> files.sortedWith(compareBy(nullsLast()) { it.author?.lowercase() })
                 SortOrder.PERCENT_ASC -> files.sortedBy { it.progressPercentage ?: 0f }
                 SortOrder.PERCENT_DESC -> files.sortedByDescending { it.progressPercentage ?: 0f }
+                SortOrder.SIZE_ASC -> files.sortedBy { it.fileSize }
+                SortOrder.SIZE_DESC -> files.sortedByDescending { it.fileSize }
             }
         }
 
@@ -478,8 +484,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
             if (filesToDelete.isNotEmpty()) {
                 val ids = filesToDelete.map { it.bookId }
                 ids.forEach { bookId ->
-                    pdfTextRepository.clearBookText(bookId)
-                    clearImportedFileCache(bookId)
+                    cleanupBookDataLocally(bookId)
                     try {
                         val cacheDir = File(appContext.cacheDir, "opds_stream_${bookId.hashCode()}")
                         if (cacheDir.exists()) cacheDir.deleteRecursively()
@@ -838,14 +843,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
 
             Timber.d("Deleting book permanently from reader: $bookId")
 
-            pdfTextRepository.clearBookText(bookId)
-            try {
-                val cacheDir = File(appContext.cacheDir, "imported_file_$bookId")
-                if (cacheDir.exists()) cacheDir.deleteRecursively()
-            } catch (e: Exception) {
-                Timber.e(e, "Failed to clear cache for $bookId")
-            }
-
+            cleanupBookDataLocally(bookId)
             recentFilesRepository.deleteFilePermanently(listOf(bookId))
 
             withContext(Dispatchers.Main) {
@@ -1013,13 +1011,20 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
     private fun getFastFileId(context: Context, uri: Uri): String {
         var result = uri.toString()
         try {
-            context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
-                if (cursor.moveToFirst()) {
-                    val sizeIndex = cursor.getColumnIndex(OpenableColumns.SIZE)
-                    val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                    val size = if (sizeIndex != -1) cursor.getLong(sizeIndex) else 0L
-                    val name = if (nameIndex != -1) cursor.getString(nameIndex) else "unknown"
-                    result = "${name}_${size}"
+            if (uri.scheme == "file") {
+                uri.path?.let {
+                    val file = File(it)
+                    result = "${file.name}_${file.length()}"
+                }
+            } else {
+                context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                    if (cursor.moveToFirst()) {
+                        val sizeIndex = cursor.getColumnIndex(OpenableColumns.SIZE)
+                        val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                        val size = if (sizeIndex != -1) cursor.getLong(sizeIndex) else 0L
+                        val name = if (nameIndex != -1) cursor.getString(nameIndex) else "unknown"
+                        result = "${name}_${size}"
+                    }
                 }
             }
         } catch (e: Exception) {
@@ -1560,7 +1565,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
             _internalState.update { it.copy(syncedFolders = currentFolders) }
 
             val filesToRemove = recentFilesRepository.getFilesBySourceFolder(folder.uriString)
-            filesToRemove.forEach { pdfTextRepository.clearBookText(it.bookId) }
+            filesToRemove.forEach { cleanupBookDataLocally(it.bookId) }
 
             recentFilesRepository.deleteFilesBySourceFolder(folder.uriString)
             try {
@@ -1671,8 +1676,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                     val idsToRemove = filesToRemove.map { it.bookId }
 
                     idsToRemove.forEach { bookId ->
-                        pdfTextRepository.clearBookText(bookId)
-                        clearImportedFileCache(bookId)
+                        cleanupBookDataLocally(bookId)
                     }
                     recentFilesRepository.deleteFilePermanently(idsToRemove)
                 }
@@ -1689,7 +1693,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
             val folders = _internalState.value.syncedFolders
             folders.forEach { folder ->
                 val filesToRemove = recentFilesRepository.getFilesBySourceFolder(folder.uriString)
-                filesToRemove.forEach { pdfTextRepository.clearBookText(it.bookId) }
+                filesToRemove.forEach { cleanupBookDataLocally(it.bookId) }
 
                 recentFilesRepository.deleteFilesBySourceFolder(folder.uriString)
                 try {
@@ -1902,6 +1906,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
         viewModelScope.launch {
             try {
                 recentFilesRepository.clearAllLocalData()
+                clearBookCache()
                 pdfTextRepository.clearAllText()
                 pdfTextBoxRepository.clearAll()
                 prefs.edit { remove(KEY_LAST_SYNC_TIMESTAMP) }
@@ -2378,6 +2383,24 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
             recentFilesRepository.getFileByBookId(bookId) == null
         }
 
+        val fileSize = withContext(Dispatchers.IO) {
+            try {
+                if (uri.scheme == "file") {
+                    uri.path?.let { File(it).length() } ?: 0L
+                } else {
+                    appContext.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                        if (cursor.moveToFirst()) {
+                            val sizeIndex = cursor.getColumnIndex(OpenableColumns.SIZE)
+                            if (sizeIndex != -1) cursor.getLong(sizeIndex) else 0L
+                        } else 0L
+                    } ?: 0L
+                }
+            } catch (e: Exception) {
+                Timber.e(e, "Failed to get file size for $uri")
+                0L
+            }
+        }
+
         val existingItem = recentFilesRepository.getFileByBookId(bookId)
         val displayName = customDisplayName ?: existingItem?.displayName ?: getFileNameFromUri(
             uri, appContext
@@ -2388,7 +2411,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
         var author: String? = null
         var bookForMetadata = epubBook
 
-        if (bookForMetadata == null && (type == FileType.EPUB || type == FileType.MOBI || type == FileType.FB2 || type == FileType.MD || type == FileType.TXT || type == FileType.HTML)) {
+        if (bookForMetadata == null && (type == FileType.EPUB || type == FileType.MOBI || type == FileType.FB2 || type == FileType.MD || type == FileType.TXT || type == FileType.HTML || type == FileType.DOCX)) {
             Timber.d("Parsing downloaded book for cover/metadata: $displayName")
             Timber.tag("FileOpenPerf")
                 .d("[$bookId] addFileToRecent: Starting metadata parsing (no book provided)")
@@ -2450,7 +2473,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
 
         val finalBookMetadata = bookForMetadata
 
-        if ((type == FileType.EPUB || type == FileType.MOBI || type == FileType.FB2 || type == FileType.MD || type == FileType.TXT || type == FileType.HTML) && finalBookMetadata != null) {
+        if ((type == FileType.EPUB || type == FileType.MOBI || type == FileType.FB2 || type == FileType.MD || type == FileType.TXT || type == FileType.HTML || type == FileType.DOCX) && finalBookMetadata != null) {
             title =
                 finalBookMetadata.title.takeIf { it.isNotBlank() && it != "content" } ?: displayName
 
@@ -2529,7 +2552,8 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
             lastModifiedTimestamp = newLastModifiedTimestamp,
             isDeleted = false,
             isRecent = isRecent,
-            sourceFolderUri = sourceFolderUri
+            sourceFolderUri = sourceFolderUri,
+            fileSize = fileSize
         )
         recentFilesRepository.addRecentFile(newItem)
         Timber.i("Added/Updated $displayName ($type) to recent files via repository.")
@@ -2871,6 +2895,12 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    private suspend fun cleanupBookDataLocally(bookId: String) {
+        pdfTextRepository.clearBookText(bookId)
+        clearImportedFileCache(bookId)
+        bookCacheDao.deleteEntireBookCache(bookId)
+    }
+
     private fun clearImportedFileCache(bookId: String) {
         try {
             val cacheDir = File(appContext.cacheDir, "imported_file_$bookId")
@@ -2892,15 +2922,24 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
 
         if (uri.scheme != "opds-pse") {
             try {
-                val cursor = appContext.contentResolver.query(uri, null, null, null, null)
-                cursor?.use {
-                    if (it.moveToFirst()) {
-                        val sizeIndex = it.getColumnIndex(OpenableColumns.SIZE)
-                        val nameIndex = it.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                        val size = if (sizeIndex != -1) it.getLong(sizeIndex) else -1L
-                        val name = if (nameIndex != -1) it.getString(nameIndex) else "unknown"
-                        Timber.tag("FileOpenPerf")
-                            .d("[$bookId] File details | name=$name | size=${size} bytes | sizeMB=${size / (1024.0 * 1024)}")
+                if (uri.scheme == "file") {
+                    uri.path?.let {
+                        val file = File(it)
+                        val size = file.length()
+                        val name = file.name
+                        Timber.tag("FileOpenPerf").d("[$bookId] File details | name=$name | size=${size} bytes | sizeMB=${size / (1024.0 * 1024)}")
+                    }
+                } else {
+                    val cursor = appContext.contentResolver.query(uri, null, null, null, null)
+                    cursor?.use {
+                        if (it.moveToFirst()) {
+                            val sizeIndex = it.getColumnIndex(OpenableColumns.SIZE)
+                            val nameIndex = it.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                            val size = if (sizeIndex != -1) it.getLong(sizeIndex) else -1L
+                            val name = if (nameIndex != -1) it.getString(nameIndex) else "unknown"
+                            Timber.tag("FileOpenPerf")
+                                .d("[$bookId] File details | name=$name | size=${size} bytes | sizeMB=${size / (1024.0 * 1024)}")
+                        }
                     }
                 }
             } catch (e: Exception) {
@@ -2952,7 +2991,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                         sourceFolderUri = null
                     )
                 }
-            } else if (type == FileType.EPUB || type == FileType.MOBI || type == FileType.FB2 || type == FileType.MD || type == FileType.TXT || type == FileType.HTML) {
+            } else if (type == FileType.EPUB || type == FileType.MOBI || type == FileType.FB2 || type == FileType.MD || type == FileType.TXT || type == FileType.HTML || type == FileType.DOCX) {
                 viewModelScope.launch {
                     val recentItem = recentFilesRepository.getFileByBookId(bookId)
                     if (recentItem?.sourceFolderUri != null) {
@@ -3110,6 +3149,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
         Timber.d("Determining type for: $uri | Mime: $mimeType | Name: $fileName")
 
         return when (mimeType) {
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document" -> FileType.DOCX
             "application/zip", "application/vnd.comicbook+zip", "application/x-cbz" -> {
                 if (fileName?.endsWith(".cbz", ignoreCase = true) == true) FileType.CBZ else null
             }
@@ -3181,6 +3221,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                         ".htm",
                         ignoreCase = true
                     ) == true -> FileType.HTML
+                    fileName?.endsWith(".docx", ignoreCase = true) == true -> FileType.DOCX
 
                     else -> null
                 }
@@ -3846,7 +3887,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
 
                         folderBooks.forEach { item ->
                             idsToDeleteLocally.add(item.bookId)
-                            pdfTextRepository.clearBookText(item.bookId)
+                            cleanupBookDataLocally(item.bookId)
 
                             clearImportedFileCache(item.bookId)
 
@@ -3912,8 +3953,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
 
                                 for (item in managedBooks) {
                                     recentFilesRepository.markAsDeleted(listOf(item.bookId))
-                                    pdfTextRepository.clearBookText(item.bookId)
-                                    clearImportedFileCache(item.bookId)
+                                    cleanupBookDataLocally(item.bookId)
 
                                     firestoreRepository.syncBookMetadata(
                                         currentUser.uid,
@@ -3941,8 +3981,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                                 Timber.e(e, "Error during permanent deletion")
                                 recentFilesRepository.deleteFilePermanently(managedBooks.map { it.bookId })
                                 managedBooks.forEach { item ->
-                                    clearImportedFileCache(item.bookId)
-                                    pdfTextRepository.clearBookText(item.bookId)
+                                    cleanupBookDataLocally(item.bookId)
                                 }
                                 _internalState.update {
                                     it.copy(
@@ -3954,8 +3993,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                         } else {
                             recentFilesRepository.deleteFilePermanently(managedBooks.map { it.bookId })
                             managedBooks.forEach { item ->
-                                clearImportedFileCache(item.bookId)
-                                pdfTextRepository.clearBookText(item.bookId)
+                                cleanupBookDataLocally(item.bookId)
                             }
                         }
                     }
@@ -4073,8 +4111,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                 val reflowBookIds = reflowBooks.map { it.bookId }
 
                 reflowBookIds.forEach { bookId ->
-                    clearImportedFileCache(bookId)
-                    pdfTextRepository.clearBookText(bookId)
+                    cleanupBookDataLocally(bookId)
                 }
 
                 recentFilesRepository.deleteFilePermanently(reflowBookIds)
