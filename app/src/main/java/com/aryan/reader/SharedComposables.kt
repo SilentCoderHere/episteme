@@ -691,7 +691,7 @@ fun AboutDialog(onDismiss: () -> Unit) {
                         icon = Icons.Outlined.BugReport,
                         text = "Report an Issue",
                         subtitle = "File a bug or feature request",
-                        onClick = { uriHandler.openUri("https://github.com/yourusername/episteme/issues") }
+                        onClick = { uriHandler.openUri("https://github.com/Aryan-Raj3112/episteme/issues") }
                     )
                 } else {
                     Spacer(modifier = Modifier.height(12.dp))
