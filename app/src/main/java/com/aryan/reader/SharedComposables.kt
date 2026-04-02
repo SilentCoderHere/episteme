@@ -622,7 +622,7 @@ fun AboutDialog(onDismiss: () -> Unit) {
                         fontWeight = FontWeight.Bold
                     )
                     Text(
-                        text = if (isOss) "Open Source Edition" else "Pro Edition",
+                        text = if (isOss) "Open Source Version" else "Playstore Version",
                         style = MaterialTheme.typography.labelMedium,
                         color = MaterialTheme.colorScheme.primary
                     )
