@@ -24,6 +24,7 @@ import timber.log.Timber
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Box
@@ -44,15 +45,22 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.core.content.edit
 import com.aryan.reader.R
@@ -96,7 +104,8 @@ data class UserHighlight(
     val cfi: String,
     val text: String,
     val color: HighlightColor,
-    val chapterIndex: Int
+    val chapterIndex: Int,
+    val note: String? = null
 )
 
 fun escapeJsString(value: String): String {
@@ -182,6 +191,7 @@ fun saveHighlightsToPrefs(context: Context, bookTitle: String, highlights: List<
             put("text", h.text)
             put("colorId", h.color.id)
             put("chapterIndex", h.chapterIndex)
+            put("note", h.note ?: "")
         }
         jsonArray.put(obj)
     }
@@ -200,13 +210,15 @@ fun loadHighlightsFromPrefs(context: Context, bookTitle: String): List<UserHighl
             val obj = jsonArray.getJSONObject(i)
             val colorId = obj.getString("colorId")
             val color = HighlightColor.entries.find { it.id == colorId } ?: HighlightColor.YELLOW
+            val noteStr = obj.optString("note", "")
             list.add(
                 UserHighlight(
                     id = obj.optString("id", UUID.randomUUID().toString()),
                     cfi = obj.getString("cfi"),
                     text = obj.getString("text"),
                     color = color,
-                    chapterIndex = obj.getInt("chapterIndex")
+                    chapterIndex = obj.getInt("chapterIndex"),
+                    note = noteStr.takeIf { it.isNotBlank() }
                 )
             )
         }
@@ -225,13 +237,15 @@ fun parseHighlightsJson(jsonString: String?): List<UserHighlight> {
             val obj = jsonArray.getJSONObject(i)
             val colorId = obj.getString("colorId")
             val color = HighlightColor.entries.find { it.id == colorId } ?: HighlightColor.YELLOW
+            val noteStr = obj.optString("note", "")
             list.add(
                 UserHighlight(
-                    id = obj.optString("id", java.util.UUID.randomUUID().toString()),
+                    id = obj.optString("id", UUID.randomUUID().toString()),
                     cfi = obj.getString("cfi"),
                     text = obj.getString("text"),
                     color = color,
-                    chapterIndex = obj.getInt("chapterIndex")
+                    chapterIndex = obj.getInt("chapterIndex"),
+                    note = noteStr.takeIf { it.isNotBlank() }
                 )
             )
         }
@@ -250,6 +264,7 @@ fun highlightsToJson(highlights: List<UserHighlight>): String {
             put("text", h.text)
             put("colorId", h.color.id)
             put("chapterIndex", h.chapterIndex)
+            put("note", h.note ?: "")
         }
         jsonArray.put(obj)
     }
@@ -271,7 +286,7 @@ fun processAndAddHighlight(
     newColor: HighlightColor,
     chapterIndex: Int,
     currentList: MutableList<UserHighlight>
-) {
+): String {
     val newParts = newCfi.split('|')
     val newStartFull = newParts.first()
     val newEndFull = newParts.last()
@@ -286,10 +301,11 @@ fun processAndAddHighlight(
     var finalEndPath = newEndPath
     var finalEndOffset = newEndOffset
     var finalText = newText
+    var finalNote: String? = null
 
     while (iterator.hasNext()) {
         val existing = iterator.next()
-        if (existing.chapterIndex != chapterIndex || existing.color != newColor) continue
+        if (existing.chapterIndex != chapterIndex) continue
 
         val exParts = existing.cfi.split('|')
         val exStartFull = exParts.first()
@@ -317,6 +333,7 @@ fun processAndAddHighlight(
 
         if (!isDisjoint) {
             iterator.remove()
+            if (existing.note != null && finalNote == null) finalNote = existing.note
             val unionStartCmp = comparePaths(finalStartPath, exStartPath)
             if (unionStartCmp > 0 || (unionStartCmp == 0 && finalStartOffset > exStartOffset)) {
                 finalStartPath = exStartPath
@@ -331,12 +348,15 @@ fun processAndAddHighlight(
         }
     }
 
+    val finalCfi = "$finalStartPath:$finalStartOffset|$finalEndPath:$finalEndOffset"
     currentList.add(UserHighlight(
-        cfi = "$finalStartPath:$finalStartOffset|$finalEndPath:$finalEndOffset",
+        cfi = finalCfi,
         text = finalText,
         color = newColor,
-        chapterIndex = chapterIndex
+        chapterIndex = chapterIndex,
+        note = finalNote
     ))
+    return finalCfi
 }
 
 // --- UI Components ---
@@ -479,4 +499,459 @@ fun PaletteManagerDialog(
             TextButton(onClick = onDismiss) { Text("Cancel") }
         }
     )
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun AnnotationBottomSheet(
+    highlight: UserHighlight,
+    effectiveBg: Color,
+    effectiveText: Color,
+    activeHighlightPalette: List<HighlightColor>,
+    onColorChange: (HighlightColor) -> Unit,
+    onOpenPaletteManager: () -> Unit,
+    onDismiss: () -> Unit,
+    onSave: (String) -> Unit,
+    onDelete: () -> Unit,
+    onCopy: () -> Unit,
+    onDictionary: () -> Unit,
+    onTranslate: () -> Unit,
+    onSearch: () -> Unit
+) {
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    var noteText by remember { mutableStateOf(highlight.note ?: "") }
+
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = sheetState,
+        containerColor = effectiveBg, // Matches user theme
+        contentColor = effectiveText,
+        contentWindowInsets = { WindowInsets.navigationBars }
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 24.dp)
+                .padding(bottom = 24.dp)
+        ) {
+            // Top: Highlight Colors
+            HighlightColorRow(
+                activeHighlightPalette = activeHighlightPalette,
+                selectedColor = highlight.color,
+                onColorSelect = onColorChange,
+                onOpenPaletteManager = onOpenPaletteManager,
+                modifier = Modifier.padding(bottom = 16.dp)
+            )
+
+            // Middle: Elegant Highlight Snippet Card
+            Surface(
+                color = highlight.color.color.copy(alpha = 0.1f),
+                shape = RoundedCornerShape(12.dp),
+                border = BorderStroke(1.dp, highlight.color.color.copy(alpha = 0.3f)),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Row(modifier = Modifier.height(IntrinsicSize.Min)) {
+                    // Left colored accent bar
+                    Box(
+                        modifier = Modifier
+                            .width(6.dp)
+                            .fillMaxHeight()
+                            .background(highlight.color.color)
+                    )
+                    Text(
+                        text = "\"${highlight.text}\"",
+                        style = MaterialTheme.typography.bodyMedium.copy(fontStyle = androidx.compose.ui.text.font.FontStyle.Italic),
+                        maxLines = 4,
+                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                        color = effectiveText.copy(alpha = 0.9f),
+                        modifier = Modifier.padding(16.dp)
+                    )
+                }
+            }
+
+            Spacer(Modifier.height(16.dp))
+
+            // Action Tools Row
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceEvenly
+            ) {
+                BottomSheetToolButton(icon = R.drawable.copy, label = "Copy", onClick = onCopy, effectiveText = effectiveText)
+                BottomSheetToolButton(icon = R.drawable.dictionary, label = "Dict", onClick = onDictionary, effectiveText = effectiveText)
+                BottomSheetToolButton(icon = R.drawable.translate, label = "Translate", onClick = onTranslate, effectiveText = effectiveText)
+                BottomSheetToolButton(icon = R.drawable.search, label = "Search", onClick = onSearch, effectiveText = effectiveText)
+            }
+
+            Spacer(Modifier.height(16.dp))
+
+            // Note TextField
+            OutlinedTextField(
+                value = noteText,
+                onValueChange = { noteText = it },
+                placeholder = { Text("Add a note...", color = effectiveText.copy(alpha = 0.5f)) },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 100.dp),
+                maxLines = 5,
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedContainerColor = Color.Transparent,
+                    unfocusedContainerColor = Color.Transparent,
+                    focusedBorderColor = MaterialTheme.colorScheme.primary,
+                    unfocusedBorderColor = effectiveText.copy(alpha = 0.3f),
+                    focusedTextColor = effectiveText,
+                    unfocusedTextColor = effectiveText
+                ),
+                shape = RoundedCornerShape(12.dp)
+            )
+
+            Spacer(Modifier.height(24.dp))
+
+            // Bottom Actions
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Button(
+                    onClick = onDelete,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.errorContainer,
+                        contentColor = MaterialTheme.colorScheme.onErrorContainer
+                    )
+                ) {
+                    Icon(Icons.Default.Delete, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text("Delete")
+                }
+                Button(
+                    onClick = { onSave(noteText) },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.primary,
+                        contentColor = MaterialTheme.colorScheme.onPrimary
+                    )
+                ) {
+                    Text("Save Note")
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun BottomSheetToolButton(
+    icon: Int,
+    label: String,
+    onClick: () -> Unit,
+    effectiveText: Color
+) {
+    Column(
+        modifier = Modifier
+            .clip(RoundedCornerShape(8.dp))
+            .clickable(onClick = onClick)
+            .padding(12.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Icon(
+            painter = painterResource(id = icon),
+            contentDescription = label,
+            tint = effectiveText.copy(alpha = 0.8f),
+            modifier = Modifier.size(24.dp)
+        )
+        Spacer(modifier = Modifier.height(6.dp))
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelSmall,
+            color = effectiveText.copy(alpha = 0.8f)
+        )
+    }
+}
+
+@Composable
+fun PaginatedTextSelectionMenu(
+    onCopy: () -> Unit,
+    onSelectAll: (() -> Unit)?,
+    onDictionary: () -> Unit,
+    onTranslate: () -> Unit,
+    onSearch: () -> Unit,
+    onHighlight: ((HighlightColor) -> Unit)?,
+    onNote: (() -> Unit)? = null,
+    onDelete: (() -> Unit)?,
+    onTts: (() -> Unit)?,
+    @Suppress("unused") isProUser: Boolean,
+    @Suppress("unused") isOss: Boolean,
+    activeHighlightPalette: List<HighlightColor> = emptyList(),
+    onOpenPaletteManager: (() -> Unit)? = null
+) {
+    Surface(
+        shape = RoundedCornerShape(12.dp),
+        shadowElevation = 6.dp,
+        color = MaterialTheme.colorScheme.surface,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+    ) {
+        Column(modifier = Modifier.width(IntrinsicSize.Max).widthIn(min = 200.dp)) {
+            if (onHighlight != null) {
+                HighlightColorRow(
+                    activeHighlightPalette = activeHighlightPalette,
+                    selectedColor = null,
+                    onColorSelect = onHighlight,
+                    onOpenPaletteManager = onOpenPaletteManager
+                )
+                HorizontalDivider()
+            }
+
+            val actions = mutableListOf<MenuActionItem>()
+            actions.add(MenuActionItem(iconRes = R.drawable.copy, label = "Copy", onClick = onCopy))
+            if (onTts != null) {
+                actions.add(MenuActionItem(imageVector = Icons.AutoMirrored.Filled.VolumeUp, label = "Speak", onClick = onTts))
+            }
+            actions.add(MenuActionItem(iconRes = R.drawable.dictionary, label = "Dict", onClick = onDictionary))
+            actions.add(MenuActionItem(iconRes = R.drawable.translate, label = "Translate", onClick = onTranslate))
+            actions.add(MenuActionItem(iconRes = R.drawable.search, label = "Search", onClick = onSearch))
+
+            if (onNote != null) {
+                actions.add(MenuActionItem(imageVector = Icons.Default.Edit, label = "Note", onClick = onNote))
+            }
+
+            if (onSelectAll != null) {
+                actions.add(MenuActionItem(iconRes = R.drawable.select_all, label = "Select All", onClick = onSelectAll))
+            }
+            if (onDelete != null) {
+                actions.add(MenuActionItem(imageVector = Icons.Default.Delete, label = "Remove", onClick = onDelete, isError = true))
+            }
+
+            Column(modifier = Modifier.padding(bottom = 4.dp)) {
+                actions.chunked(3).forEach { rowActions ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 8.dp, vertical = 4.dp),
+                        horizontalArrangement = Arrangement.SpaceEvenly,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        rowActions.forEach { action ->
+                            val tint = if (action.isError) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface
+                            Column(
+                                modifier = Modifier
+                                    .width(64.dp)
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .clickable { action.onClick() }
+                                    .padding(vertical = 8.dp),
+                                horizontalAlignment = Alignment.CenterHorizontally
+                            ) {
+                                if (action.imageVector != null) {
+                                    Icon(imageVector = action.imageVector, contentDescription = action.label, tint = tint, modifier = Modifier.size(24.dp))
+                                } else if (action.iconRes != null) {
+                                    Icon(painter = painterResource(id = action.iconRes), contentDescription = action.label, tint = tint, modifier = Modifier.size(24.dp))
+                                }
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text(text = action.label, style = MaterialTheme.typography.labelSmall, color = tint, maxLines = 1)
+                            }
+                        }
+                        repeat(3 - rowActions.size) {
+                            Spacer(modifier = Modifier.width(64.dp))
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+private class MenuActionItem(
+    val iconRes: Int? = null,
+    val imageVector: androidx.compose.ui.graphics.vector.ImageVector? = null,
+    val label: String,
+    val onClick: () -> Unit,
+    val isError: Boolean = false
+)
+
+@Composable
+fun HighlightColorRow(
+    modifier: Modifier = Modifier,
+    activeHighlightPalette: List<HighlightColor>,
+    selectedColor: HighlightColor? = null,
+    onColorSelect: (HighlightColor) -> Unit,
+    onOpenPaletteManager: (() -> Unit)? = null,
+) {
+    Row(
+        modifier = modifier
+            .padding(vertical = 12.dp, horizontal = 12.dp)
+            .fillMaxWidth(),
+        horizontalArrangement = Arrangement.Center,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        activeHighlightPalette.forEach { colorEnum ->
+            Box(
+                contentAlignment = Alignment.Center,
+                modifier = Modifier
+                    .padding(horizontal = 6.dp)
+                    .size(32.dp)
+                    .clip(CircleShape) // 1. Clip shape for ripple
+                    .background(colorEnum.color) // 2. Apply background
+                    .clickable {
+                        Timber.d("HighlightColorRow: Color clicked -> ${colorEnum.name}")
+                        onColorSelect(colorEnum)
+                    } // 3. Add clickable (ripple)
+                    .border( // 4. Add border on top
+                        width = if (selectedColor == colorEnum) 3.dp else 1.dp,
+                        color = if (selectedColor == colorEnum) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.outline.copy(alpha=0.3f),
+                        shape = CircleShape
+                    )
+            ) {
+                if (selectedColor == colorEnum) {
+                    Icon(
+                        imageVector = Icons.Default.Check,
+                        contentDescription = "Selected",
+                        tint = if (colorEnum == HighlightColor.WHITE || colorEnum == HighlightColor.YELLOW) Color.Black else Color.White,
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
+            }
+        }
+
+        if (onOpenPaletteManager != null) {
+            Spacer(modifier = Modifier.width(8.dp))
+            SpectrumButton(
+                onClick = onOpenPaletteManager,
+                size = 32.dp
+            )
+        }
+    }
+}
+
+@Composable
+fun PaginatedTextSelectionMenu(
+    onCopy: () -> Unit,
+    onSelectAll: (() -> Unit)?,
+    onDictionary: () -> Unit,
+    onTranslate: () -> Unit,
+    onSearch: () -> Unit,
+    onHighlight: ((HighlightColor) -> Unit)?,
+    onNote: (() -> Unit)? = null,
+    onDelete: (() -> Unit)?,
+    onTts: (() -> Unit)?,
+    @Suppress("unused") isProUser: Boolean,
+    @Suppress("unused") isOss: Boolean,
+    activeHighlightPalette: List<HighlightColor> = emptyList(),
+    onOpenPaletteManager: (() -> Unit)? = null,
+    existingNote: String? = null,
+    selectedColor: HighlightColor? = null
+) {
+    Surface(
+        shape = RoundedCornerShape(12.dp),
+        shadowElevation = 6.dp,
+        color = MaterialTheme.colorScheme.surface,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+    ) {
+        Column(modifier = Modifier.width(IntrinsicSize.Max).widthIn(min = 200.dp)) {
+            // 1. Colors Row
+            if (onHighlight != null) {
+                HighlightColorRow(
+                    activeHighlightPalette = activeHighlightPalette,
+                    selectedColor = selectedColor,
+                    onColorSelect = onHighlight,
+                    onOpenPaletteManager = onOpenPaletteManager
+                )
+                HorizontalDivider()
+            }
+
+            // 2. Improved Comment/Note View
+            if (!existingNote.isNullOrBlank()) {
+                Surface(
+                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                    shape = RoundedCornerShape(8.dp),
+                    modifier = Modifier
+                        .padding(horizontal = 12.dp, vertical = 8.dp)
+                        .fillMaxWidth()
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .heightIn(max = 140.dp)
+                            .verticalScroll(rememberScrollState())
+                            .padding(12.dp)
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                imageVector = Icons.Default.Edit,
+                                contentDescription = "Note",
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(14.dp)
+                            )
+                            Spacer(Modifier.width(6.dp))
+                            Text(
+                                "Note",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.primary,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            text = existingNote,
+                            style = MaterialTheme.typography.bodyMedium.copy(
+                                fontStyle = androidx.compose.ui.text.font.FontStyle.Italic
+                            ),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+                HorizontalDivider()
+            }
+
+            val actions = mutableListOf<MenuActionItem>()
+            actions.add(MenuActionItem(iconRes = R.drawable.copy, label = "Copy", onClick = onCopy))
+            if (onTts != null) {
+                actions.add(MenuActionItem(imageVector = Icons.AutoMirrored.Filled.VolumeUp, label = "Speak", onClick = onTts))
+            }
+            actions.add(MenuActionItem(iconRes = R.drawable.dictionary, label = "Dict", onClick = onDictionary))
+            actions.add(MenuActionItem(iconRes = R.drawable.translate, label = "Translate", onClick = onTranslate))
+            actions.add(MenuActionItem(iconRes = R.drawable.search, label = "Search", onClick = onSearch))
+
+            if (onNote != null) {
+                val noteLabel = if (existingNote.isNullOrBlank()) "Note" else "Edit"
+                actions.add(MenuActionItem(imageVector = Icons.Default.Edit, label = noteLabel, onClick = onNote))
+            }
+
+            if (onSelectAll != null) {
+                actions.add(MenuActionItem(iconRes = R.drawable.select_all, label = "Select All", onClick = onSelectAll))
+            }
+            if (onDelete != null) {
+                actions.add(MenuActionItem(imageVector = Icons.Default.Delete, label = "Remove", onClick = onDelete, isError = true))
+            }
+
+            Column(modifier = Modifier.padding(bottom = 4.dp)) {
+                actions.chunked(3).forEach { rowActions ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 8.dp, vertical = 4.dp),
+                        horizontalArrangement = Arrangement.SpaceEvenly,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        rowActions.forEach { action ->
+                            val tint = if (action.isError) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface
+                            Column(
+                                modifier = Modifier
+                                    .width(64.dp)
+                                    .clickable { action.onClick() }
+                                    .padding(vertical = 8.dp),
+                                horizontalAlignment = Alignment.CenterHorizontally
+                            ) {
+                                if (action.imageVector != null) {
+                                    Icon(imageVector = action.imageVector, contentDescription = action.label, tint = tint, modifier = Modifier.size(24.dp))
+                                } else if (action.iconRes != null) {
+                                    Icon(painter = painterResource(id = action.iconRes), contentDescription = action.label, tint = tint, modifier = Modifier.size(24.dp))
+                                }
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text(text = action.label, style = MaterialTheme.typography.labelSmall, color = tint, maxLines = 1)
+                            }
+                        }
+                        repeat(3 - rowActions.size) {
+                            Spacer(modifier = Modifier.width(64.dp))
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

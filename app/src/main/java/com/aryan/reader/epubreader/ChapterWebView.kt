@@ -82,7 +82,6 @@ import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupPositionProvider
 import androidx.core.net.toUri
 import com.aryan.reader.ReaderTexture
-import com.aryan.reader.paginatedreader.PaginatedTextSelectionMenu
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
 import org.json.JSONObject
@@ -280,7 +279,9 @@ private data class CustomMenuState(
     val selectionBounds: Rect,
     val finishActionModeCallback: () -> Unit,
     val cfi: String? = null,
-    val isExistingHighlight: Boolean = false
+    val isExistingHighlight: Boolean = false,
+    val note: String? = null,
+    val selectedColor: HighlightColor? = null
 )
 
 @Suppress("unused")
@@ -344,6 +345,7 @@ fun ChapterWebView(
     onWordSelectedForAiDefinition: (String) -> Unit,
     onTranslate: (String) -> Unit,
     onSearch: (String) -> Unit,
+    onNoteRequested: (String?) -> Unit,
     onContentReadyForSummarization: suspend (String) -> Unit,
     currentFontFamily: ReaderFont,
     customFontPath: String? = null,
@@ -368,6 +370,7 @@ fun ChapterWebView(
     val jsToInject = remember(context) { getJsToInject(context) }
 
     var showPaletteManager by remember { mutableStateOf(false) }
+    val latestUserHighlights by rememberUpdatedState(userHighlights)
 
     val textureBase64 by remember(activeTextureId) {
         mutableStateOf(
@@ -461,7 +464,7 @@ fun ChapterWebView(
                 Timber.d(
                     "InteractiveWebView factory for $chapterTitle (Key: $key), isDarkTheme: $isDarkTheme, initialScroll: $initialScrollTarget"
                 )
-                val webView = InteractiveWebView(
+                @Suppress("unused") val webView = InteractiveWebView(
                     context = ctx,
                     onSingleTap = onTap,
                     onPotentialScroll = onPotentialScroll,
@@ -511,32 +514,11 @@ fun ChapterWebView(
                             onClickCallback = { cfi, text, left, top, right, bottom ->
                                 this.post {
                                     onHighlightClicked()
-
-                                    val densityValue = density.density
-                                    val locationOnScreen = IntArray(2)
-                                    this.getLocationOnScreen(locationOnScreen)
-                                    val xOffset = locationOnScreen[0]
-                                    val yOffset = locationOnScreen[1]
-
-                                    val rect = Rect(
-                                        (left * densityValue).toInt() + xOffset,
-                                        (top * densityValue).toInt() + yOffset,
-                                        (right * densityValue).toInt() + xOffset,
-                                        (bottom * densityValue).toInt() + yOffset
+                                    localWebViewRef?.evaluateJavascript(
+                                        "javascript:if(window.getSelection) window.getSelection().removeAllRanges();",
+                                        null
                                     )
-
-                                    customMenuState = CustomMenuState(
-                                        selectedText = text,
-                                        selectionBounds = rect,
-                                        finishActionModeCallback = {
-                                            localWebViewRef?.evaluateJavascript(
-                                                "javascript:if(window.getSelection) window.getSelection().removeAllRanges();",
-                                                null
-                                            )
-                                        },
-                                        cfi = cfi,
-                                        isExistingHighlight = true
-                                    )
+                                    onNoteRequested(cfi)
                                 }
                             }
                         ), "HighlightBridge"
@@ -846,7 +828,13 @@ fun ChapterWebView(
                     "javascript:window.updateReaderStyles($currentFontSize, $currentLineHeight, '$fontNameForJs', '${currentTextAlign.cssValue}');",
                     null
                 )
-            }, modifier = Modifier.fillMaxSize()
+
+                val escapedHighlights = escapeJsString(highlightsJson)
+                webView.evaluateJavascript(
+                    "javascript:window.CURRENT_HIGHLIGHTS = '${escapedHighlights}'; window.HighlightBridgeHelper.restoreHighlights(window.CURRENT_HIGHLIGHTS);",
+                    null
+                )
+                }, modifier = Modifier.fillMaxSize()
             )
         }
 
@@ -989,7 +977,19 @@ fun ChapterWebView(
                                     }
                                     customMenuState = null
                                 },
-                                onHighlight = null, // Highlight handles itself above in the Colors Row
+                                onNote = {
+                                    if (state.isExistingHighlight && state.cfi != null) {
+                                        onNoteRequested(state.cfi)
+                                    } else {
+                                        onNoteRequested(null)
+                                        localWebViewRef?.evaluateJavascript(
+                                            "javascript:window.HighlightBridgeHelper.createUserHighlight('${HighlightColor.YELLOW.cssClass}', '${HighlightColor.YELLOW.id}');", null
+                                        )
+                                    }
+                                    state.finishActionModeCallback()
+                                    customMenuState = null
+                                },
+                                onHighlight = null,
                                 onTts = {
                                     localWebViewRef?.evaluateJavascript(
                                         "javascript:window.TtsBridgeHelper.extractAndRelayTextFromSelection();",
@@ -1006,21 +1006,13 @@ fun ChapterWebView(
                                 onDelete = if (state.isExistingHighlight && state.cfi != null) {
                                     {
                                         val highlightToDelete = userHighlights.find { h ->
-                                            h.cfi == state.cfi || h.cfi.split("|")
-                                                .contains(state.cfi)
+                                            h.cfi == state.cfi || h.cfi.split("|").contains(state.cfi)
                                         }
                                         if (highlightToDelete != null) {
                                             val cssClassToDelete = highlightToDelete.color.cssClass
-                                            val allCfiParts = highlightToDelete.cfi.split("|")
-                                            allCfiParts.forEach { partCfi ->
-                                                localWebViewRef?.evaluateJavascript(
-                                                    "javascript:window.HighlightBridgeHelper.removeHighlightByCfi('${
-                                                        escapeJsString(
-                                                            partCfi
-                                                        )
-                                                    }', '$cssClassToDelete');", null
-                                                )
-                                            }
+                                            localWebViewRef?.evaluateJavascript(
+                                                "javascript:window.HighlightBridgeHelper.removeHighlightByCfi('${escapeJsString(highlightToDelete.cfi)}', '$cssClassToDelete');", null
+                                            )
                                             onHighlightDeleted(highlightToDelete.cfi)
                                         }
                                         state.finishActionModeCallback()
@@ -1028,7 +1020,10 @@ fun ChapterWebView(
                                     }
                                 } else null,
                                 isProUser = isProUser,
-                                isOss = isOss)
+                                isOss = isOss,
+                                existingNote = state.note,
+                                selectedColor = state.selectedColor
+                            )
                         }
                     }
                 }

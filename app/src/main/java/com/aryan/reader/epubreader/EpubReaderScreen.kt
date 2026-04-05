@@ -477,6 +477,9 @@ fun EpubReaderHost(
     var sliderStartPage by remember { mutableIntStateOf(0) }
     var startPageThumbnail by remember { mutableStateOf<Bitmap?>(null) }
 
+    var pendingNoteForNewHighlight by remember { mutableStateOf(false) }
+    var highlightToNoteCfi by remember { mutableStateOf<String?>(null) }
+
     var showJustifyWarningDialog by remember { mutableStateOf(false) }
     var isNavigatingByToc by remember { mutableStateOf(false) }
 
@@ -1022,6 +1025,7 @@ fun EpubReaderHost(
     var showTtsSettingsSheet by remember { mutableStateOf(false) }
     var showDeviceVoiceSettingsSheet by remember { mutableStateOf(false) }
     var showThemePanel by remember { mutableStateOf(false) }
+    var showPaletteManager by remember { mutableStateOf(false) }
 
     var currentThemeId by remember { mutableStateOf(loadReaderThemeId(context)) }
     var customThemes by remember { mutableStateOf(loadCustomThemes(context)) }
@@ -1062,6 +1066,18 @@ fun EpubReaderHost(
                 (paginator as? BookPaginator)?.findChapterIndexForPage(paginatedPagerState.currentPage)
             } else {
                 null
+            }
+        }
+    }
+
+    val onHighlightColorChange: (UserHighlight, HighlightColor) -> Unit = { targetHighlight, newColor ->
+        val index = userHighlights.indexOfFirst { it.cfi == targetHighlight.cfi }
+        if (index != -1) {
+            userHighlights[index] = targetHighlight.copy(color = newColor)
+            if (currentRenderMode == RenderMode.VERTICAL_SCROLL && targetHighlight.chapterIndex == currentChapterIndex) {
+                val cssClass = newColor.cssClass
+                val jsCommand = "javascript:window.HighlightBridgeHelper.updateHighlightStyle('${escapeJsString(targetHighlight.cfi)}', '$cssClass', '${newColor.id}');"
+                webViewRefForTts?.evaluateJavascript(jsCommand, null)
             }
         }
     }
@@ -1637,13 +1653,16 @@ fun EpubReaderHost(
         drawerContent = {
             EpubReaderDrawerSheet(
                 chapters = chapters,
-                tableOfContents = epubBook.tableOfContents, // Pass TOC
+                tableOfContents = epubBook.tableOfContents,
                 activeFragmentId = activeFragmentId,
                 bookmarks = bookmarks,
                 userHighlights = userHighlights,
                 currentChapterIndex = currentChapterIndex,
                 currentChapterInPaginatedMode = currentChapterInPaginatedMode,
                 renderMode = currentRenderMode,
+                activeHighlightPalette = currentHighlightPalette,
+                onOpenPaletteManager = { showPaletteManager = true },
+                onHighlightColorChange = onHighlightColorChange,
                 onNavigateToTocEntry = { entry ->
                     scope.launch {
                         drawerState.close()
@@ -1948,15 +1967,14 @@ fun EpubReaderHost(
                         highlightToDelete.chapterIndex == currentChapterIndex) {
 
                         val cssClass = highlightToDelete.color.cssClass
-                        val cfiParts = highlightToDelete.cfi.split("|")
-
-                        cfiParts.forEach { partCfi ->
-                            val jsCommand = "javascript:window.HighlightBridgeHelper.removeHighlightByCfi('${escapeJsString(partCfi)}', '$cssClass');"
-                            Timber.d("Executing JS removal for part: $partCfi")
-                            webViewRefForTts?.evaluateJavascript(jsCommand, null)
-                        }
+                        val jsCommand = "javascript:window.HighlightBridgeHelper.removeHighlightByCfi('${escapeJsString(highlightToDelete.cfi)}', '$cssClass');"
+                        Timber.d("Executing JS removal for highlight: ${highlightToDelete.cfi}")
+                        webViewRefForTts?.evaluateJavascript(jsCommand, null)
                     }
-                }
+                },
+                onEditNote = { highlight ->
+                    highlightToNoteCfi = highlight.cfi
+                },
             )
         }
     ) {
@@ -2238,21 +2256,25 @@ fun EpubReaderHost(
                                                 Timber.d("Vertical Mode (Source): Creating Highlight. CFI: $cfi")
                                                 Timber.d("Vertical Mode (Source): Text Snippet: '${text.take(50)}...'")
                                                 val color = HighlightColor.entries.find { it.id == colorId } ?: HighlightColor.YELLOW
-                                                val existingIndex = userHighlights.indexOfFirst { it.cfi == cfi }
 
-                                                if (existingIndex != -1) {
-                                                    val existing = userHighlights[existingIndex]
-                                                    userHighlights[existingIndex] = existing.copy(color = color, text = text)
-                                                    Timber.d("Kotlin: Updated existing highlight at index $existingIndex")
+                                                val finalCfi = processAndAddHighlight(
+                                                    newCfi = cfi,
+                                                    newText = text,
+                                                    newColor = color,
+                                                    chapterIndex = currentChapterIndex,
+                                                    currentList = userHighlights
+                                                )
+
+                                                if (pendingNoteForNewHighlight) {
+                                                    pendingNoteForNewHighlight = false
+                                                    highlightToNoteCfi = finalCfi
+                                                }
+                                            },
+                                            onNoteRequested = { cfi ->
+                                                if (cfi != null) {
+                                                    highlightToNoteCfi = cfi
                                                 } else {
-                                                    val highlight = UserHighlight(
-                                                        cfi = cfi,
-                                                        text = text,
-                                                        color = color,
-                                                        chapterIndex = currentChapterIndex
-                                                    )
-                                                    userHighlights.add(highlight)
-                                                    Timber.d("Kotlin: Added new highlight")
+                                                    pendingNoteForNewHighlight = true
                                                 }
                                             },
                                             onHighlightDeleted = { cfi ->
@@ -2896,13 +2918,24 @@ fun EpubReaderHost(
                                 onHighlightCreated = { cfi, text, colorId ->
                                     Timber.d("EpubReaderScreen: onHighlightCreated. CFI: $cfi")
                                     val color = HighlightColor.entries.find { it.id == colorId } ?: HighlightColor.YELLOW
-                                    processAndAddHighlight(
+                                    val finalCfi = processAndAddHighlight(
                                         newCfi = cfi,
                                         newText = text,
                                         newColor = color,
                                         chapterIndex = currentChapterInPaginatedMode ?: 0,
                                         currentList = userHighlights
                                     )
+                                    if (pendingNoteForNewHighlight) {
+                                        pendingNoteForNewHighlight = false
+                                        highlightToNoteCfi = finalCfi
+                                    }
+                                },
+                                onNoteRequested = { cfi ->
+                                    if (cfi != null) {
+                                        highlightToNoteCfi = cfi
+                                    } else {
+                                        pendingNoteForNewHighlight = true
+                                    }
                                 },
                                 onHighlightDeleted = { cfi ->
                                     val toRemove = userHighlights.find { it.cfi == cfi }
@@ -3933,6 +3966,60 @@ fun EpubReaderHost(
                         }
                     }
                 }
+
+                if (highlightToNoteCfi != null) {
+                    val targetHighlight = userHighlights.find {
+                        it.cfi == highlightToNoteCfi || (highlightToNoteCfi != null && it.cfi.contains(highlightToNoteCfi!!))
+                    }
+                    if (targetHighlight != null) {
+                        AnnotationBottomSheet(
+                            highlight = targetHighlight,
+                            effectiveBg = effectiveBg,
+                            effectiveText = effectiveText,
+                            activeHighlightPalette = currentHighlightPalette,
+                            onColorChange = { newColor -> onHighlightColorChange(targetHighlight, newColor) },
+                            onOpenPaletteManager = { showPaletteManager = true },
+                            onDismiss = { highlightToNoteCfi = null },
+                            onSave = { noteText ->
+                                val index = userHighlights.indexOfFirst { it.cfi == targetHighlight.cfi }
+                                if (index != -1) {
+                                    userHighlights[index] = targetHighlight.copy(note = noteText.takeIf { it.isNotBlank() })
+                                }
+                                highlightToNoteCfi = null
+                            },
+                            onDelete = {
+                                userHighlights.remove(targetHighlight)
+
+                                if (currentRenderMode == RenderMode.VERTICAL_SCROLL && targetHighlight.chapterIndex == currentChapterIndex) {
+                                    val cssClass = targetHighlight.color.cssClass
+                                    val jsCommand = "javascript:window.HighlightBridgeHelper.removeHighlightByCfi('${escapeJsString(
+                                        targetHighlight.cfi)}', '$cssClass');"
+                                    webViewRefForTts?.evaluateJavascript(jsCommand, null)
+                                }
+                                highlightToNoteCfi = null
+                            },
+                            onCopy = {
+                                val clipboardManager = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                                val clip = android.content.ClipData.newPlainText("Copied Text", targetHighlight.text)
+                                clipboardManager.setPrimaryClip(clip)
+                                highlightToNoteCfi = null
+                            },
+                            onDictionary = {
+                                onDictionaryLookup(targetHighlight.text)
+                                highlightToNoteCfi = null
+                            },
+                            onTranslate = {
+                                onTranslateLookup(targetHighlight.text)
+                                highlightToNoteCfi = null
+                            },
+                            onSearch = {
+                                onSearchLookup(targetHighlight.text)
+                                highlightToNoteCfi = null
+                            }
+                        )
+                    }
+                }
+
                 CustomTopBanner(bannerMessage = bannerMessage)
             }
         }
@@ -4095,6 +4182,19 @@ fun EpubReaderHost(
                 onDismiss = { showThemePanel = false },
                 customThemes = customThemes,
                 onCustomThemesUpdated = { customThemes = it; saveCustomThemes(context, it) }
+            )
+        }
+
+        if (showPaletteManager) {
+            PaletteManagerDialog(
+                currentPalette = currentHighlightPalette,
+                onDismiss = { showPaletteManager = false },
+                onSave = { newPalette ->
+                    newPalette.forEachIndexed { index, color ->
+                        onUpdateHighlightPalette(index, color)
+                    }
+                    showPaletteManager = false
+                }
             )
         }
     }

@@ -27,6 +27,7 @@ package com.aryan.reader.pdf
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.content.ClipData
 import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
@@ -43,6 +44,7 @@ import android.print.PrintDocumentInfo
 import android.print.PrintManager
 import android.provider.OpenableColumns
 import android.util.Base64
+import android.util.LruCache
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -119,7 +121,6 @@ import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.filled.Brush
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Fullscreen
 import androidx.compose.material.icons.filled.FullscreenExit
@@ -144,6 +145,7 @@ import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.FloatingActionButtonDefaults
 import androidx.compose.material3.HorizontalDivider
@@ -153,6 +155,7 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.MenuDefaults
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.ModalDrawerSheet
 import androidx.compose.material3.ModalNavigationDrawer
 import androidx.compose.material3.OutlinedTextField
@@ -167,6 +170,7 @@ import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberDrawerState
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -262,6 +266,7 @@ import com.aryan.reader.AiDefinitionResult
 import com.aryan.reader.BuildConfig
 import com.aryan.reader.DeviceVoiceSettingsSheet
 import com.aryan.reader.FileType
+import com.aryan.reader.HighlightColorPickerDialog
 import com.aryan.reader.MainViewModel
 import com.aryan.reader.R
 import com.aryan.reader.ReaderTheme
@@ -359,6 +364,24 @@ private const val PREF_EXTERNAL_TRANSLATE_PKG = "external_translate_package"
 private const val PREF_EXTERNAL_SEARCH_PKG = "external_search_package"
 private const val PDF_THEME_KEY = "pdf_reader_theme"
 private const val PDF_KEEP_SCREEN_ON_KEY = "pdf_keep_screen_on_enabled"
+
+private fun loadCustomHighlightColors(context: Context): Map<PdfHighlightColor, Color> {
+    val prefs = context.getSharedPreferences(SETTINGS_PREFS_NAME, Context.MODE_PRIVATE)
+    return PdfHighlightColor.entries.associateWith {
+        val defaultArgb = it.color.toArgb()
+        val savedArgb = prefs.getInt("custom_highlight_${it.name}", defaultArgb)
+        Color(savedArgb)
+    }
+}
+
+private fun saveCustomHighlightColors(context: Context, colors: Map<PdfHighlightColor, Color>) {
+    val prefs = context.getSharedPreferences(SETTINGS_PREFS_NAME, Context.MODE_PRIVATE)
+    prefs.edit {
+        colors.forEach { (colorEnum, color) ->
+            putInt("custom_highlight_${colorEnum.name}", color.toArgb())
+        }
+    }
+}
 
 private fun saveKeepScreenOn(context: Context, isEnabled: Boolean) {
     val prefs = context.getSharedPreferences(SETTINGS_PREFS_NAME, Context.MODE_PRIVATE)
@@ -1091,7 +1114,7 @@ private data class DocumentCacheItem(
 )
 
 private class DocumentCache(val maxSize: Int = 3) {
-    val cache = object : android.util.LruCache<String, DocumentCacheItem>(maxSize) {
+    val cache = object : LruCache<String, DocumentCacheItem>(maxSize) {
         override fun entryRemoved(
             evicted: Boolean,
             key: String,
@@ -1189,7 +1212,7 @@ fun PdfViewerScreen(
     val effectiveFileType = uiState.selectedFileType ?: FileType.PDF
 
     var showNewTabSheet by remember { mutableStateOf(false) }
-    val sheetState = androidx.compose.material3.rememberModalBottomSheetState(skipPartiallyExpanded = false)
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = false)
 
     val isTabsEnabled = uiState.isTabsEnabled
     val openTabs = uiState.openTabs
@@ -1279,6 +1302,16 @@ fun PdfViewerScreen(
     var showPenPlayground by rememberSaveable { mutableStateOf(false) }
     var isEditMode by rememberSaveable { mutableStateOf(false) }
     var isDockMinimized by rememberSaveable { mutableStateOf(false) }
+
+    var pendingNoteForNewHighlight by remember { mutableStateOf(false) }
+    var highlightToNoteId by remember { mutableStateOf<String?>(null) }
+    val onNoteRequested: (String?) -> Unit = { id ->
+        if (id != null) {
+            highlightToNoteId = id
+        } else {
+            pendingNoteForNewHighlight = true
+        }
+    }
 
     val isDrawingActive by remember(isEditMode, isDockMinimized) {
         derivedStateOf { isEditMode && !isDockMinimized }
@@ -1393,6 +1426,10 @@ fun PdfViewerScreen(
     }
 
     val (initialDockLocation, initialDockOffset) = remember(context) { loadDockState(context) }
+
+    var customHighlightColors by remember { mutableStateOf(loadCustomHighlightColors(context)) }
+    var showHighlightColorPicker by remember { mutableStateOf(false) }
+    var highlightColorPickerInitialSlot by remember { mutableStateOf(PdfHighlightColor.YELLOW) }
 
     var dockLocation by remember { mutableStateOf(initialDockLocation) }
     var dockOffset by remember { mutableStateOf(initialDockOffset) }
@@ -1834,6 +1871,10 @@ fun PdfViewerScreen(
                                 withContext(Dispatchers.Main) {
                                     userHighlights.add(newHighlight)
                                     Timber.tag("PdfExportDebug").d("userHighlights now contains ${userHighlights.size} items.")
+                                    if (pendingNoteForNewHighlight) {
+                                        pendingNoteForNewHighlight = false
+                                        highlightToNoteId = newHighlight.id
+                                    }
                                 }
                             }
                         }
@@ -4094,61 +4135,125 @@ fun PdfViewerScreen(
                                         )
                                     }
                                 } else {
-                                    var showDeleteConfirmDialogFor by remember {
-                                        mutableStateOf<PdfUserHighlight?>(null)
-                                    }
-                                    val sortedHighlights = remember(userHighlights.toList()) {
-                                        userHighlights.sortedBy { it.pageIndex }
-                                    }
+                                    var showDeleteConfirmDialogFor by remember { mutableStateOf<PdfUserHighlight?>(null) }
+                                    var filterWithNotesOnly by remember { mutableStateOf(false) }
 
-                                    LazyColumn(modifier = Modifier.fillMaxSize()) {
-                                        itemsIndexed(
-                                            items = sortedHighlights,
-                                            key = { _, highlight -> highlight.id }
-                                        ) { _, highlight ->
-                                            ListItem(
-                                                headlineContent = {
-                                                    Text(
-                                                        text = highlight.text.ifBlank { "Highlighted section" },
-                                                        maxLines = 2,
-                                                        overflow = TextOverflow.Ellipsis,
-                                                        modifier = Modifier
-                                                            .background(
-                                                                color = highlight.color.color.copy(alpha = 0.3f),
-                                                                shape = RoundedCornerShape(4.dp)
-                                                            )
-                                                            .padding(horizontal = 4.dp, vertical = 2.dp)
-                                                    )
-                                                },
-                                                supportingContent = {
-                                                    Text(
-                                                        "Page ${highlight.pageIndex + 1}",
-                                                        style = MaterialTheme.typography.bodySmall
-                                                    )
-                                                },
-                                                trailingContent = {
-                                                    IconButton(
-                                                        onClick = { showDeleteConfirmDialogFor = highlight }
-                                                    ) {
-                                                        Icon(
-                                                            imageVector = Icons.Default.Delete,
-                                                            contentDescription = "Delete highlight",
-                                                            tint = MaterialTheme.colorScheme.error
+                                    Column(modifier = Modifier.fillMaxSize()) {
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+                                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                        ) {
+                                            FilterChip(
+                                                selected = !filterWithNotesOnly,
+                                                onClick = { filterWithNotesOnly = false },
+                                                label = { Text("All") }
+                                            )
+                                            FilterChip(
+                                                selected = filterWithNotesOnly,
+                                                onClick = { filterWithNotesOnly = true },
+                                                label = { Text("With Notes") }
+                                            )
+                                        }
+
+                                        val filteredHighlights = if (filterWithNotesOnly) {
+                                            userHighlights.filter { !it.note.isNullOrBlank() }
+                                        } else {
+                                            userHighlights.toList()
+                                        }
+
+                                        val sortedHighlights = remember(filteredHighlights) {
+                                            filteredHighlights.sortedBy { it.pageIndex }
+                                        }
+
+                                        LazyColumn(modifier = Modifier.fillMaxSize()) {
+                                            itemsIndexed(
+                                                items = sortedHighlights,
+                                                key = { _, highlight -> highlight.id }
+                                            ) { _, highlight ->
+                                                ListItem(
+                                                    headlineContent = {
+                                                        Text(
+                                                            text = highlight.text.ifBlank { "Highlighted section" },
+                                                            maxLines = 2,
+                                                            overflow = TextOverflow.Ellipsis,
+                                                            fontWeight = FontWeight.SemiBold
                                                         )
-                                                    }
-                                                },
-                                                modifier = Modifier.clickable {
-                                                    coroutineScope.launch {
-                                                        drawerState.close()
-                                                        if (displayMode == DisplayMode.PAGINATION) {
-                                                            pagerState.scrollToPage(highlight.pageIndex)
-                                                        } else {
-                                                            verticalReaderState.scrollToPage(highlight.pageIndex)
+                                                    },
+                                                    supportingContent = {
+                                                        Column {
+                                                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                                                val displayColor = customHighlightColors[highlight.color] ?: highlight.color.color
+
+                                                                Box(
+                                                                    modifier = Modifier
+                                                                        .size(12.dp)
+                                                                        .background(displayColor, CircleShape)
+                                                                )
+                                                                Spacer(Modifier.width(8.dp))
+                                                                Text(
+                                                                    "Page ${highlight.pageIndex + 1}",
+                                                                    style = MaterialTheme.typography.labelMedium,
+                                                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                                                )
+                                                            }
+                                                            if (!highlight.note.isNullOrBlank()) {
+                                                                Spacer(Modifier.height(8.dp))
+                                                                Surface(
+                                                                    shape = RoundedCornerShape(8.dp),
+                                                                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                                                                    modifier = Modifier.fillMaxWidth()
+                                                                ) {
+                                                                    Text(
+                                                                        text = highlight.note,
+                                                                        style = MaterialTheme.typography.bodySmall.copy(fontStyle = FontStyle.Italic),
+                                                                        modifier = Modifier.padding(12.dp),
+                                                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                                                    )
+                                                                }
+                                                            }
+                                                        }
+                                                    },
+                                                    trailingContent = {
+                                                        Box {
+                                                            var highlightMenuExpanded by remember { mutableStateOf(false) }
+                                                            IconButton(onClick = { highlightMenuExpanded = true }) {
+                                                                Icon(Icons.Default.MoreVert, contentDescription = "Options")
+                                                            }
+                                                            DropdownMenu(
+                                                                expanded = highlightMenuExpanded,
+                                                                onDismissRequest = { highlightMenuExpanded = false }
+                                                            ) {
+                                                                DropdownMenuItem(
+                                                                    text = { Text(if (highlight.note.isNullOrBlank()) "Add Note" else "Edit Note") },
+                                                                    onClick = {
+                                                                        onNoteRequested(highlight.id)
+                                                                        highlightMenuExpanded = false
+                                                                        coroutineScope.launch { drawerState.close() }
+                                                                    }
+                                                                )
+                                                                DropdownMenuItem(
+                                                                    text = { Text("Delete") },
+                                                                    onClick = {
+                                                                        showDeleteConfirmDialogFor = highlight
+                                                                        highlightMenuExpanded = false
+                                                                    }
+                                                                )
+                                                            }
+                                                        }
+                                                    },
+                                                    modifier = Modifier.clickable {
+                                                        coroutineScope.launch {
+                                                            drawerState.close()
+                                                            if (displayMode == DisplayMode.PAGINATION) {
+                                                                pagerState.scrollToPage(highlight.pageIndex)
+                                                            } else {
+                                                                verticalReaderState.scrollToPage(highlight.pageIndex)
+                                                            }
                                                         }
                                                     }
-                                                }
-                                            )
-                                            HorizontalDivider()
+                                                )
+                                                HorizontalDivider()
+                                            }
                                         }
                                     }
 
@@ -4436,6 +4541,11 @@ fun PdfViewerScreen(
                                                 totalPages = totalDisplayPages,
                                                 activeTheme = activeTheme,
                                                 isScrollLocked = isScrollLocked,
+                                                customHighlightColors = customHighlightColors,
+                                                onPaletteClick = {
+                                                    highlightColorPickerInitialSlot = PdfHighlightColor.YELLOW
+                                                    showHighlightColorPicker = true
+                                                },
                                                 onScaleChanged = { newScale ->
                                                     if (pagerState.currentPage == pageIndex) {
                                                         currentPageScale = newScale
@@ -4506,6 +4616,7 @@ fun PdfViewerScreen(
                                                 onHighlightAdd = onHighlightAdd,
                                                 onHighlightUpdate = onHighlightUpdate,
                                                 onHighlightDelete = onHighlightDelete,
+                                                onNoteRequested = onNoteRequested,
                                                 onTts = { pageIdx, charIdx -> startTtsWithPermissionCheck(pageIdx, charIdx) },
                                                 activeToolThickness = currentStrokeWidthState,
                                                 onTwoFingerSwipe = { direction ->
@@ -4817,6 +4928,8 @@ fun PdfViewerScreen(
                                             pdfDocument = docHolder,
                                             activeTheme = activeTheme,
                                             isScrollLocked = isScrollLocked,
+                                            customHighlightColors = customHighlightColors,
+                                            onPaletteClick = { showHighlightColorPicker = true },
                                             totalPages = totalDisplayPages,
                                             pageAspectRatios = ratiosHolder,
                                             virtualPages = virtualPages,
@@ -4841,6 +4954,7 @@ fun PdfViewerScreen(
                                             onHighlightAdd = onHighlightAdd,
                                             onHighlightUpdate = onHighlightUpdate,
                                             onHighlightDelete = onHighlightDelete,
+                                            onNoteRequested = onNoteRequested,
                                             onTts = { pageIdx, charIdx -> startTtsWithPermissionCheck(pageIdx, charIdx) },
                                             activeToolThickness = currentStrokeWidthState,
                                             onLinkClicked = onLinkClickedStable,
@@ -6999,7 +7113,7 @@ fun PdfViewerScreen(
                 }
 
                 if (showNewTabSheet) {
-                    androidx.compose.material3.ModalBottomSheet(
+                    ModalBottomSheet(
                         onDismissRequest = { showNewTabSheet = false },
                         sheetState = sheetState,
                         containerColor = MaterialTheme.colorScheme.surface
@@ -7243,6 +7357,84 @@ fun PdfViewerScreen(
                     DeviceVoiceSettingsSheet(
                         isVisible = true,
                         onDismiss = { showDeviceVoiceSettingsSheet = false }
+                    )
+                }
+
+                if (highlightToNoteId != null) {
+                    val targetHighlight = userHighlights.find { it.id == highlightToNoteId }
+                    if (targetHighlight != null) {
+                        val effectiveBg = if (activeTheme.backgroundColor == Color.Unspecified) MaterialTheme.colorScheme.surface else activeTheme.backgroundColor
+                        val effectiveText = if (activeTheme.textColor == Color.Unspecified) MaterialTheme.colorScheme.onSurface else activeTheme.textColor
+
+                        PdfAnnotationBottomSheet(
+                            highlight = targetHighlight,
+                            effectiveBg = effectiveBg,
+                            effectiveText = effectiveText,
+                            customHighlightColors = customHighlightColors,
+                            onPaletteClick = {
+                                highlightColorPickerInitialSlot = targetHighlight.color
+                                showHighlightColorPicker = true
+                            },
+                            onColorChange = { newColor ->
+                                onHighlightUpdate(
+                                    targetHighlight.id,
+                                    newColor
+                                )
+                            },
+                            onDismiss = { highlightToNoteId = null },
+                            onSave = { noteText ->
+                                val index =
+                                    userHighlights.indexOfFirst { it.id == targetHighlight.id }
+                                if (index != -1) {
+                                    userHighlights[index] =
+                                        targetHighlight.copy(note = noteText.takeIf { it.isNotBlank() })
+                                }
+                                highlightToNoteId = null
+                            },
+                            onDelete = {
+                                onHighlightDelete(targetHighlight.id)
+                                highlightToNoteId = null
+                            },
+                            onCopy = {
+                                val clip = ClipData.newPlainText(
+                                    "Copied Text",
+                                    targetHighlight.text
+                                )
+                                clipboardManager.setText(
+                                    androidx.compose.ui.text.AnnotatedString(
+                                        targetHighlight.text
+                                    )
+                                )
+                                highlightToNoteId = null
+                            },
+                            onDictionary = {
+                                onDictionaryLookupStable(targetHighlight.text)
+                                highlightToNoteId = null
+                            },
+                            onTranslate = {
+                                onTranslateTextStable(targetHighlight.text)
+                                highlightToNoteId = null
+                            },
+                            onSearch = {
+                                onSearchTextStable(targetHighlight.text)
+                                highlightToNoteId = null
+                            }
+                        )
+                    } else {
+                        highlightToNoteId = null
+                    }
+                }
+
+                if (showHighlightColorPicker) {
+                    HighlightColorPickerDialog(
+                        initialColors = customHighlightColors,
+                        initialSelection = highlightColorPickerInitialSlot,
+                        onDismiss = { showHighlightColorPicker = false },
+                        onSave = { newColors ->
+                            customHighlightColors = newColors
+                            saveCustomHighlightColors(context, newColors)
+                            showHighlightColorPicker = false
+                        }
                     )
                 }
 

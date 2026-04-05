@@ -368,6 +368,7 @@ data class PageSelectionData(
     val selectionHighlightColor: Color,
     val pageIndex: Int,
     val userHighlightScreenRects: StableHolder<List<Pair<PdfUserHighlight, List<Rect>>>>,
+    val customHighlightColors: StableHolder<Map<PdfHighlightColor, Color>>
 )
 
 @Suppress("unused")
@@ -437,8 +438,11 @@ internal fun PdfPageComposable(
     onHighlightAdd: (Int, Pair<Int, Int>, String, PdfHighlightColor) -> Unit = { _,_,_,_ -> },
     onHighlightUpdate: (String, PdfHighlightColor) -> Unit = { _,_ -> },
     onHighlightDelete: (String) -> Unit = {},
+    onNoteRequested: (String?) -> Unit = {},
     onTts: (Int, Int) -> Unit = { _, _ -> },
-    activeToolThickness: Float = 0f
+    activeToolThickness: Float = 0f,
+    customHighlightColors: Map<PdfHighlightColor, Color> = emptyMap(),
+    onPaletteClick: (() -> Unit)? = null
 ) {
     val pdfDocumentItem = pdfDocument.item
     var bitmapState by remember { mutableStateOf(PdfThumbnailCache.get(pageIndex)) }
@@ -2552,16 +2556,7 @@ internal fun PdfPageComposable(
 
                         if (hitHighlightPair != null && tappedRect != null) {
                             val hitHighlight = hitHighlightPair.first
-                            val combinedRect = Rect(hitHighlightPair.second.first())
-                            hitHighlightPair.second.forEach { combinedRect.union(it) }
-
-                            customMenuState = CustomPdfMenuState(
-                                selectedText = hitHighlight.text,
-                                anchorRect = combinedRect,
-                                charRange = hitHighlight.range,
-                                isExistingHighlight = true,
-                                highlightId = hitHighlight.id
-                            )
+                            onNoteRequested(hitHighlight.id)
                             return@launch
                         }
 
@@ -3568,7 +3563,8 @@ internal fun PdfPageComposable(
                         searchHighlightMode,
                         searchFocusedColor,
                         searchAllColor,
-                        userHighlightScreenRects
+                        userHighlightScreenRects,
+                        customHighlightColors
                     ) {
                         PageSelectionData(
                             pageLinks = StableHolder(pageLinks),
@@ -3593,6 +3589,7 @@ internal fun PdfPageComposable(
                             mergedSearchAllRects = StableHolder(mergedSearchAllRects),
                             searchHighlightMode = searchHighlightMode,
                             userHighlightScreenRects = StableHolder(userHighlightScreenRects),
+                            customHighlightColors = StableHolder(customHighlightColors)
                         )
                     }
 
@@ -3622,6 +3619,7 @@ internal fun PdfPageComposable(
                         onHighlightUpdate = onHighlightUpdate,
                         onHighlightDelete = onHighlightDelete,
                         onTts = onTts,
+                        onNote = onNoteRequested,
                         teardropHeightPx = teardropHeightPxState.value,
                         activeDraggingHandle = activeDraggingHandle,
                         showMagnifier = showMagnifier,
@@ -3833,7 +3831,9 @@ internal fun PdfPageComposable(
                         onTextBoxDrag = onTextBoxDrag,
                         onTextBoxDragEnd = onTextBoxDragEnd,
                         onDragPageTurn = onDragPageTurn,
-                        draggingBoxId = draggingBoxId
+                        draggingBoxId = draggingBoxId,
+                        customHighlightColors = customHighlightColors,
+                        onPaletteClick = onPaletteClick
                     )
                 }
 
@@ -3955,7 +3955,8 @@ private fun PdfHighlightsLayer(
     scrimColorForTextHighlight: Color,
     allTextPageHighlightColor: Color,
     ttsHighlightColor: Color,
-    selectionHighlightColor: Color
+    selectionHighlightColor: Color,
+    customHighlightColors: Map<PdfHighlightColor, Color> = emptyMap()
 ) {
     Timber.d("PdfHighlightsLayer Recompose")
     Canvas(modifier = Modifier
@@ -4098,10 +4099,11 @@ private fun PdfHighlightsLayer(
 
             // 9. Persistent User Highlights
             userHighlightScreenRects.forEach { (highlight, screenRects) ->
+                val displayColor = customHighlightColors[highlight.color] ?: highlight.color.color
                 screenRects.forEach { r ->
                     if (isVisible(r)) {
                         drawRect(
-                            color = highlight.color.color.copy(alpha = 0.4f),
+                            color = displayColor.copy(alpha = 0.4f),
                             topLeft = Offset(r.left.toFloat(), r.top.toFloat()),
                             size = Size(r.width().toFloat(), r.height().toFloat())
                         )
@@ -4471,7 +4473,8 @@ private fun PdfPageSelectionsLayer(
     scrimColorForTextHighlight: Color,
     allTextPageHighlightColor: Color,
     ttsHighlightColor: Color,
-    selectionHighlightColor: Color
+    selectionHighlightColor: Color,
+    customHighlightColors: Map<PdfHighlightColor, Color> = emptyMap()
 ) {
     SideEffect {
         Timber.tag("PdfDrawPerf").v("SELECTIONS LAYER: Recomposing")
@@ -4498,7 +4501,8 @@ private fun PdfPageSelectionsLayer(
         scrimColorForTextHighlight = scrimColorForTextHighlight,
         allTextPageHighlightColor = allTextPageHighlightColor,
         ttsHighlightColor = ttsHighlightColor,
-        selectionHighlightColor = selectionHighlightColor
+        selectionHighlightColor = selectionHighlightColor,
+        customHighlightColors = customHighlightColors
     )
 
     val highlightTime = (System.nanoTime() - highlightStart) / 1_000_000f
@@ -4561,12 +4565,14 @@ private fun PdfPageRenderer(
     onTextBoxDragEnd: () -> Unit,
     onDragPageTurn: (Int) -> Unit,
     draggingBoxId: String? = null,
+    customHighlightColors: Map<PdfHighlightColor, Color> = emptyMap(),
+    onPaletteClick: (() -> Unit)? = null,
     onHighlightAdd: (Int, Pair<Int, Int>, String, PdfHighlightColor) -> Unit,
     onHighlightUpdate: (String, PdfHighlightColor) -> Unit,
     onHighlightDelete: (String) -> Unit,
     onTts: (Int, Int) -> Unit,
-    activeToolThickness: Float
-
+    activeToolThickness: Float,
+    onNote: (String?) -> Unit,
 ) {
     Box(modifier = Modifier.fillMaxSize()) {
         Box(
@@ -4604,7 +4610,8 @@ private fun PdfPageRenderer(
                 scrimColorForTextHighlight = selectionData.scrimColorForTextHighlight,
                 allTextPageHighlightColor = selectionData.allTextPageHighlightColor,
                 ttsHighlightColor = selectionData.ttsHighlightColor,
-                selectionHighlightColor = selectionData.selectionHighlightColor
+                selectionHighlightColor = selectionData.selectionHighlightColor,
+                customHighlightColors = selectionData.customHighlightColors.item
             )
 
             // Layer 3: Annotations & Text
@@ -4950,7 +4957,21 @@ private fun PdfPageRenderer(
                     onTts = {
                         onTts(selectionData.pageIndex, menuState.charRange.first)
                         onMenuDismiss()
-                    }
+                    },
+                    onNote = {
+                        if (menuState.isExistingHighlight && menuState.highlightId != null) {
+                            onNote(menuState.highlightId)
+                        } else {
+                            onNote(null)
+                            onHighlightAdd(
+                                selectionData.pageIndex, menuState.charRange, menuState.selectedText,
+                                PdfHighlightColor.YELLOW
+                            )
+                        }
+                        onMenuDismiss()
+                    },
+                    customHighlightColors = selectionData.customHighlightColors.item,
+                    onPaletteClick = onPaletteClick
                 )
             }
         }

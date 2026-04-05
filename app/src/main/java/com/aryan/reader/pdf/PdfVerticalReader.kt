@@ -230,8 +230,11 @@ internal fun PdfVerticalReader(
     onHighlightAdd: (Int, Pair<Int, Int>, String, PdfHighlightColor) -> Unit = { _,_,_,_ -> },
     onHighlightUpdate: (String, PdfHighlightColor) -> Unit = { _,_ -> },
     onHighlightDelete: (String) -> Unit = {},
+    onNoteRequested: (String?) -> Unit = {},
     onTts: (Int, Int) -> Unit = { _, _ -> },
-    activeToolThickness: Float = 0f
+    activeToolThickness: Float = 0f,
+    customHighlightColors: Map<PdfHighlightColor, Color> = emptyMap(),
+    onPaletteClick: () -> Unit = {}
 ) {
     SideEffect { Timber.tag("PdfDrawPerf").v("LIST: PdfVerticalReader Recomposing.") }
     DisposableEffect(state) {
@@ -1576,8 +1579,11 @@ internal fun PdfVerticalReader(
                                     onHighlightAdd = onHighlightAdd,
                                     onHighlightUpdate = onHighlightUpdate,
                                     onHighlightDelete = onHighlightDelete,
+                                    onNoteRequested = onNoteRequested,
                                     onTts = onTts,
                                     activeToolThickness = activeToolThickness,
+                                    customHighlightColors = customHighlightColors,
+                                    onPaletteClick = onPaletteClick,
                                     onTextBoxDragStart = { box, localTopLeft, touchOffset ->
                                         val currentZoom = zoomAnimatable.value
                                         val panX = panXAnimatable.value
