@@ -19,13 +19,18 @@
  */
 package com.aryan.reader.epubreader
 
+import android.content.Context
+import androidx.compose.foundation.layout.fillMaxWidth
 import timber.log.Timber
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.style.TextAlign
 import com.aryan.reader.AiDefinitionPopup
 import com.aryan.reader.AiDefinitionResult
 import com.aryan.reader.R
@@ -137,6 +142,7 @@ suspend fun executeRecapLogic(
     characterLimit: Int,
     summaryCacheManager: SummaryCacheManager,
     paginator: IPaginator?,
+    context: Context,
     onProgressUpdate: (String) -> Unit,
     onResultUpdate: (String) -> Unit,
     onError: (String) -> Unit,
@@ -216,6 +222,7 @@ suspend fun executeRecapLogic(
     fetchRecap(
         pastSummaries = pastSummaries,
         currentText = finalContextText,
+        context = context,
         onUpdate = { chunk -> onResultUpdate(chunk) },
         onError = { error -> onError(error) },
         onFinish = { onFinish() }
@@ -250,7 +257,7 @@ fun EpubReaderAiOverlays(
 ) {
     if (showSummarizationPopup) {
         SummarizationPopup(
-            title = "Chapter Summary",
+            title = stringResource(R.string.ai_chapter_summary),
             result = summarizationResult,
             isLoading = isSummarizationLoading,
             onDismiss = onDismissSummarization,
@@ -260,7 +267,7 @@ fun EpubReaderAiOverlays(
 
     if (showRecapPopup) {
         SummarizationPopup(
-            title = "Story Recap (Beta)",
+            title = stringResource(R.string.ai_story_recap_beta),
             result = recapResult,
             isLoading = isRecapLoading,
             onDismiss = onDismissRecap,
@@ -272,16 +279,26 @@ fun EpubReaderAiOverlays(
         AlertDialog(
             onDismissRequest = onDismissSummarizationUpsell,
             icon = { Icon(painter = painterResource(id = R.drawable.summarize), contentDescription = null) },
-            title = { Text("Unlock Chapter Summarization") },
-            text = { Text("Get concise summaries of any chapter with Episteme Pro. Upgrade to start using this feature.") },
+            title = {
+                Text(
+                    text = stringResource(R.string.ai_unlock_summarization),
+                    modifier = Modifier.fillMaxWidth(),
+                    textAlign = TextAlign.Center
+                )
+            },
+            text = {
+                Text(
+                    text = stringResource(R.string.ai_unlock_summarization_desc),
+                )
+            },
             confirmButton = {
                 TextButton(onClick = {
                     onDismissSummarizationUpsell()
                     onNavigateToPro()
-                }) { Text("Learn More") }
+                }) { Text(stringResource(R.string.action_learn_more)) }
             },
             dismissButton = {
-                TextButton(onClick = onDismissSummarizationUpsell) { Text("Not Now") }
+                TextButton(onClick = onDismissSummarizationUpsell) { Text(stringResource(R.string.action_not_now)) }
             }
         )
     }
@@ -293,7 +310,6 @@ fun EpubReaderAiOverlays(
             isLoading = isAiDefinitionLoading,
             onDismiss = onDismissAiDefinition,
             isMainTtsActive = isTtsSessionActive,
-            // Pass it down
             onOpenExternalDictionary = {
                 selectedTextForAi?.let { text -> onOpenExternalDictionary(text) }
             }
@@ -304,16 +320,16 @@ fun EpubReaderAiOverlays(
         AlertDialog(
             onDismissRequest = onDismissDictionaryUpsell,
             icon = { Icon(painter = painterResource(id = R.drawable.ai), contentDescription = null) },
-            title = { Text("Unlock Smart Dictionary") },
-            text = { Text("Defining entire phrases and paragraphs up to 2000 characters is a Pro feature. Upgrade to get instant definitions for any selected text.") },
+            title = { Text(stringResource(R.string.ai_unlock_smart_dict)) },
+            text = { Text(stringResource(R.string.ai_unlock_smart_dict_desc)) },
             confirmButton = {
                 TextButton(onClick = {
                     onDismissDictionaryUpsell()
                     onNavigateToPro()
-                }) { Text("Learn More") }
+                }) { Text(stringResource(R.string.action_learn_more)) }
             },
             dismissButton = {
-                TextButton(onClick = onDismissDictionaryUpsell) { Text("Not Now") }
+                TextButton(onClick = onDismissDictionaryUpsell) { Text(stringResource(R.string.action_not_now)) }
             }
         )
     }

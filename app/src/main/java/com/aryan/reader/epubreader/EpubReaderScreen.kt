@@ -41,6 +41,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.RequiresApi
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
@@ -120,18 +121,22 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.core.content.edit
+import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -144,6 +149,7 @@ import com.aryan.reader.BuiltInThemes
 import com.aryan.reader.CustomTopBanner
 import com.aryan.reader.DeviceVoiceSettingsSheet
 import com.aryan.reader.MainViewModel
+import com.aryan.reader.R
 import com.aryan.reader.ReaderThemePanel
 import com.aryan.reader.RenderMode
 import com.aryan.reader.SearchResult
@@ -157,6 +163,7 @@ import com.aryan.reader.fetchAiDefinition
 import com.aryan.reader.loadCustomThemes
 import com.aryan.reader.loadReaderThemeId
 import com.aryan.reader.paginatedreader.BookPaginator
+import com.aryan.reader.paginatedreader.CfiUtils
 import com.aryan.reader.paginatedreader.HeaderBlock
 import com.aryan.reader.paginatedreader.IPaginator
 import com.aryan.reader.paginatedreader.ListItemBlock
@@ -661,15 +668,13 @@ fun EpubReaderHost(
                     isAiDefinitionLoading = true
                     aiDefinitionResult = null
                     fetchAiDefinition(
-                        text = word,
-                        onUpdate = { chunk ->
-                            val currentDefinition = aiDefinitionResult?.definition ?: ""
-                            aiDefinitionResult = AiDefinitionResult(definition = currentDefinition + chunk)
-                        },
-                        onError = { error ->
-                            aiDefinitionResult = AiDefinitionResult(error = error)
-                        },
-                        onFinish = { isAiDefinitionLoading = false }
+                        text = word, onUpdate = { chunk ->
+                        val currentDefinition = aiDefinitionResult?.definition ?: ""
+                        aiDefinitionResult =
+                            AiDefinitionResult(definition = currentDefinition + chunk)
+                    }, onError = { error ->
+                        aiDefinitionResult = AiDefinitionResult(error = error)
+                    }, onFinish = { isAiDefinitionLoading = false }, context = context
                     )
                 }
             } else {
@@ -911,7 +916,7 @@ fun EpubReaderHost(
         }
     }
 
-    val configuration = androidx.compose.ui.platform.LocalConfiguration.current
+    val configuration = LocalConfiguration.current
     var lastOrientation by remember { mutableIntStateOf(configuration.orientation) }
 
     LaunchedEffect(configuration.orientation) {
@@ -1122,8 +1127,8 @@ fun EpubReaderHost(
                 var foundIdx = -1
                 for (i in chunks.indices) {
                     val c = chunks[i]
-                    val cPath = com.aryan.reader.paginatedreader.CfiUtils.getPath(c.sourceCfi)
-                    val bPath = com.aryan.reader.paginatedreader.CfiUtils.getPath(baseCfi)
+                    val cPath = CfiUtils.getPath(c.sourceCfi)
+                    val bPath = CfiUtils.getPath(baseCfi)
                     if (cPath == bPath && startOffset >= c.startOffsetInSource && startOffset < c.startOffsetInSource + c.text.length) {
                         foundIdx = i
                         break
@@ -1309,9 +1314,10 @@ fun EpubReaderHost(
                 characterLimit = charLimit,
                 summaryCacheManager = summaryCacheManager,
                 paginator = paginator,
+                context = context,
                 onProgressUpdate = { recapProgressMessage = it },
                 onResultUpdate = { chunk ->
-                    isRecapLoading = false // Start showing content
+                    isRecapLoading = false
                     val current = recapResult?.summary ?: ""
                     recapResult = SummarizationResult(summary = current + chunk)
                 },
@@ -1440,7 +1446,7 @@ fun EpubReaderHost(
         }
     }
 
-    val pageInfoBottomPadding by androidx.compose.animation.core.animateDpAsState(
+    val pageInfoBottomPadding by animateDpAsState(
         targetValue = if (showBars && pageInfoMode == PageInfoMode.SYNC) 45.dp else 0.dp,
         label = "PageInfoBottomPadding"
     )
@@ -2002,8 +2008,9 @@ fun EpubReaderHost(
                 if (systemUiMode == SystemUiMode.HIDDEN) {
                     0.dp
                 } else {
-                    val insets = androidx.core.view.ViewCompat.getRootWindowInsets(view)
-                    val ignoringVisibilityTopPx = insets?.getInsetsIgnoringVisibility(androidx.core.view.WindowInsetsCompat.Type.statusBars())?.top ?: 0
+                    val insets = ViewCompat.getRootWindowInsets(view)
+                    val ignoringVisibilityTopPx = insets?.getInsetsIgnoringVisibility(
+                        WindowInsetsCompat.Type.statusBars())?.top ?: 0
                     val ignoringVisibilityTop = with(density) { ignoringVisibilityTopPx.toDp() }
 
                     if (ignoringVisibilityTop > 0.dp) {
@@ -2093,7 +2100,7 @@ fun EpubReaderHost(
                                     modifier = Modifier.fillMaxSize(),
                                     contentAlignment = Alignment.Center
                                 ) {
-                                    Text("No chapters available for this book.")
+                                    Text(stringResource(R.string.no_chapters_available))
                                 }
                             } else {
                                 AnimatedContent(
@@ -3496,7 +3503,7 @@ fun EpubReaderHost(
                     onDeleteReflow = onDeleteReflow
                 )
 
-                val autoScrollPadding by androidx.compose.animation.core.animateDpAsState(
+                val autoScrollPadding by animateDpAsState(
                     targetValue = if (showBars) (bottomPadding + 45.dp + 16.dp) else 32.dp,
                     label = "AutoScrollPadding"
                 )
@@ -3854,7 +3861,7 @@ fun EpubReaderHost(
                             CircularProgressIndicator()
                             Spacer(modifier = Modifier.height(16.dp))
                             Text(
-                                text = "Navigating to position...",
+                                text = stringResource(R.string.navigating_to_position),
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = MaterialTheme.colorScheme.onBackground
                             )
@@ -3865,8 +3872,8 @@ fun EpubReaderHost(
                 if (showPermissionRationaleDialog) {
                     AlertDialog(
                         onDismissRequest = { showPermissionRationaleDialog = false },
-                        title = { Text("Permission Required") },
-                        text = { Text("To show playback controls while the app is in the background, please grant the notification permission.") },
+                        title = { Text(stringResource(R.string.dialog_permission_required)) },
+                        text = { Text(stringResource(R.string.dialog_permission_notification_desc)) },
                         confirmButton = {
                             TextButton(
                                 onClick = {
@@ -3874,7 +3881,7 @@ fun EpubReaderHost(
                                     permissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
                                 }
                             ) {
-                                Text("Continue")
+                                Text(stringResource(R.string.action_continue))
                             }
                         },
                         dismissButton = {
@@ -3884,7 +3891,7 @@ fun EpubReaderHost(
                                     startTts()
                                 }
                             ) {
-                                Text("Not now")
+                                Text(stringResource(R.string.action_not_now))
                             }
                         }
                     )
@@ -3894,11 +3901,11 @@ fun EpubReaderHost(
                     AlertDialog(
                         onDismissRequest = { showJustifyWarningDialog = false },
                         icon = { Icon(Icons.Default.Info, contentDescription = null) },
-                        title = { Text("Justified Text Limitation") },
-                        text = { Text("Using Justified alignment in Paginated Mode may cause text selection and highlights to be inaccurate due to layout limitations.") },
+                        title = { Text(stringResource(R.string.dialog_justified_text_limitation)) },
+                        text = { Text(stringResource(R.string.dialog_justified_text_limitation_desc)) },
                         confirmButton = {
                             TextButton(onClick = { showJustifyWarningDialog = false }) {
-                                Text("I Understand")
+                                Text(stringResource(R.string.action_i_understand))
                             }
                         }
                     )
@@ -3919,7 +3926,7 @@ fun EpubReaderHost(
                             CircularProgressIndicator()
                             Spacer(Modifier.height(16.dp))
                             Text(
-                                "Navigating to chapter...",
+                                stringResource(R.string.navigating_to_chapter),
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = MaterialTheme.colorScheme.onBackground
                             )
