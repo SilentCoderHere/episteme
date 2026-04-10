@@ -54,7 +54,8 @@ class ContentStyler(
     private val themeTextColor: Color,
     private val chapterAbsPath: String,
     private val extractionBasePath: String,
-    private val userTextAlign: TextAlign?
+    private val userTextAlign: TextAlign?,
+    private val paragraphGapMultiplier: Float
 ) {
 
     fun style(semanticBlocks: List<SemanticBlock>): List<ContentBlock> {
@@ -102,6 +103,18 @@ class ContentStyler(
 
     private fun styleBlock(block: SemanticBlock): ContentBlock? {
         val themedStyle = applyThemeToStyle(block.style)
+
+        val finalBlockStyle = if (block is SemanticParagraph) {
+            val originalMargin = themedStyle.blockStyle.margin
+            val newMargin = originalMargin.copy(
+                top = originalMargin.top * paragraphGapMultiplier,
+                bottom = originalMargin.bottom * paragraphGapMultiplier
+            )
+            themedStyle.blockStyle.copy(margin = newMargin)
+        } else {
+            themedStyle.blockStyle
+        }
+
         return when (block) {
             is SemanticParagraph -> {
                 val computedTextAlign = userTextAlign ?: themedStyle.paragraphStyle.textAlign
@@ -109,7 +122,7 @@ class ContentStyler(
                 ParagraphBlock(
                     content = buildAnnotatedString(block, themedStyle),
                     textAlign = computedTextAlign,
-                    style = themedStyle.blockStyle,
+                    style = finalBlockStyle,
                     elementId = block.elementId,
                     cfi = block.cfi,
                     startCharOffsetInSource = block.startCharOffsetInSource,
@@ -353,13 +366,19 @@ class ContentStyler(
                 textMotion = mergedParagraphStyle.textMotion
             )
 
-            var initialSpanStyle = baseTextStyle.toSpanStyle()
-                .merge(blockStyle.spanStyle)
-                .copy(fontFamily = baseTextStyle.fontFamily)
+            val isCustomFont = baseTextStyle.fontFamily != null && baseTextStyle.fontFamily != FontFamily.Default
 
-            if (rootFontFamily == FontFamily.Monospace) {
-                initialSpanStyle = initialSpanStyle.copy(fontFamily = rootFontFamily)
+            val effectiveBlockFontFamily = if (rootFontFamily == FontFamily.Monospace) {
+                FontFamily.Monospace
+            } else if (isCustomFont) {
+                baseTextStyle.fontFamily
+            } else {
+                rootFontFamily ?: baseTextStyle.fontFamily
             }
+
+            val initialSpanStyle = baseTextStyle.toSpanStyle()
+                .merge(blockStyle.spanStyle)
+                .copy(fontFamily = effectiveBlockFontFamily)
 
             Timber.d("ContentStyler: InitialSpanStyle. BaseFontSize=${baseTextStyle.fontSize}, BlockFontSize=${blockStyle.spanStyle.fontSize} -> Merged=${initialSpanStyle.fontSize}")
 
@@ -368,14 +387,23 @@ class ContentStyler(
                     append(block.text)
                     block.spans.sortedBy { it.start }.forEach { span ->
                         val themedSpanStyle = applyThemeToStyle(span.style)
-                        val fontFamily = findFirstAvailableFontFamily(themedSpanStyle.fontFamilies, fontFamilyMap)
+                        val spanFontFamily = findFirstAvailableFontFamily(themedSpanStyle.fontFamilies, fontFamilyMap)
+                        val effectiveSpanFontFamily = if (spanFontFamily == FontFamily.Monospace) {
+                            FontFamily.Monospace
+                        } else if (isCustomFont) {
+                            baseTextStyle.fontFamily
+                        } else {
+                            spanFontFamily
+                        }
+
                         val baselineShift = when (span.tag) {
                             "sub" -> BaselineShift.Subscript
                             "sup" -> BaselineShift.Superscript
                             else -> null
                         }
+
                         val finalSpanStyle = themedSpanStyle.spanStyle.copy(
-                            fontFamily = fontFamily,
+                            fontFamily = effectiveSpanFontFamily,
                             baselineShift = baselineShift
                         )
                         addStyle(initialSpanStyle.merge(finalSpanStyle), span.start, span.end)

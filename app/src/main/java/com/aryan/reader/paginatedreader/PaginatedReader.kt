@@ -491,6 +491,7 @@ private fun WrappingContentLayout(
 @OptIn(ExperimentalFoundationApi::class, ExperimentalSerializationApi::class, FlowPreview::class)
 @Composable
 fun PaginatedReaderScreen(
+    modifier: Modifier = Modifier,
     book: EpubBook,
     isDarkTheme: Boolean,
     effectiveBg: Color,
@@ -500,11 +501,12 @@ fun PaginatedReaderScreen(
     searchQuery: String,
     fontSizeMultiplier: Float,
     lineHeightMultiplier: Float,
+    paragraphGapMultiplier: Float,
     fontFamily: FontFamily,
     textAlign: ReaderTextAlign,
     ttsHighlightInfo: TtsHighlightInfo?,
     initialChapterIndexInBook: Int?,
-    modifier: Modifier = Modifier,
+    removeEdgePadding: Boolean = false,
     onPaginatorReady: (IPaginator) -> Unit,
     onTap: (Offset?) -> Unit,
     isProUser: Boolean,
@@ -553,6 +555,7 @@ fun PaginatedReaderScreen(
 
         var debouncedFontSizeMult by remember { mutableFloatStateOf(fontSizeMultiplier) }
         var debouncedLineHeightMult by remember { mutableFloatStateOf(lineHeightMultiplier) }
+        var debouncedParagraphGapMult by remember { mutableFloatStateOf(paragraphGapMultiplier) }
         var debouncedFontFamily by remember { mutableStateOf(fontFamily) }
         var debouncedTextAlign by remember { mutableStateOf(textAlign) }
 
@@ -611,8 +614,8 @@ fun PaginatedReaderScreen(
             )
         }
 
-        LaunchedEffect(fontSizeMultiplier, lineHeightMultiplier, fontFamily, textAlign) {
-            if (fontSizeMultiplier != debouncedFontSizeMult || lineHeightMultiplier != debouncedLineHeightMult || fontFamily != debouncedFontFamily || textAlign != debouncedTextAlign) {
+        LaunchedEffect(fontSizeMultiplier, lineHeightMultiplier, paragraphGapMultiplier, fontFamily, textAlign) {
+            if (fontSizeMultiplier != debouncedFontSizeMult || lineHeightMultiplier != debouncedLineHeightMult || paragraphGapMultiplier != debouncedParagraphGapMult || fontFamily != debouncedFontFamily || textAlign != debouncedTextAlign) {
                 Timber.d("Formatting changed. Waiting for debounce.")
                 delay(400L)
 
@@ -627,6 +630,7 @@ fun PaginatedReaderScreen(
 
                 debouncedFontSizeMult = fontSizeMultiplier
                 debouncedLineHeightMult = lineHeightMultiplier
+                debouncedParagraphGapMult = paragraphGapMultiplier
                 debouncedFontFamily = fontFamily
                 debouncedTextAlign = textAlign
                 Timber.d("Debounce complete. Applying new format settings.")
@@ -642,7 +646,7 @@ fun PaginatedReaderScreen(
         }
 
         val density = LocalDensity.current
-        val horizontalPadding = 16.dp
+        val horizontalPadding = if (removeEdgePadding) 0.dp else 16.dp
         val verticalPadding = 16.dp
 
         val textConstraints =
@@ -673,8 +677,8 @@ fun PaginatedReaderScreen(
             remember(initialChapterIndexInBook, anchorLocatorForReconfig) {
                 anchorLocatorForReconfig?.chapterIndex ?: initialChapterIndexInBook ?: 0
             }
-        val paginator = remember(book, textConstraints, isDarkTheme, textStyle, userTextAlign, effectiveBg, effectiveText) {
-            val userAgentStylesheet = UserAgentStylesheet.default
+        val paginator = remember(book, textConstraints, isDarkTheme, textStyle, userTextAlign, effectiveBg, effectiveText, debouncedParagraphGapMult) {
+        val userAgentStylesheet = UserAgentStylesheet.default
             var allRules = OptimizedCssRules()
             val allFontFaces = mutableListOf<FontFaceInfo>()
 
@@ -739,7 +743,8 @@ fun PaginatedReaderScreen(
                 allFontFaces = allFontFaces,
                 context = context.applicationContext,
                 mathMLRenderer = mathMLRenderer,
-                userTextAlign = userTextAlign
+                userTextAlign = userTextAlign,
+                paragraphGapMultiplier = debouncedParagraphGapMult
             )
         }
 
@@ -1171,7 +1176,6 @@ private fun TextWithEmphasis(
                     is HeaderBlock -> block.startCharOffsetInSource
                     is QuoteBlock -> block.startCharOffsetInSource
                     is ListItemBlock -> block.startCharOffsetInSource
-                    else -> 0
                 }
 
                 val isStart = block.blockIndex == activeSelection.startBlockIndex && currentBlockAbs == activeSelection.startBlockCharOffset
@@ -1276,76 +1280,6 @@ private fun TextWithEmphasis(
         }
         .then(customDrawer)
         .pointerInput(userHighlights, text) {
-            awaitEachGesture {
-                val down = awaitFirstDown(
-                    pass = PointerEventPass.Initial, requireUnconsumed = false
-                )
-                val layout = textLayoutResult
-                if (layout != null) {
-                    val hit = getHighlightAt(down.position, layout)
-                    if (hit != null) {
-                        down.consume()
-                        val startPosition = down.position
-                        var dragDistance = 0f
-                        var isFinished = false
-
-                        val longPressJob = scope.launch {
-                            delay(500)
-                            pressedHighlightCfi = hit.first.cfi
-                        }
-
-                        try {
-                            while (true) {
-                                val event = awaitPointerEvent(
-                                    pass = PointerEventPass.Initial
-                                )
-                                val change = event.changes.firstOrNull {
-                                    it.id == down.id
-                                }
-                                if (change == null) {
-                                    longPressJob.cancel()
-                                    pressedHighlightCfi = null
-                                    break
-                                }
-                                change.consume()
-                                if (change.pressed) {
-                                    dragDistance = (change.position - startPosition).getDistance()
-                                    if (dragDistance >= viewConfiguration.touchSlop) {
-                                        longPressJob.cancel()
-                                        pressedHighlightCfi = null
-                                    }
-                                } else {
-                                    isFinished = true
-                                    longPressJob.cancel()
-                                    pressedHighlightCfi = null
-                                    break
-                                }
-                            }
-                        } catch (_: Exception) {
-                            longPressJob.cancel()
-                            pressedHighlightCfi = null
-                        }
-
-                        if (isFinished && dragDistance < viewConfiguration.touchSlop) {
-                            val (highlight, localRect) = hit
-                            val globalRect = layoutCoordinates?.let { coords ->
-                                if (coords.isAttached) {
-                                    val topLeft = coords.localToWindow(
-                                        localRect.topLeft
-                                    )
-                                    val bottomRight = coords.localToWindow(
-                                        localRect.bottomRight
-                                    )
-                                    Rect(topLeft, bottomRight)
-                                } else null
-                            } ?: localRect
-                            onHighlightClick(highlight, globalRect)
-                        }
-                    }
-                }
-            }
-        }
-        .pointerInput(text) {
             detectTapGestures(
                 onLongPress = { offset ->
                     textLayoutResult?.let { layout ->
@@ -1355,7 +1289,6 @@ private fun TextWithEmphasis(
                         var start = wordBoundary.start
                         var end = wordBoundary.end
 
-                        // Trim trailing/leading punctuations for a cleaner word selection
                         val textStr = text.text
                         while (start < end && start < textStr.length && !textStr[start].isLetterOrDigit()) start++
                         while (end > start && end <= textStr.length && !textStr[end - 1].isLetterOrDigit()) end--
@@ -1377,7 +1310,6 @@ private fun TextWithEmphasis(
                                         is HeaderBlock -> block.startCharOffsetInSource
                                         is QuoteBlock -> block.startCharOffsetInSource
                                         is ListItemBlock -> block.startCharOffsetInSource
-                                        else -> 0
                                     }
 
                                     onSelectionChange(
@@ -1402,14 +1334,27 @@ private fun TextWithEmphasis(
                 },
                 onTap = { offset ->
                     textLayoutResult?.let { layout ->
+                        val hit = getHighlightAt(offset, layout)
+                        if (hit != null) {
+                            val (highlight, localRect) = hit
+                            val globalRect = layoutCoordinates?.let { coords ->
+                                if (coords.isAttached) {
+                                    val topLeft = coords.localToWindow(localRect.topLeft)
+                                    val bottomRight = coords.localToWindow(localRect.bottomRight)
+                                    Rect(topLeft, bottomRight)
+                                } else null
+                            } ?: localRect
+                            onHighlightClick(highlight, globalRect)
+                            return@detectTapGestures
+                        }
+
                         val charOffset = layout.getOffsetForPosition(offset)
-                        val urlAnnotation = text.getStringAnnotations(
-                            "URL", charOffset, charOffset
-                        ).firstOrNull()
+                        val urlAnnotation = text.getStringAnnotations("URL", charOffset, charOffset).firstOrNull()
                         if (urlAnnotation != null) onLinkClick(urlAnnotation.item)
                         else onGeneralTap(offset)
                     }
-                })
+                }
+            )
         }, onTextLayout = {
         textLayoutResult = it
         if (layoutCoordinates != null && block.cfi != null) {
@@ -1713,7 +1658,6 @@ internal fun PaginatedReaderContent(
                                     is HeaderBlock -> firstTextBlock.startCharOffsetInSource
                                     is QuoteBlock -> firstTextBlock.startCharOffsetInSource
                                     is ListItemBlock -> firstTextBlock.startCharOffsetInSource
-                                    else -> 0
                                 }
 
                                 val newTextPerBlock = (previousSel?.textPerBlock ?: emptyMap()).toMutableMap()
@@ -2853,7 +2797,6 @@ internal fun PaginatedReaderContent(
                                     is HeaderBlock -> block.startCharOffsetInSource
                                     is QuoteBlock -> block.startCharOffsetInSource
                                     is ListItemBlock -> block.startCharOffsetInSource
-                                    else -> 0
                                 }
                                 val isStartBlockPart = block.blockIndex == sel.startBlockIndex && currentBlockAbs == sel.startBlockCharOffset
                                 val isEndBlockPart = block.blockIndex == sel.endBlockIndex && currentBlockAbs == sel.endBlockCharOffset
@@ -3008,7 +2951,6 @@ internal fun PaginatedReaderContent(
                                     is HeaderBlock -> block.startCharOffsetInSource
                                     is QuoteBlock -> block.startCharOffsetInSource
                                     is ListItemBlock -> block.startCharOffsetInSource
-                                    else -> 0
                                 }
                                 var newStartBlockAbs = if (isStartHandle) currentBlockAbs else sel.startBlockCharOffset
                                 var newEndBlockAbs = if (!isStartHandle) currentBlockAbs else sel.endBlockCharOffset
@@ -3044,7 +2986,6 @@ internal fun PaginatedReaderContent(
                                                 is HeaderBlock -> (b.third as HeaderBlock).startCharOffsetInSource
                                                 is QuoteBlock -> (b.third as QuoteBlock).startCharOffsetInSource
                                                 is ListItemBlock -> (b.third as ListItemBlock).startCharOffsetInSource
-                                                else -> 0
                                             }
                                         }))
 
@@ -3061,7 +3002,6 @@ internal fun PaginatedReaderContent(
                                             is HeaderBlock -> b.third.startCharOffsetInSource
                                             is QuoteBlock -> b.third.startCharOffsetInSource
                                             is ListItemBlock -> b.third.startCharOffsetInSource
-                                            else -> 0
                                         }
                                         val isStartBlockPart = b.third.blockIndex == newStartIdx && bAbs == newStartBlockAbs
                                         val isEndBlockPart = b.third.blockIndex == newEndIdx && bAbs == newEndBlockAbs
@@ -3092,7 +3032,6 @@ internal fun PaginatedReaderContent(
                                             is HeaderBlock -> it.third.startCharOffsetInSource
                                             is QuoteBlock -> it.third.startCharOffsetInSource
                                             is ListItemBlock -> it.third.startCharOffsetInSource
-                                            else -> 0
                                         }
                                         abs == newStartBlockAbs
                                     }
@@ -3187,7 +3126,6 @@ internal fun PaginatedReaderContent(
                                             is HeaderBlock -> block.startCharOffsetInSource
                                             is QuoteBlock -> block.startCharOffsetInSource
                                             is ListItemBlock -> block.startCharOffsetInSource
-                                            else -> 0
                                         }
                                         blockAbs == targetBlockAbs
                                     }
