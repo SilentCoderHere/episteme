@@ -215,8 +215,9 @@ fun LibraryScreen(
         if (isContextualModeActive) {
             viewModel.clearContextualAction()
         }
+        val mimeTypes = if (uiState.useStrictFileFilter) MainViewModel.SUPPORTED_MIME_TYPES else arrayOf("*/*")
         try {
-            pickFileLauncher.launch(arrayOf("*/*"))
+            pickFileLauncher.launch(mimeTypes)
         } catch (_: android.content.ActivityNotFoundException) {
             Timber.w("OpenDocument picker failed. Falling back to GetMultipleContents.")
             try {
@@ -1553,7 +1554,7 @@ private fun FolderSyncScreen(
 
     Scaffold(
         floatingActionButton = {
-            if (syncedFolders.size < 3) {
+            if (syncedFolders.size < 10) {
                 ExtendedFloatingActionButton(
                     text = { Text(stringResource(R.string.fab_add_folder)) },
                     icon = { Icon(Icons.Default.Add, "Add") },

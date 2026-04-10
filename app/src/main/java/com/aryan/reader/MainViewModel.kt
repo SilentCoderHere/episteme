@@ -242,6 +242,7 @@ data class ReaderScreenState(
     val activeTabBookId: String? = null,
     val showExternalFileSavePromptFor: String? = null,
     val externalFileBehavior: String = "ASK",
+    val useStrictFileFilter: Boolean = false,
 )
 
 open class MainViewModel(application: Application) : AndroidViewModel(application) {
@@ -352,7 +353,8 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                 } catch(_: Exception) { emptyList() }
             } ?: emptyList(),
             activeTabBookId = prefs.getString(KEY_ACTIVE_TAB, null),
-            externalFileBehavior = prefs.getString(KEY_EXTERNAL_FILE_BEHAVIOR, "ASK") ?: "ASK"
+            externalFileBehavior = prefs.getString(KEY_EXTERNAL_FILE_BEHAVIOR, "ASK") ?: "ASK",
+            useStrictFileFilter = prefs.getBoolean(KEY_USE_STRICT_FILE_FILTER, false)
         )
     )
 
@@ -4468,6 +4470,21 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    fun closeAllTabs() {
+        Timber.tag("PdfTabSync").i("ViewModel: closeAllTabs called")
+        prefs.edit {
+            remove(KEY_OPEN_TAB_IDS)
+            remove(KEY_ACTIVE_TAB)
+        }
+        _internalState.update { it.copy(openTabIds = emptyList(), activeTabBookId = null) }
+        clearSelectedFile()
+    }
+
+    fun setStrictFileFilter(enabled: Boolean) {
+        prefs.edit { putBoolean(KEY_USE_STRICT_FILE_FILTER, enabled) }
+        _internalState.update { it.copy(useStrictFileFilter = enabled) }
+    }
+
     companion object {
         private const val KEY_SORT_ORDER = "sort_order"
         internal const val KEY_SHELVES = "shelf_names"
@@ -4483,7 +4500,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
         internal const val KEY_SYNCED_FOLDER_URI = "synced_folder_uri"
         internal const val KEY_LAST_FOLDER_SCAN_TIME = "last_folder_scan_time"
         private const val KEY_SYNCED_FOLDERS_JSON = "synced_folders_list_json"
-        private const val MAX_FOLDER_LIMIT = 3
+        private const val MAX_FOLDER_LIMIT = 10
         internal const val KEY_PINNED_HOME = "pinned_home_books"
         internal const val KEY_PINNED_LIBRARY = "pinned_library_books"
         private const val KEY_RECENT_FILES_LIMIT = "recent_files_limit"
@@ -4491,5 +4508,21 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
         private const val KEY_OPEN_TAB_IDS = "open_tab_ids"
         private const val KEY_ACTIVE_TAB = "active_tab_book_id"
         private const val KEY_EXTERNAL_FILE_BEHAVIOR = "external_file_behavior"
+        private const val KEY_USE_STRICT_FILE_FILTER = "use_strict_file_filter"
+
+        val SUPPORTED_MIME_TYPES = arrayOf(
+            "application/pdf", "application/epub+zip", "application/x-mobipocket-ebook",
+            "application/vnd.amazon.ebook", "application/vnd.amazon.mobi8-ebook", "text/markdown",
+            "text/x-markdown", "text/plain", "text/html", "application/xhtml+xml",
+            "application/x-fictionbook+xml", "application/x-zip-compressed-fb2", "application/zip",
+            "application/vnd.comicbook+zip", "application/x-cbz", "application/vnd.comicbook-rar",
+            "application/x-cbr", "application/x-rar-compressed", "application/x-cb7",
+            "application/x-7z-compressed", "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "application/vnd.oasis.opendocument.text", "application/x-vnd.oasis.opendocument.text-flat-xml",
+            "text/csv", "text/comma-separated-values", "text/tab-separated-values", "application/json",
+            "application/xml", "text/xml", "text/x-java-source", "text/x-python", "text/x-kotlin",
+            "text/javascript", "application/javascript", "text/x-c", "text/x-c++",
+            "text/x-csharp", "text/x-ruby", "text/x-go", "text/x-log"
+        )
     }
 }

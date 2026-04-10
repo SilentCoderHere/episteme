@@ -47,7 +47,9 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
@@ -55,6 +57,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.FolderSpecial
@@ -79,6 +82,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.InputChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalDrawerSheet
 import androidx.compose.material3.ModalNavigationDrawer
@@ -146,10 +150,12 @@ fun HomeScreen(
 ) {
     val context = LocalContext.current
     val customTabUriHandler = remember { CustomTabUriHandler(context) }
+    var showCloseAllTabsDialog by remember { mutableStateOf(false) }
 
     CompositionLocalProvider(LocalUriHandler provides customTabUriHandler) {
         val uiState by viewModel.uiState.collectAsStateWithLifecycle()
         val recentFilesForHome = uiState.recentFiles.filter { it.isRecent }
+        val openTabs = uiState.openTabs
         val selectedContextItems = uiState.contextualActionItems
         val isContextualModeActive = selectedContextItems.isNotEmpty()
         val scope = rememberCoroutineScope()
@@ -166,7 +172,7 @@ fun HomeScreen(
         var showInfoDialog by remember { mutableStateOf(false) }
         var itemForInfoDialog by remember { mutableStateOf<RecentFileItem?>(null) }
         var showBehaviorDialog by remember { mutableStateOf(false) }
-
+        var showStrictFilterDialog by remember { mutableStateOf(false) }
         var showClearBookCacheDialog by remember { mutableStateOf(false) }
         var showClearReflowCacheDialog by remember { mutableStateOf(false) }
 
@@ -240,8 +246,9 @@ fun HomeScreen(
             if (isContextualModeActive) {
                 viewModel.clearContextualAction()
             }
+            val mimeTypes = if (uiState.useStrictFileFilter) MainViewModel.SUPPORTED_MIME_TYPES else arrayOf("*/*")
             try {
-                pickFileLauncher.launch(arrayOf("*/*"))
+                pickFileLauncher.launch(mimeTypes)
             } catch (_: android.content.ActivityNotFoundException) {
                 Timber.w("OpenDocument picker failed. Falling back to GetMultipleContents.")
                 try {
@@ -312,7 +319,14 @@ fun HomeScreen(
                                 onClearReflowCache = { showClearReflowCacheDialog = true },
                                 onRecentFilesLimitChange = viewModel::setRecentFilesLimit,
                                 onTabsToggle = viewModel::setTabsEnabled,
-                                onExternalFileBehaviorClick = { showBehaviorDialog = true }
+                                onExternalFileBehaviorClick = { showBehaviorDialog = true },
+                                onStrictFilterToggleClick = {
+                                    if (uiState.useStrictFileFilter) {
+                                        viewModel.setStrictFileFilter(false)
+                                    } else {
+                                        showStrictFilterDialog = true
+                                    }
+                                }
                             )
                         } else {
                             ContextualTopAppBar(
@@ -335,7 +349,7 @@ fun HomeScreen(
                                 .fillMaxSize()
                                 .padding(paddingValues)
                         ) {
-                            if (recentFilesForHome.isEmpty()) {
+                            if (recentFilesForHome.isEmpty() && (!uiState.isTabsEnabled || openTabs.isEmpty())) {
                                 if (uiState.recentFiles.isEmpty()) {
                                     EmptyState(
                                         title = stringResource(R.string.your_library_empty),
@@ -356,10 +370,14 @@ fun HomeScreen(
                             } else {
                                 RecentFilesContent(
                                     recentFiles = recentFilesForHome,
+                                    openTabs = openTabs,
+                                    isTabsEnabled = uiState.isTabsEnabled,
                                     selectedContextItems = selectedContextItems,
                                     pinnedHomeBookIds = uiState.pinnedHomeBookIds,
                                     onItemClick = { item -> viewModel.onRecentFileClicked(item) },
                                     onItemLongClick = { item -> viewModel.onRecentItemLongPress(item) },
+                                    onTabCloseClick = { bookId -> viewModel.closeTab(bookId) },
+                                    onCloseAllTabsClick = { showCloseAllTabsDialog = true },
                                     onSelectFileClick = onSelectFileClick,
                                     onNavigateToFolderSync = { viewModel.navigateToFolderSync() },
                                     windowSizeClass = windowSizeClass,
@@ -393,6 +411,16 @@ fun HomeScreen(
                             viewModel.hideItemsFromRecentsView()
                             showDeleteConfirmDialog = false
                         }, onDismiss = { showDeleteConfirmDialog = false })
+                    }
+
+                    if (showCloseAllTabsDialog) {
+                        CloseAllTabsDialog(
+                            onConfirm = {
+                                viewModel.closeAllTabs()
+                                showCloseAllTabsDialog = false
+                            },
+                            onDismiss = { showCloseAllTabsDialog = false }
+                        )
                     }
 
                     if (showClearCloudDataDialog) {
@@ -461,6 +489,16 @@ fun HomeScreen(
                             onSelect = { viewModel.setExternalFileBehavior(it) }
                         )
                     }
+
+                    if (showStrictFilterDialog) {
+                        StrictFilterConfirmationDialog(
+                            onConfirm = {
+                                viewModel.setStrictFileFilter(true)
+                                showStrictFilterDialog = false
+                            },
+                            onDismiss = { showStrictFilterDialog = false }
+                        )
+                    }
                 }
             }
             if (showAboutDialog) {
@@ -504,10 +542,14 @@ fun HomeScreen(
 @Composable
 private fun RecentFilesContent(
     recentFiles: List<RecentFileItem>,
+    openTabs: List<RecentFileItem>,
+    isTabsEnabled: Boolean,
     selectedContextItems: Collection<RecentFileItem>,
     pinnedHomeBookIds: Set<String>,
     onItemClick: (RecentFileItem) -> Unit,
     onItemLongClick: (RecentFileItem) -> Unit,
+    onTabCloseClick: (String) -> Unit,
+    onCloseAllTabsClick: () -> Unit,
     onSelectFileClick: () -> Unit,
     onNavigateToFolderSync: () -> Unit,
     windowSizeClass: WindowSizeClass,
@@ -526,6 +568,10 @@ private fun RecentFilesContent(
                     .fillMaxSize()
                     .padding(horizontal = 16.dp),
                 recentFiles = recentFiles,
+                openTabs = openTabs,
+                isTabsEnabled = isTabsEnabled,
+                onTabCloseClick = onTabCloseClick,
+                onCloseAllTabsClick = onCloseAllTabsClick,
                 selectedItemUris = selectedContextItems.mapNotNull { it.uriString }.toSet(),
                 pinnedHomeBookIds = pinnedHomeBookIds,
                 onItemClick = onItemClick,
@@ -570,6 +616,10 @@ private fun RecentFilesContent(
 private fun RecentFilesGrid(
     modifier: Modifier = Modifier,
     recentFiles: List<RecentFileItem>,
+    openTabs: List<RecentFileItem>,
+    isTabsEnabled: Boolean,
+    onTabCloseClick: (String) -> Unit,
+    onCloseAllTabsClick: () -> Unit,
     pinnedHomeBookIds: Set<String>,
     selectedItemUris: Set<String>,
     onItemClick: (RecentFileItem) -> Unit,
@@ -585,11 +635,66 @@ private fun RecentFilesGrid(
     }
 
     Column(modifier = modifier) {
+        if (isTabsEnabled && openTabs.isNotEmpty()) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 8.dp, top = 24.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = stringResource(R.string.active_tabs),
+                    style = MaterialTheme.typography.titleLarge
+                )
+                IconButton(onClick = onCloseAllTabsClick) {
+                    Icon(
+                        imageVector = Icons.Default.Close,
+                        contentDescription = stringResource(R.string.close_all_tabs),
+                        tint = MaterialTheme.colorScheme.error
+                    )
+                }
+            }
+            LazyRow(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier.fillMaxWidth(),
+                contentPadding = PaddingValues(bottom = 8.dp)
+            ) {
+                items(openTabs, key = { "tab_${it.bookId}" }) { tab ->
+                    InputChip(
+                        selected = false,
+                        onClick = { onItemClick(tab) },
+                        label = {
+                            Text(
+                                text = tab.customName ?: tab.title ?: tab.displayName,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.widthIn(max = 150.dp)
+                            )
+                        },
+                        trailingIcon = {
+                            IconButton(
+                                onClick = { onTabCloseClick(tab.bookId) },
+                                modifier = Modifier.size(24.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Close,
+                                    contentDescription = stringResource(R.string.close_tab),
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            }
+                        }
+                    )
+                }
+            }
+        }
+
         Text(
             text = stringResource(R.string.recent_files),
             style = MaterialTheme.typography.titleLarge,
-            modifier = Modifier.padding(bottom = 8.dp, top = 24.dp)
+            modifier = Modifier.padding(bottom = 8.dp, top = if (isTabsEnabled && openTabs.isNotEmpty()) 8.dp else 24.dp)
         )
+
         LazyVerticalGrid(
             columns = gridCells,
             contentPadding = contentPadding,
@@ -777,7 +882,8 @@ fun DefaultTopAppBar(
     onFolderSyncToggle: (Boolean) -> Unit,
     onRecentFilesLimitChange: (Int) -> Unit,
     onTabsToggle: (Boolean) -> Unit,
-    onExternalFileBehaviorClick: () -> Unit
+    onExternalFileBehaviorClick: () -> Unit,
+    onStrictFilterToggleClick: () -> Unit
 ) {
     var showOptionsMenu by remember { mutableStateOf(false) }
     var showLimitMenu by remember { mutableStateOf(false) }
@@ -844,6 +950,15 @@ fun DefaultTopAppBar(
                 DropdownMenuItem(text = { Text(stringResource(R.string.options_external_file_behavior)) }, onClick = {
                     onExternalFileBehaviorClick()
                     showOptionsMenu = false
+                })
+
+                DropdownMenuItem(text = { Text("Use Strict File Filter") }, onClick = {
+                    onStrictFilterToggleClick()
+                    showOptionsMenu = false
+                }, trailingIcon = {
+                    if (uiState.useStrictFileFilter) {
+                        Icon(Icons.Default.Check, contentDescription = "Enabled")
+                    }
                 })
 
                 HorizontalDivider()
@@ -1381,5 +1496,36 @@ fun ExternalFileBehaviorDialog(
         confirmButton = {
             TextButton(onClick = onDismiss) { Text(stringResource(R.string.action_cancel)) }
         }
+    )
+}
+
+@Composable
+fun CloseAllTabsDialog(onConfirm: () -> Unit, onDismiss: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(stringResource(R.string.dialog_close_all_tabs)) },
+        text = { Text(stringResource(R.string.dialog_close_all_tabs_desc)) },
+        confirmButton = {
+            TextButton(
+                onClick = onConfirm,
+                colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)
+            ) {
+                Text(stringResource(R.string.action_close))
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text(stringResource(R.string.action_cancel)) }
+        }
+    )
+}
+
+@Composable
+fun StrictFilterConfirmationDialog(onConfirm: () -> Unit, onDismiss: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Enable Strict File Filter") },
+        text = { Text("If you enable this, some supported file types like AZW3, CB7, and FB2 might not show up depending on your file manager.\n\nAre you sure you want to enable this filter?") },
+        confirmButton = { TextButton(onClick = onConfirm) { Text("Enable") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text(stringResource(R.string.action_cancel)) } }
     )
 }
