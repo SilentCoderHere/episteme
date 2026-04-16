@@ -1,3 +1,25 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <string name="action_cancel">إلغاء</string>
+    <string name="action_save">حفظ</string>
+    <string name="action_delete">حذف</string>
+    <string name="action_remove">إزالة</string>
+    <string name="action_ok">موافق</string>
+    <string name="action_close">إغلاق</string>
+    <string name="action_add">إضافة</string>
+    <string name="action_rename">إعادة تسمية</string>
+    <string name="action_back">رجوع</string>
+    <string name="action_search">بحث</string>
+    <string name="action_clear">مسح</string>
+    <string name="action_apply">تطبيق</string>
+    <string name="tab_free">مجاني</string>
+    <string name="active_tabs">التبويبات النشطة</string>
+    <string name="close_tab">إغلاق التبويب</string>
+    <string name="close_all_tabs">إغلاق الكل</string>
+    <string name="dialog_close_all_tabs">إغلاق الكل؟</string>
+    <string name="dialog_close_all_tabs_desc">هل أنت متأكد من رغبتك في إغلاق جميع علامات التبويب النشطة؟</string>
+    <string name="legal_agreement_full">%1$s أنت توافق على %2$s الخاصة بنا، وتقر بأنك قد قرأت %3$s.</string>
+    <string name="legal_terms_of_service">شروط الخدمة</string>
+    <string name="legal_privacy_policy">سياسة الخصوصية</string>
+    <string name="legal_licenses">التراخيص</string>
 </resources>
