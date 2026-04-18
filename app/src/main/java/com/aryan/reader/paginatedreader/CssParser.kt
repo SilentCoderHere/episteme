@@ -34,7 +34,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.em
-import androidx.compose.ui.unit.sp
+import androidx.compose.ui.unit.isSpecified
 import timber.log.Timber
 import java.io.File
 import java.util.regex.Pattern
@@ -427,6 +427,11 @@ object CssParser {
         var marginBottomStr: String? = null
         var marginLeftStr: String? = null
 
+        var wordSpacing: TextUnit = TextUnit.Unspecified
+        var textDecorationStyle: String? = null
+        var textDecorationColor: Color = Color.Unspecified
+        var textUnderlineOffset: Dp = Dp.Unspecified
+
         var borderTopWidth: Dp? = null
         var borderRightWidth: Dp? = null
         var borderBottomWidth: Dp? = null
@@ -566,14 +571,42 @@ object CssParser {
                         }
                     }
                     "text-decoration" -> {
-                        spanStyle = spanStyle.copy(
-                            textDecoration = when(value) {
-                                "underline" -> TextDecoration.Underline
-                                "line-through" -> TextDecoration.LineThrough
-                                "none" -> TextDecoration.None
-                                else -> spanStyle.textDecoration
-                            }
-                        )
+                        val parts = value.split(" ")
+                        val decos = mutableListOf<TextDecoration>()
+
+                        if (parts.contains("underline")) decos.add(TextDecoration.Underline)
+                        if (parts.contains("line-through")) decos.add(TextDecoration.LineThrough)
+
+                        if (parts.contains("none")) {
+                            spanStyle = spanStyle.copy(textDecoration = TextDecoration.None)
+                        } else if (decos.isNotEmpty()) {
+                            spanStyle = spanStyle.copy(textDecoration = TextDecoration.combine(decos))
+                        }
+
+                        val styles = listOf("solid", "double", "dotted", "dashed", "wavy")
+                        parts.firstOrNull { it in styles }?.let { textDecorationStyle = it }
+                        parts.firstNotNullOfOrNull { parseColor(it) }?.let { color ->
+                            textDecorationColor = this@CssParser.adaptColorForTheme(color, isDarkTheme, isBackground = false, themeBackgroundColor, themeTextColor)
+                        }
+                    }
+                    "word-spacing" -> {
+                        val trimmedValue = value.trim()
+                        wordSpacing = if (trimmedValue.lowercase() == "normal") {
+                            TextUnit.Unspecified
+                        } else {
+                            parseCssDimensionToTextUnit(value, containerWidthPx, density)
+                        }
+                    }
+                    "text-decoration-style" -> {
+                        textDecorationStyle = value
+                    }
+                    "text-decoration-color" -> {
+                        parseColor(value)?.let {
+                            textDecorationColor = this@CssParser.adaptColorForTheme(it, isDarkTheme, isBackground = false, themeBackgroundColor, themeTextColor)
+                        }
+                    }
+                    "text-underline-offset" -> {
+                        textUnderlineOffset = parseCssSizeToDp(value, baseFontSizeSp, density, containerWidthPx)
                     }
                     "letter-spacing" -> {
                         val letterSpacing = parseCssDimensionToTextUnit(value, containerWidthPx, density)
@@ -623,9 +656,9 @@ object CssParser {
                     "padding-left" -> padding = padding.copy(left = parseCssSizeToDp(value, baseFontSizeSp, density, containerWidthPx))
                     "padding-right" -> padding = padding.copy(right = parseCssSizeToDp(value, baseFontSizeSp, density, containerWidthPx))
 
-                    "width" -> width = parseCssSizeToDp(value, baseFontSizeSp, density, containerWidthPx)
-                    "max-width" -> maxWidth = parseCssSizeToDp(value, baseFontSizeSp, density, containerWidthPx)
-                    "height" -> height = parseCssSizeToDp(value, baseFontSizeSp, density, containerWidthPx)
+                    "width" -> width = parseCssDimension(value, baseFontSizeSp, density, containerWidthPx)
+                    "max-width" -> maxWidth = parseCssDimension(value, baseFontSizeSp, density, containerWidthPx)
+                    "height" -> height = parseCssDimension(value, baseFontSizeSp, density, containerWidthPx)
 
                     "background-color" -> {
                         val originalColor = parseColor(value) ?: Color.Unspecified
@@ -872,7 +905,10 @@ object CssParser {
             borderCollapse = borderCollapse,
             borderSpacing = borderSpacing
         )
-        return CssStyle(spanStyle, paragraphStyle, blockStyle, fontFamilies, display, fontSize, textTransform, boxSizing, content, hyphens, fontVariantNumeric, textEmphasis)
+        return CssStyle(
+            spanStyle, paragraphStyle, blockStyle, fontFamilies, display, fontSize, textTransform, boxSizing, content, hyphens, fontVariantNumeric, textEmphasis,
+            wordSpacing, textDecorationStyle, textDecorationColor, textUnderlineOffset
+        )
     }
 
     private fun parseShorthand4(value: String, baseFontSize: Float, density: Float, containerWidth: Int): List<Dp> {
@@ -939,7 +975,46 @@ object CssParser {
         return Triple(w, s, c)
     }
 
-    // ADD the parseCssSizeToDp function here at the bottom of the object or file
+    internal fun parseCssDimension(
+        size: String,
+        baseFontSizeSp: Float,
+        density: Float,
+        containerWidthPx: Int
+    ): Dp {
+        val trimmed = size.trim().lowercase()
+        if (trimmed in listOf("auto", "none", "max-content", "min-content", "fit-content", "inherit", "initial")) {
+            return Dp.Unspecified
+        }
+        if (trimmed == "0" || trimmed == "0px") return 0.dp
+
+        return when {
+            trimmed.endsWith("px") -> trimmed.removeSuffix("px").toFloatOrNull()?.let { (it / density).dp } ?: Dp.Unspecified
+            trimmed.endsWith("dp") -> trimmed.removeSuffix("dp").toFloatOrNull()?.dp ?: Dp.Unspecified
+            trimmed.endsWith("em") -> trimmed.removeSuffix("em").toFloatOrNull()?.let { (it * baseFontSizeSp).dp } ?: Dp.Unspecified
+            trimmed.endsWith("rem") -> trimmed.removeSuffix("rem").toFloatOrNull()?.let { (it * baseFontSizeSp).dp } ?: Dp.Unspecified
+            trimmed.endsWith("pt") -> trimmed.removeSuffix("pt").toFloatOrNull()?.let { (it * 1.33f).dp } ?: Dp.Unspecified
+            trimmed.endsWith("%") -> {
+                val percent = trimmed.removeSuffix("%").toFloatOrNull()
+                if (percent != null) {
+                    ((percent / 100f) * containerWidthPx / density).dp
+                } else {
+                    Dp.Unspecified
+                }
+            }
+            trimmed.endsWith("vw") -> {
+                val percent = trimmed.removeSuffix("vw").toFloatOrNull()
+                if (percent != null) {
+                    ((percent / 100f) * containerWidthPx / density).dp
+                } else {
+                    Dp.Unspecified
+                }
+            }
+            trimmed.endsWith("vh") -> Dp.Unspecified
+            trimmed.toFloatOrNull() != null -> (trimmed.toFloat() / density).dp
+            else -> Dp.Unspecified
+        }
+    }
+
     internal fun parseCssSizeToDp(
         size: String,
         baseFontSizeSp: Float,
@@ -947,45 +1022,9 @@ object CssParser {
         containerWidthPx: Int
     ): Dp {
         val trimmed = size.trim().lowercase()
-        // Handle keywords
         BORDER_WIDTH_KEYWORDS[trimmed]?.let { return it }
-
-        if (trimmed == "0" || trimmed == "0px") return 0.dp
-
-        return when {
-            trimmed.endsWith("px") -> trimmed.removeSuffix("px").toFloatOrNull()?.let { (it / density).dp } ?: 0.dp
-            trimmed.endsWith("dp") -> trimmed.removeSuffix("dp").toFloatOrNull()?.dp ?: 0.dp
-            trimmed.endsWith("em") -> trimmed.removeSuffix("em").toFloatOrNull()?.let { (it * baseFontSizeSp).dp } ?: 0.dp
-            trimmed.endsWith("rem") -> trimmed.removeSuffix("rem").toFloatOrNull()?.let { (it * baseFontSizeSp).dp } ?: 0.dp
-            trimmed.endsWith("pt") -> trimmed.removeSuffix("pt").toFloatOrNull()?.let { (it * 1.33f).dp } ?: 0.dp // 1pt ≈ 1.33px
-            trimmed.endsWith("%") -> {
-                val percent = trimmed.removeSuffix("%").toFloatOrNull()
-                if (percent != null) {
-                    ((percent / 100f) * containerWidthPx / density).dp
-                } else {
-                    0.dp
-                }
-            }
-            trimmed.toFloatOrNull() != null -> (trimmed.toFloat() / density).dp
-            else -> 0.dp
-        }
-    }
-
-    internal fun parseCssDimensionToTextUnit(
-        dimension: String?,
-        containerWidthPx: Int,
-        density: Float
-    ): TextUnit {
-        if (dimension.isNullOrBlank()) return TextUnit.Unspecified
-        val trimmed = dimension.trim().lowercase()
-        return when {
-            trimmed.endsWith("px") -> trimmed.removeSuffix("px").toFloatOrNull()?.sp ?: TextUnit.Unspecified
-            trimmed.endsWith("em") -> trimmed.removeSuffix("em").toFloatOrNull()?.em ?: TextUnit.Unspecified
-            trimmed.endsWith("rem") -> trimmed.removeSuffix("rem").toFloatOrNull()?.em ?: TextUnit.Unspecified
-            trimmed.endsWith("%") -> trimmed.removeSuffix("%").toFloatOrNull()?.let { (it / 100f).em } ?: TextUnit.Unspecified
-            trimmed.endsWith("pt") -> trimmed.removeSuffix("pt").toFloatOrNull()?.let { (it * 1.33f).sp } ?: TextUnit.Unspecified
-            else -> TextUnit.Unspecified
-        }
+        val dim = parseCssDimension(size, baseFontSizeSp, density, containerWidthPx)
+        return if (dim.isSpecified) dim else 0.dp
     }
 
     internal fun parseColor(colorString: String): Color? {

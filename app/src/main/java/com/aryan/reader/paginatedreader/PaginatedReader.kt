@@ -1,4 +1,6 @@
 // PaginatedReader.kt
+@file:Suppress("VariableNeverRead")
+
 package com.aryan.reader.paginatedreader
 
 import android.annotation.SuppressLint
@@ -9,6 +11,7 @@ import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.widget.Toast
+import androidx.compose.ui.unit.isSpecified
 import androidx.annotation.RequiresApi
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
@@ -24,7 +27,6 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -49,6 +51,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
@@ -73,6 +76,8 @@ import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.graphics.ColorMatrix
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.PathEffect
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Fill
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.clipPath
@@ -614,6 +619,18 @@ fun PaginatedReaderScreen(
             )
         }
 
+        LaunchedEffect(pagerState) {
+            snapshotFlow { pagerState.currentPage }.collect { page ->
+                Timber.tag("PageTurnDiag").i("Pager Settled: Now on page $page at ${System.currentTimeMillis()}")
+            }
+        }
+
+        LaunchedEffect(pagerState) {
+            snapshotFlow { pagerState.isScrollInProgress }.collect { isScrolling ->
+                Timber.tag("PageTurnDiag").d("Pager Scroll State: isScrolling=$isScrolling")
+            }
+        }
+
         LaunchedEffect(fontSizeMultiplier, lineHeightMultiplier, paragraphGapMultiplier, fontFamily, textAlign) {
             if (fontSizeMultiplier != debouncedFontSizeMult || lineHeightMultiplier != debouncedLineHeightMult || paragraphGapMultiplier != debouncedParagraphGapMult || fontFamily != debouncedFontFamily || textAlign != debouncedTextAlign) {
                 Timber.d("Formatting changed. Waiting for debounce.")
@@ -755,7 +772,7 @@ fun PaginatedReaderScreen(
 
         LaunchedEffect(paginator) {
             if (anchorLocatorForReconfig != null) {
-                Timber.tag("ThemeReconfig").d("Restoration Effect Triggered for Locator: $anchorLocatorForReconfig")
+                Timber.tag("POS_DIAG").d("Restoration Triggered. Anchor Locator: $anchorLocatorForReconfig")
 
                 snapshotFlow { paginator.isLoading }.filter { !it }.first()
 
@@ -763,19 +780,15 @@ fun PaginatedReaderScreen(
                 if (targetLocator != null) {
                     val page = paginator.findPageForLocator(targetLocator)
 
-                    Timber.tag("ThemeReconfig").d("""
-                Restoration Progress:
-                - Target Locator: $targetLocator
-                - Paginator found Page: $page
-                - Chapter Start Page: ${paginator.chapterStartPageIndices[targetLocator.chapterIndex]}
-            """.trimIndent())
+                    Timber.tag("POS_DIAG").d("Restoration Result: Paginator resolved locator to page: $page")
 
                     if (page != null) {
                         pagerState.scrollToPage(page)
+                        Timber.tag("POS_DIAG").i("Restoration: Pager scrolled to $page")
                     } else {
                         val startPage = paginator.chapterStartPageIndices[targetLocator.chapterIndex]
                         if (startPage != null) {
-                            Timber.tag("ThemeReconfig").w("Precise page not found, falling back to chapter start: $startPage")
+                            Timber.tag("POS_DIAG").w("Restoration: Precise page not found, falling back to chapter start: $startPage")
                             pagerState.scrollToPage(startPage)
                         }
                     }
@@ -831,7 +844,15 @@ fun PaginatedReaderScreen(
             textStyle = textStyle,
             horizontalPadding = horizontalPadding,
             verticalPadding = verticalPadding,
-            onGetPage = { pageIndex -> paginator.getPageContent(pageIndex) },
+            onGetPage = { pageIndex ->
+                val startTime = System.currentTimeMillis()
+                val result = paginator.getPageContent(pageIndex)
+                val duration = System.currentTimeMillis() - startTime
+                if (duration > 16) {
+                    Timber.tag("PageTurnDiag").w("HEAVY TASK: paginator.getPageContent($pageIndex) took ${duration}ms on Thread ${Thread.currentThread().name}")
+                }
+                result
+            },
             onGetChapterPath = { pageIndex -> paginator.getChapterPathForPage(pageIndex) },
             onGetChapterInfo = { pageIndex ->
                 paginator.findChapterIndexForPage(pageIndex)?.let { chapterIndex ->
@@ -1186,8 +1207,206 @@ private fun TextWithEmphasis(
     var layoutCoordinates by remember { mutableStateOf<LayoutCoordinates?>(null) }
     val scope = rememberCoroutineScope()
     var pressedHighlightCfi by remember { mutableStateOf<String?>(null) }
+    val density = LocalDensity.current
+
+    data class EmphasisMarkInfo(val center: Offset, val radius: Float, val color: Color)
+    data class UnderlineDrawInfo(val path: Path?, val effect: PathEffect?, val minX: Float, val maxX: Float, val y: Float, val decoStyle: String, val decoColor: Color)
+
+    // --- CACHING DECORATIONS FOR PERFORMANCE ---
+    val cachedHighlights = remember(block, userHighlights, textLayoutResult, pressedHighlightCfi) {
+        val startTime = System.currentTimeMillis()
+        val paths = mutableListOf<Pair<Path, Color>>()
+        val layout = textLayoutResult
+        if (layout != null && block.cfi != null && userHighlights.isNotEmpty()) {
+            userHighlights.forEach { highlight ->
+                val range = getHighlightOffsetsInBlock(block, highlight)
+                if (range != null) {
+                    try {
+                        val path = layout.getPathForRange(range.first, range.last + 1)
+                        paths.add(path to highlight.color.color.copy(alpha = 0.4f))
+                        if (highlight.cfi == pressedHighlightCfi) {
+                            paths.add(path to Color.Black.copy(alpha = 0.1f))
+                        }
+                    } catch (e: Exception) {
+                        Timber.tag("DecorationsDiag").e(e, "Highlight path out of bounds")
+                    }
+                }
+            }
+        }
+        val duration = System.currentTimeMillis() - startTime
+        if (duration > 5) {
+            Timber.tag("DecorationsDiag").w("Calculated highlight paths for block ${block.blockIndex} in ${duration}ms")
+        }
+        paths
+    }
+
+    val cachedEmphasisMarks = remember(textLayoutResult, text, style.color, density) {
+        val startTime = System.currentTimeMillis()
+        val marks = mutableListOf<EmphasisMarkInfo>()
+        val layout = textLayoutResult
+        if (layout != null) {
+            val emphasisAnnotations = text.getStringAnnotations("TextEmphasis", 0, text.length)
+            if (emphasisAnnotations.isNotEmpty()) {
+                with(density) { // Provides the scope for .toPx()
+                    emphasisAnnotations.forEach { annotation ->
+                        val emphasis = parseEmphasisAnnotation(annotation.item, style.color)
+                        val markColor = if (emphasis.color.isSpecified) emphasis.color else style.color
+                        val markSize = layout.layoutInput.style.fontSize.toPx() * 0.3f
+                        for (offset in annotation.start until annotation.end) {
+                            if (offset >= text.text.length || text.text[offset].isWhitespace()) continue
+                            try {
+                                val boundingBox = layout.getBoundingBox(offset)
+                                val center = Offset(
+                                    boundingBox.center.x,
+                                    if (emphasis.position == "under") boundingBox.bottom + markSize * 0.1f
+                                    else boundingBox.top - markSize * 0.1f
+                                )
+                                marks.add(EmphasisMarkInfo(center, markSize / 2, markColor))
+                            } catch (e: Exception) {
+                                Timber.tag("DecorationsDiag").e(e, "Emphasis mark out of bounds")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        val duration = System.currentTimeMillis() - startTime
+        if (duration > 5) {
+            Timber.tag("DecorationsDiag").w("Calculated emphasis marks for block ${block.blockIndex} in ${duration}ms")
+        }
+        marks
+    }
+
+    val cachedUnderlines = remember(textLayoutResult, text, style.color, density) {
+        val startTime = System.currentTimeMillis()
+        val lines = mutableListOf<UnderlineDrawInfo>()
+        val layout = textLayoutResult
+        if (layout != null) {
+            val customUnderlines = text.getStringAnnotations("CustomUnderline", 0, text.length)
+            if (customUnderlines.isNotEmpty()) {
+                val maxIdx = maxOf(0, text.length - 1)
+                val groupedUnderlines = customUnderlines.groupBy { it.item }
+                val mergedUnderlines = mutableListOf<AnnotatedString.Range<String>>()
+
+                groupedUnderlines.forEach { (item, annotations) ->
+                    val sorted = annotations.sortedBy { it.start }
+                    var currentStart = -1
+                    var currentEnd = -1
+
+                    for (ann in sorted) {
+                        if (currentStart == -1) {
+                            currentStart = ann.start
+                            currentEnd = ann.end
+                        } else if (ann.start <= currentEnd) {
+                            currentEnd = maxOf(currentEnd, ann.end)
+                        } else {
+                            mergedUnderlines.add(AnnotatedString.Range(item, currentStart, currentEnd))
+                            currentStart = ann.start
+                            currentEnd = ann.end
+                        }
+                    }
+                    if (currentStart != -1) {
+                        mergedUnderlines.add(AnnotatedString.Range(item, currentStart, currentEnd))
+                    }
+                }
+
+                with(density) {
+                    mergedUnderlines.forEach { annotation ->
+                        val parts = annotation.item.split('|')
+                        val decoStyle = parts.getOrNull(0) ?: "solid"
+                        val colorStr = parts.getOrNull(1) ?: "Unspecified"
+                        val decoColor = if (colorStr != "Unspecified") Color(colorStr.toULong()) else style.color
+
+                        val safeStart = annotation.start.coerceIn(0, text.length)
+                        val safeEnd = annotation.end.coerceIn(0, text.length)
+                        if (safeStart < safeEnd) {
+                            val startLine = layout.getLineForOffset(safeStart.coerceIn(0, maxIdx))
+                            val endLine = layout.getLineForOffset((safeEnd - 1).coerceIn(0, maxIdx))
+
+                            for (line in startLine..endLine) {
+                                val lineStart = layout.getLineStart(line)
+                                val lineEnd = layout.getLineEnd(line, visibleEnd = true)
+
+                                val intersectionStart = maxOf(safeStart, lineStart)
+                                val intersectionEnd = minOf(safeEnd, lineEnd)
+
+                                var actualStart = intersectionStart
+                                while (actualStart < intersectionEnd && text[actualStart].isWhitespace()) {
+                                    actualStart++
+                                }
+
+                                var actualEnd = intersectionEnd
+                                while (actualEnd > actualStart && text[actualEnd - 1].isWhitespace()) {
+                                    actualEnd--
+                                }
+
+                                if (actualStart < actualEnd) {
+                                    var minX = Float.POSITIVE_INFINITY
+                                    var maxX = Float.NEGATIVE_INFINITY
+                                    for (i in actualStart until actualEnd) {
+                                        try {
+                                            val box = layout.getBoundingBox(i)
+                                            minX = minOf(minX, box.left, box.right)
+                                            maxX = maxOf(maxX, box.left, box.right)
+                                        } catch (e: Exception) {
+                                            Timber.tag("DecorationsDiag").e(e, "Underline box out of bounds")
+                                        }
+                                    }
+
+                                    if (minX < maxX && !minX.isInfinite() && !maxX.isInfinite()) {
+                                        val baseline = layout.getLineBaseline(line)
+                                        val defaultOffset = layout.layoutInput.style.fontSize.toPx() * 0.1f
+                                        val requestedOffset = parts.getOrNull(2)?.toFloatOrNull()?.dp?.toPx()
+                                        val y = baseline + (requestedOffset ?: defaultOffset)
+
+                                        var underlinePath: Path? = null
+                                        var effect: PathEffect? = null
+
+                                        when (decoStyle) {
+                                            "wavy" -> {
+                                                underlinePath = Path()
+                                                underlinePath.moveTo(minX, y)
+                                                val waveLength = 4.dp.toPx()
+                                                val amplitude = 1.dp.toPx()
+                                                var currentX = minX
+                                                var isUp = true
+
+                                                while (currentX < maxX) {
+                                                    val nextX = minOf(currentX + waveLength / 2f, maxX)
+                                                    val midX = currentX + (nextX - currentX) / 2f
+                                                    val cpY = if (isUp) y - amplitude else y + amplitude
+                                                    underlinePath.quadraticTo(midX, cpY, nextX, y)
+                                                    currentX = nextX
+                                                    isUp = !isUp
+                                                }
+                                            }
+                                            "dashed" -> {
+                                                effect = PathEffect.dashPathEffect(floatArrayOf(4.dp.toPx(), 4.dp.toPx()))
+                                            }
+                                            "dotted" -> {
+                                                effect = PathEffect.dashPathEffect(floatArrayOf(1f, 4.dp.toPx()))
+                                            }
+                                        }
+
+                                        lines.add(UnderlineDrawInfo(underlinePath, effect, minX, maxX, y, decoStyle, decoColor))
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        val duration = System.currentTimeMillis() - startTime
+        if (duration > 5) {
+            Timber.tag("DecorationsDiag").w("Calculated custom underlines for block ${block.blockIndex} in ${duration}ms")
+        }
+        lines
+    }
 
     val customDrawer = Modifier.drawBehind {
+        val drawStartTime = System.currentTimeMillis()
+
         textLayoutResult?.let { layoutResult ->
             if (activeSelection != null) {
                 // ADD absolute offset helper:
@@ -1219,47 +1438,59 @@ private fun TextWithEmphasis(
                             val path = layoutResult.getPathForRange(sOffset, eOffset)
                             drawPath(path, Color(0xFF1976D2).copy(alpha = 0.3f))
                         } catch (e: Exception) {
-                            Timber.e(e, "Highlight path out of bounds")
+                            Timber.tag("DecorationsDiag").e(e, "Highlight path out of bounds")
                         }
                     }
                 }
             }
 
-            if (block.cfi != null && userHighlights.isNotEmpty()) {
-                userHighlights.forEach { highlight ->
-                    val range = getHighlightOffsetsInBlock(block, highlight)
-                    if (range != null) {
-                        try {
-                            val path = layoutResult.getPathForRange(range.first, range.last + 1)
-                            drawPath(path, highlight.color.color.copy(alpha = 0.4f), blendMode = BlendMode.SrcOver)
-                            if (highlight.cfi == pressedHighlightCfi) {
-                                drawPath(path, Color.Black.copy(alpha = 0.1f), blendMode = BlendMode.SrcOver)
-                            }
-                        } catch (_: Exception) { }
-                    }
-                }
+            cachedHighlights.forEach { (path, color) ->
+                drawPath(path, color, blendMode = BlendMode.SrcOver)
             }
 
-            val emphasisAnnotations = text.getStringAnnotations("TextEmphasis", 0, text.length)
-            if (emphasisAnnotations.isNotEmpty()) {
-                emphasisAnnotations.forEach { annotation ->
-                    val emphasis = parseEmphasisAnnotation(annotation.item, style.color)
-                    val markColor = if (emphasis.color.isSpecified) emphasis.color else style.color
-                    val markSize = layoutResult.layoutInput.style.fontSize.toPx() * 0.3f
-                    for (offset in annotation.start until annotation.end) {
-                        if (offset >= text.text.length || text.text[offset].isWhitespace()) continue
-                        try {
-                            val boundingBox = layoutResult.getBoundingBox(offset)
-                            val center = Offset(
-                                boundingBox.center.x,
-                                if (emphasis.position == "under") boundingBox.bottom + markSize * 0.1f
-                                else boundingBox.top - markSize * 0.1f
+            cachedEmphasisMarks.forEach { mark ->
+                drawCircle(mark.color, mark.radius, mark.center, style = Stroke(1f))
+            }
+
+            cachedUnderlines.forEach { line ->
+                when (line.decoStyle) {
+                    "wavy" -> {
+                        line.path?.let { p ->
+                            drawPath(p, color = line.decoColor, style = Stroke(width = 1.dp.toPx(), cap = StrokeCap.Round, join = StrokeJoin.Round))
+                        }
+                    }
+                    "dashed", "dotted" -> {
+                        drawLine(
+                            color = line.decoColor,
+                            start = Offset(line.minX, line.y),
+                            end = Offset(line.maxX, line.y),
+                            strokeWidth = if (line.decoStyle == "dotted") 2.dp.toPx() else 1.dp.toPx(),
+                            cap = if (line.decoStyle == "dotted") StrokeCap.Round else StrokeCap.Butt,
+                            pathEffect = line.effect
+                        )
+                    }
+                    else -> { // Solid or Double
+                        drawLine(
+                            color = line.decoColor,
+                            start = Offset(line.minX, line.y),
+                            end = Offset(line.maxX, line.y),
+                            strokeWidth = 1.dp.toPx()
+                        )
+                        if (line.decoStyle == "double") {
+                            drawLine(
+                                color = line.decoColor,
+                                start = Offset(line.minX, line.y + 2.dp.toPx()),
+                                end = Offset(line.maxX, line.y + 2.dp.toPx()),
+                                strokeWidth = 1.dp.toPx()
                             )
-                            drawCircle(markColor, markSize / 2, center, style = Stroke(1f))
-                        } catch (_: Exception) { }
+                        }
                     }
                 }
             }
+        }
+        val drawDuration = System.currentTimeMillis() - drawStartTime
+        if (drawDuration > 5) {
+            Timber.tag("DecorationsDiag").w("Modifier.drawBehind took ${drawDuration}ms for block ${block.blockIndex}")
         }
     }
 
@@ -1568,6 +1799,7 @@ internal fun PaginatedReaderContent(
                                     val down = event.changes.firstOrNull { it.pressed }
                                     if (down != null) {
                                         pageTurnTouchY = down.position.y
+                                        Timber.tag("PageTurnFixDiag").v("Touch Event: Y=${down.position.y} at OffsetFraction=${pagerState.currentPageOffsetFraction}")
                                     }
                                 }
                             }
@@ -1592,8 +1824,19 @@ internal fun PaginatedReaderContent(
                         var currentChapterPath by remember { mutableStateOf<String?>(null) }
 
                         LaunchedEffect(pageIndex, uiState.generation) {
+                            val fetchStartTime = System.currentTimeMillis()
+                            Timber.tag("PageTurnDiag").d("Page $pageIndex: Starting content fetch")
+
                             pageContent = onGetPage(pageIndex)
+
+                            val fetchDuration = System.currentTimeMillis() - fetchStartTime
+                            Timber.tag("PageTurnDiag").d("Page $pageIndex: Content fetched in ${fetchDuration}ms")
+
                             onGetChapterPath(pageIndex)?.let { currentChapterPath = it }
+                        }
+
+                        SideEffect {
+                            Timber.tag("PageTurnDiag").v("Page $pageIndex: Re-composing content area")
                         }
 
                         val textBlocksOnPage =
@@ -2263,10 +2506,6 @@ internal fun PaginatedReaderContent(
                                                         }
 
                                                         is FlexContainerBlock -> {
-                                                            // Background, border, and padding are
-                                                            // already applied by the outer Box wrapper.
-                                                            // Only apply padding + width here.
-                                                            val containerModifier = paddingModifier
 
                                                             if (block.style.flexDirection == "row") {
                                                                 val horizontalArrangement =
@@ -2284,7 +2523,7 @@ internal fun PaginatedReaderContent(
                                                                         else -> Alignment.Top
                                                                     }
                                                                 Row(
-                                                                    modifier = containerModifier.fillMaxWidth(),
+                                                                    modifier = paddingModifier.fillMaxWidth(),
                                                                     horizontalArrangement = horizontalArrangement,
                                                                     verticalAlignment = verticalAlignment
                                                                 ) {
@@ -2336,7 +2575,7 @@ internal fun PaginatedReaderContent(
                                                                         else -> Alignment.Start
                                                                     }
                                                                 Column(
-                                                                    modifier = containerModifier.fillMaxWidth(),
+                                                                    modifier = paddingModifier.fillMaxWidth(),
                                                                     verticalArrangement = verticalArrangement,
                                                                     horizontalAlignment = horizontalAlignment
                                                                 ) {
@@ -2505,27 +2744,21 @@ internal fun PaginatedReaderContent(
                                                         is ImageBlock -> {
                                                             val style = block.style
                                                             val finalImageModifier = Modifier.then(
-                                                                if (style.width != Dp.Unspecified) Modifier.width(
-                                                                    style.width
-                                                                )
+                                                                if (style.width.isSpecified && style.width > 0.dp) Modifier.width(style.width)
+                                                                else Modifier.fillMaxWidth()
+                                                            ).then(
+                                                                if (style.maxWidth.isSpecified && style.maxWidth > 0.dp) Modifier.widthIn(max = style.maxWidth)
                                                                 else Modifier
                                                             ).then(
-                                                                if (style.maxWidth != Dp.Unspecified) Modifier.widthIn(
-                                                                    max = style.maxWidth
-                                                                )
-                                                                else Modifier
-                                                            ).then(
-                                                                if (block.intrinsicWidth != null && block.intrinsicHeight != null && block.intrinsicWidth > 0f && block.intrinsicHeight > 0f) {
-                                                                    Modifier.aspectRatio(
-                                                                        block.intrinsicWidth / block.intrinsicHeight,
-                                                                        matchHeightConstraintsFirst = false
-                                                                    )
-                                                                } else if (style.height != Dp.Unspecified) {
-                                                                    Modifier.height(style.height)
+                                                                if (block.expectedHeight > 0) {
+                                                                    Modifier.height(with(density) { block.expectedHeight.toDp() })
                                                                 } else {
                                                                     Modifier.height(250.dp)
                                                                 }
                                                             ).then(paddingModifier)
+                                                                .onGloballyPositioned { coords ->
+                                                                    Timber.tag("IMAGE_DIAG").v("Actual Rendered Height for [#${block.blockIndex}]: ${coords.size.height}px")
+                                                                }
 
                                                             val colorFilter =
                                                                 if (block.style.filter == "invert(100%)") {
@@ -2732,24 +2965,13 @@ internal fun PaginatedReaderContent(
                                                                                         }
 
                                                                                         is ImageBlock -> {
-                                                                                            val imageModifier =
-                                                                                                Modifier.fillMaxWidth()
-                                                                                                    .then(
-                                                                                                        if (blockInCell.intrinsicWidth != null && blockInCell.intrinsicHeight != null && blockInCell.intrinsicWidth > 0f && blockInCell.intrinsicHeight > 0f) {
-                                                                                                            Modifier.aspectRatio(
-                                                                                                                blockInCell.intrinsicWidth / blockInCell.intrinsicHeight,
-                                                                                                                matchHeightConstraintsFirst = false
-                                                                                                            )
-                                                                                                        } else if (blockInCell.style.height != Dp.Unspecified) {
-                                                                                                            Modifier.height(
-                                                                                                                blockInCell.style.height
-                                                                                                            )
-                                                                                                        } else {
-                                                                                                            Modifier.height(
-                                                                                                                250.dp
-                                                                                                            )
-                                                                                                        }
-                                                                                                    )
+                                                                                            val imageModifier = Modifier.fillMaxWidth().then(
+                                                                                                if (blockInCell.expectedHeight > 0) {
+                                                                                                    Modifier.height(with(density) { blockInCell.expectedHeight.toDp() })
+                                                                                                } else {
+                                                                                                    Modifier.height(250.dp)
+                                                                                                }
+                                                                                            )
                                                                                             AsyncImage(
                                                                                                 model = Builder(
                                                                                                     LocalContext.current
@@ -3457,18 +3679,16 @@ private fun RenderFlexChildBlock(
             val style = childBlock.style
             val imageModifier = Modifier
                 .then(
-                    if (style.width != Dp.Unspecified) Modifier.width(style.width)
+                    if (style.width != Dp.Unspecified && style.width > 0.dp) Modifier.width(style.width)
                     else Modifier
                 )
                 .then(
-                    if (style.maxWidth != Dp.Unspecified) Modifier.widthIn(max = style.maxWidth)
+                    if (style.maxWidth != Dp.Unspecified && style.maxWidth > 0.dp) Modifier.widthIn(max = style.maxWidth)
                     else Modifier
                 )
                 .then(
-                    if (childBlock.intrinsicWidth != null && childBlock.intrinsicHeight != null && childBlock.intrinsicWidth > 0f && childBlock.intrinsicHeight > 0f) {
-                        Modifier.aspectRatio(childBlock.intrinsicWidth / childBlock.intrinsicHeight, matchHeightConstraintsFirst = false)
-                    } else if (style.height != Dp.Unspecified) {
-                        Modifier.height(style.height)
+                    if (childBlock.expectedHeight > 0) {
+                        Modifier.height(with(density) { childBlock.expectedHeight.toDp() })
                     } else {
                         Modifier.height(250.dp)
                     }
@@ -3582,10 +3802,8 @@ private fun RenderFlexChildBlock(
                                         )
                                     } else if (blockInCell is ImageBlock) {
                                         val imageModifier = Modifier.fillMaxWidth().then(
-                                            if (blockInCell.intrinsicWidth != null && blockInCell.intrinsicHeight != null && blockInCell.intrinsicWidth > 0f && blockInCell.intrinsicHeight > 0f) {
-                                                Modifier.aspectRatio(blockInCell.intrinsicWidth / blockInCell.intrinsicHeight, matchHeightConstraintsFirst = false)
-                                            } else if (blockInCell.style.height != Dp.Unspecified) {
-                                                Modifier.height(blockInCell.style.height)
+                                            if (blockInCell.expectedHeight > 0) {
+                                                Modifier.height(with(density) { blockInCell.expectedHeight.toDp() })
                                             } else {
                                                 Modifier.height(250.dp)
                                             }
@@ -3625,6 +3843,11 @@ private fun Modifier.realisticBookPage(
     isDarkTheme: Boolean,
     touchY: Float?
 ): Modifier = composed {
+    // Log composition frequency
+    SideEffect {
+        Timber.tag("PageTurnFixDiag").v("Page $pageIndex re-composed. Offset: ${pagerState.currentPageOffsetFraction}")
+    }
+
     val frontPath = remember { Path() }
     val backPath = remember { Path() }
     val reflectedScreenPath = remember { Path() }
@@ -3632,6 +3855,11 @@ private fun Modifier.realisticBookPage(
     this
         .graphicsLayer {
             val pageOffset = (pageIndex - pagerState.currentPage) - pagerState.currentPageOffsetFraction
+
+            // Log layer property updates
+            if (abs(pageOffset) > 0.001f && abs(pageOffset) < 0.999f) {
+                Timber.tag("PageTurnFixDiag").d("graphicsLayer: Page $pageIndex, Offset: $pageOffset")
+            }
 
             if (pageOffset <= 1f && pageOffset > -1f) {
                 translationX = -pageOffset * size.width
@@ -3644,6 +3872,7 @@ private fun Modifier.realisticBookPage(
             }
         }
         .drawWithContent {
+            val drawStart = System.nanoTime()
             val pageOffset = (pageIndex - pagerState.currentPage) - pagerState.currentPageOffsetFraction
 
             if (abs(pageOffset) < 0.001f) {
@@ -3670,9 +3899,20 @@ private fun Modifier.realisticBookPage(
                 val dy = cornerY - dragY
                 val nLen = kotlin.math.sqrt(dx * dx + dy * dy)
 
+                // CRITICAL GEOMETRY LOG
+                if (progress > 0.8f) { // Focus logs on the "end" of the turn where the stall happens
+                    Timber.tag("PageTurnFixDiag").i(
+                        "Geometry Page $pageIndex: progress=$progress, nLen=$nLen, cornerY=$cornerY, dragX=$dragX, midX=$midX"
+                    )
+                }
+
                 if (nLen > 0f) {
                     val nx = dx / nLen
                     val ny = dy / nLen
+
+                    if (nx.isNaN() || ny.isNaN()) {
+                        Timber.tag("PageTurnFixDiag").e("NAN DETECTED in Normal Vectors: nx=$nx, ny=$ny")
+                    }
 
                     val huge = w * 3f
                     val vx = -ny
@@ -3733,17 +3973,12 @@ private fun Modifier.realisticBookPage(
                     clipRect(0f, 0f, w, h) {
                         clipPath(frontPath) {
                             drawPath(reflectedScreenPath, color = paperColor)
-
                             val flapTint = if (isDarkTheme) Color.White.copy(alpha = 0.08f) else Color.Black.copy(alpha = 0.06f)
                             drawPath(reflectedScreenPath, color = flapTint)
 
                             val innerShadowWidth = shadowWidth * 0.7f
                             val innerShadowBrush = Brush.linearGradient(
-                                colors = listOf(
-                                    Color.Black.copy(alpha = 0.25f),
-                                    Color.Black.copy(alpha = 0.05f),
-                                    Color.Transparent
-                                ),
+                                colors = listOf(Color.Black.copy(alpha = 0.25f), Color.Black.copy(alpha = 0.05f), Color.Transparent),
                                 start = Offset(midX, midY),
                                 end = Offset(midX - nx * innerShadowWidth, midY - ny * innerShadowWidth)
                             )
@@ -3769,15 +4004,14 @@ private fun Modifier.realisticBookPage(
                     drawContent()
                 }
             }
-            else if (pageOffset > 0f && pageOffset <= 1f) {
-                drawRect(color = paperColor)
-                drawContent()
-                val dimAlpha = (0.25f * pageOffset).coerceIn(0f, 0.4f)
-                drawRect(color = Color.Black.copy(alpha = dimAlpha))
-            }
             else {
                 drawRect(color = paperColor)
                 drawContent()
+            }
+
+            val drawDuration = (System.nanoTime() - drawStart) / 1_000_000.0
+            if (drawDuration > 12.0) { // Log slow frames (anything near the 16ms frame budget)
+                Timber.tag("PageTurnFixDiag").w("Slow Draw on Page $pageIndex: ${drawDuration}ms")
             }
         }
 }

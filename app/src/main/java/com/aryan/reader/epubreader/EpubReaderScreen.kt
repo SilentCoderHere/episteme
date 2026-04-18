@@ -27,6 +27,8 @@ package com.aryan.reader.epubreader
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
@@ -128,6 +130,7 @@ import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -147,7 +150,6 @@ import com.aryan.reader.BannerMessage
 import com.aryan.reader.BuildConfig
 import com.aryan.reader.BuiltInThemes
 import com.aryan.reader.CustomTopBanner
-import com.aryan.reader.DeviceVoiceSettingsSheet
 import com.aryan.reader.MainViewModel
 import com.aryan.reader.R
 import com.aryan.reader.ReaderThemePanel
@@ -180,6 +182,7 @@ import com.aryan.reader.rememberSearchState
 import com.aryan.reader.saveCustomThemes
 import com.aryan.reader.saveReaderThemeId
 import com.aryan.reader.tts.SpeakerSamplePlayer
+import com.aryan.reader.tts.TtsPlaybackManager
 import com.aryan.reader.tts.loadTtsMode
 import com.aryan.reader.tts.rememberTtsController
 import com.aryan.reader.tts.splitTextIntoChunks
@@ -416,6 +419,7 @@ fun EpubReaderScreen(
         initialBookmarksJson = initialBookmarksJson,
         initialHighlightsJson = uiState.initialHighlightsJson,
         isProUser = isProUser,
+        credits = uiState.credits,
         onNavigateBack = onNavigateBack,
         onSavePosition = onSavePosition,
         onBookmarksChanged = onBookmarksChanged,
@@ -438,7 +442,8 @@ fun EpubReaderScreen(
                     }
                 }
             }
-        } else null
+        } else null,
+        viewModel = viewModel
     )
 }
 
@@ -456,6 +461,7 @@ fun EpubReaderHost(
     initialBookmarksJson: String?,
     initialHighlightsJson: String?,
     isProUser: Boolean,
+    credits: Int,
     onNavigateBack: () -> Unit,
     onSavePosition: (locator: Locator, cfiForWebView: String?, progress: Float) -> Unit,
     onBookmarksChanged: (bookmarksJson: String) -> Unit,
@@ -466,7 +472,8 @@ fun EpubReaderHost(
     customFonts: List<CustomFontEntity>,
     onImportFont: (Uri) -> Unit,
     onToggleReflow: ((Int) -> Unit)? = null,
-    onDeleteReflow: (() -> Unit)? = null
+    onDeleteReflow: (() -> Unit)? = null,
+    viewModel: MainViewModel
 ) {
     val view = LocalView.current
     val context = LocalContext.current
@@ -479,6 +486,7 @@ fun EpubReaderHost(
     val containerFocusRequester = remember { FocusRequester() }
     var isNavigatingToPosition by remember { mutableStateOf(false) }
     var isSeamlessTransitioning by remember { mutableStateOf(false) }
+    var showInsufficientCreditsDialog by remember { mutableStateOf(false) }
 
     var isPageSliderVisible by remember { mutableStateOf(false) }
     var sliderCurrentPage by remember { mutableFloatStateOf(0f) }
@@ -516,7 +524,13 @@ fun EpubReaderHost(
         mutableStateOf(loadPageTurnAnimationSetting(context))
     }
 
-    var currentTtsMode by remember { mutableStateOf(loadTtsMode(context)) }
+    var currentTtsMode by remember {
+        mutableStateOf(
+            loadTtsMode(context).let {
+                if (BuildConfig.FLAVOR == "oss") TtsPlaybackManager.TtsMode.BASE else it
+            }
+        )
+    }
 
     val locatorConverter = remember(context) {
         LocatorConverter(
@@ -546,6 +560,7 @@ fun EpubReaderHost(
     }
 
     var isAutoScrollCollapsed by remember { mutableStateOf(false) }
+    var isTtsCollapsed by remember { mutableStateOf(false) }
 
     val bookId = remember(epubBook.title, epubBook.fileName) {
         if (epubBook.fileName.length > 20) epubBook.fileName else getBookIdForPrefs(epubBook.title)
@@ -679,24 +694,35 @@ fun EpubReaderHost(
 
         if (effectiveUseOnline) {
             val wordCount = countWords(word)
-            if (isProUser || wordCount <= 1) {
+            if (wordCount > 1 && !isProUser) {
+                showDictionaryUpsellDialog = true
+            } else {
                 selectedTextForAi = word
                 showAiDefinitionPopup = true
                 scope.launch {
+                    val token = viewModel.getAuthToken()
                     isAiDefinitionLoading = true
                     aiDefinitionResult = null
                     fetchAiDefinition(
-                        text = word, onUpdate = { chunk ->
-                        val currentDefinition = aiDefinitionResult?.definition ?: ""
-                        aiDefinitionResult =
-                            AiDefinitionResult(definition = currentDefinition + chunk)
-                    }, onError = { error ->
-                        aiDefinitionResult = AiDefinitionResult(error = error)
-                    }, onFinish = { isAiDefinitionLoading = false }, context = context
+                        text = word,
+                        onUpdate = { chunk ->
+                            val currentDefinition = aiDefinitionResult?.definition ?: ""
+                            aiDefinitionResult = AiDefinitionResult(definition = currentDefinition + chunk)
+                        },
+                        authToken = token,
+                        onError = { error ->
+                            if (error == "INSUFFICIENT_CREDITS") {
+                                showInsufficientCreditsDialog = true
+                                showAiDefinitionPopup = false
+                                isAiDefinitionLoading = false
+                            } else {
+                                aiDefinitionResult = AiDefinitionResult(error = error)
+                            }
+                        },
+                        onFinish = { isAiDefinitionLoading = false },
+                        context = context
                     )
                 }
-            } else {
-                showDictionaryUpsellDialog = true
             }
         } else {
             if (!selectedDictPackage.isNullOrEmpty()) {
@@ -728,10 +754,6 @@ fun EpubReaderHost(
 
     val summaryCacheManager = remember(context) { SummaryCacheManager(context) }
     var showRecapPopup by remember { mutableStateOf(false) }
-    var recapResult by remember { mutableStateOf<SummarizationResult?>(null) }
-    var isRecapLoading by remember { mutableStateOf(false) }
-    var recapProgressMessage by remember { mutableStateOf("") }
-    var isRequestingRecapCfi by remember { mutableStateOf(false) }
 
     var currentRenderMode by remember(renderMode) { mutableStateOf(renderMode) }
     var chapterToLoadOnSwitch by remember { mutableStateOf<Int?>(null) }
@@ -796,9 +818,14 @@ fun EpubReaderHost(
 
     var webViewRefForTts by remember { mutableStateOf<WebView?>(null) }
 
-    var showSummarizationPopup by remember { mutableStateOf(false) }
+    var showAiHubSheet by remember { mutableStateOf(false) }
     var summarizationResult by remember { mutableStateOf<SummarizationResult?>(null) }
     var isSummarizationLoading by remember { mutableStateOf(false) }
+
+    var recapResult by remember { mutableStateOf<SummarizationResult?>(null) }
+    var isRecapLoading by remember { mutableStateOf(false) }
+    var recapProgressMessage by remember { mutableStateOf("") }
+    var isRequestingRecapCfi by remember { mutableStateOf(false) }
 
     val epubSearcher = remember(epubBook) { createEpubSearcher(epubBook) }
 
@@ -964,7 +991,12 @@ fun EpubReaderHost(
 
     LaunchedEffect(ttsState.errorMessage) {
         ttsState.errorMessage?.let { message ->
-            bannerMessage = BannerMessage(message, isError = true)
+            if (message == "INSUFFICIENT_CREDITS") {
+                showInsufficientCreditsDialog = true
+                ttsController.stop()
+            } else {
+                bannerMessage = BannerMessage(message, isError = true)
+            }
         }
     }
 
@@ -983,7 +1015,9 @@ fun EpubReaderHost(
     }
 
     val searchState = rememberSearchState(scope = scope, searcher = epubSearcher)
-    val speakerPlayer = remember(context, scope) { SpeakerSamplePlayer(context, scope) }
+    val speakerPlayer = remember(context, scope) {
+        SpeakerSamplePlayer(context, scope, getAuthToken = { viewModel.getAuthToken() })
+    }
 
     var isAutoScrollModeActive by remember { mutableStateOf(false) }
     var isAutoScrollPlaying by remember { mutableStateOf(false) }
@@ -1041,7 +1075,6 @@ fun EpubReaderHost(
 
     var showPermissionRationaleDialog by remember { mutableStateOf(false) }
     var showTtsSettingsSheet by remember { mutableStateOf(false) }
-    var showDeviceVoiceSettingsSheet by remember { mutableStateOf(false) }
     var showTtsControlsSheet by remember { mutableStateOf(false) }
     var showThemePanel by remember { mutableStateOf(false) }
     var showPaletteManager by remember { mutableStateOf(false) }
@@ -1102,6 +1135,11 @@ fun EpubReaderHost(
     }
 
     fun startTts() {
+        if (currentTtsMode == com.aryan.reader.tts.TtsPlaybackManager.TtsMode.CLOUD && credits <= 0) {
+            showInsufficientCreditsDialog = true
+            return
+        }
+
         if (isAutoScrollModeActive) {
             isAutoScrollModeActive = false
             isAutoScrollPlaying = false
@@ -1114,6 +1152,7 @@ fun EpubReaderHost(
             webView = webViewRefForTts,
             onPaginatedStart = {
                 scope.launch {
+                    val token = viewModel.getAuthToken()
                     val currentPage = paginatedPagerState.currentPage
                     val bookPaginator = paginator as? BookPaginator
                     val chapterIndex = bookPaginator?.findChapterIndexForPage(currentPage)
@@ -1136,7 +1175,8 @@ fun EpubReaderHost(
                                 chapterTitle = chapterTitle,
                                 coverImageUri = coverUriString,
                                 ttsMode = currentTtsMode,
-                                playbackSource = "READER"
+                                playbackSource = "READER",
+                                authToken = token
                             )
                         }
                     }
@@ -1153,8 +1193,14 @@ fun EpubReaderHost(
     )
 
     fun startTtsFromSelectionPaginated(baseCfi: String, startOffset: Int) {
+        if (currentTtsMode == com.aryan.reader.tts.TtsPlaybackManager.TtsMode.CLOUD && credits <= 0) {
+            showInsufficientCreditsDialog = true
+            return
+        }
+
         val action = {
             scope.launch {
+                val token = viewModel.getAuthToken()
                 val bookPaginator = paginator as? BookPaginator
                 val chapterIndex = currentChapterInPaginatedMode ?: return@launch
                 val chunks = bookPaginator?.getTtsChunksForChapter(chapterIndex) ?: return@launch
@@ -1191,7 +1237,8 @@ fun EpubReaderHost(
                             chapterTitle = chapterTitle,
                             coverImageUri = coverUriString,
                             ttsMode = currentTtsMode,
-                            playbackSource = "READER"
+                            playbackSource = "READER",
+                            authToken = token
                         )
                     }
                 }
@@ -1237,7 +1284,8 @@ fun EpubReaderHost(
         onToggleTtsStartOnLoad = { shouldStart -> ttsShouldStartOnChapterLoad = shouldStart },
         userStoppedTts = userStoppedTts,
         scope = scope,
-        currentTtsMode = currentTtsMode
+        currentTtsMode = currentTtsMode,
+        getAuthToken = { viewModel.getAuthToken() }
     )
 
     TtsHighlightHandler(
@@ -1338,12 +1386,15 @@ fun EpubReaderHost(
     }
 
     val runRecap = { chapterIdx: Int, charLimit: Int ->
-        showRecapPopup = true
+        showAiHubSheet = true
         isRecapLoading = true
         recapResult = null
         recapProgressMessage = "Checking past chapters..."
 
         scope.launch {
+            val token = viewModel.getAuthToken()
+            var currentCost: Double? = null
+
             executeRecapLogic(
                 epubBook = epubBook,
                 chapterIndex = chapterIdx,
@@ -1352,13 +1403,27 @@ fun EpubReaderHost(
                 paginator = paginator,
                 context = context,
                 onProgressUpdate = { recapProgressMessage = it },
+                onCostReceived = { cost ->
+                    currentCost = cost
+                    recapResult = recapResult?.copy(cost = cost) ?: SummarizationResult(cost = cost)
+                },
                 onResultUpdate = { chunk ->
                     isRecapLoading = false
                     val current = recapResult?.summary ?: ""
-                    recapResult = SummarizationResult(summary = current + chunk)
+                    recapResult = SummarizationResult(
+                        summary = current + chunk,
+                        cost = currentCost
+                    )
                 },
+                authToken = token,
                 onError = { error ->
-                    recapResult = SummarizationResult(error = error)
+                    if (error == "INSUFFICIENT_CREDITS") {
+                        showInsufficientCreditsDialog = true
+                        showRecapPopup = false
+                        isRecapLoading = false
+                    } else {
+                        recapResult = SummarizationResult(error = error)
+                    }
                 },
                 onFinish = { isRecapLoading = false }
             )
@@ -2053,6 +2118,161 @@ fun EpubReaderHost(
             }
         }
 
+        val handleGenerateSummary: (Boolean) -> Unit = { force ->
+            if (!isProUser && credits <= 0) {
+                showInsufficientCreditsDialog = true
+                showAiHubSheet = false
+            } else {
+                showAiHubSheet = true
+                isSummarizationLoading = true
+                summarizationResult = null
+                when (currentRenderMode) {
+                    RenderMode.VERTICAL_SCROLL -> {
+                        val cached = if (!force) summaryCacheManager.getSummary(
+                            epubBook.title,
+                            currentChapterIndex
+                        ) else null
+                        if (cached != null) {
+                            summarizationResult =
+                                SummarizationResult(summary = cached, isCacheHit = true)
+                            isSummarizationLoading = false
+                        } else {
+                            webViewRefForTts?.evaluateJavascript("javascript:AiBridgeHelper.extractAndRelayTextForSummarization();") { result ->
+                                Timber.d("JS summarization request: $result")
+                            } ?: run {
+                                isSummarizationLoading = false
+                                summarizationResult =
+                                    SummarizationResult(error = "WebView not available.")
+                            }
+                        }
+                    }
+
+                    RenderMode.PAGINATED -> {
+                        scope.launch {
+                            val currentPage = paginatedPagerState.currentPage
+                            val token = viewModel.getAuthToken()
+                            val chapterIndex =
+                                (paginator as? BookPaginator)?.findChapterIndexForPage(currentPage)
+
+                            Timber.tag("POS_DIAG")
+                                .d("handleGenerateSummary (Paginated): currentPage=$currentPage -> resolved chapterIndex=$chapterIndex")
+
+                            if (chapterIndex != null) {
+                                val cached = if (!force) summaryCacheManager.getSummary(
+                                    epubBook.title,
+                                    chapterIndex
+                                ) else null
+                                if (cached != null) {
+                                    summarizationResult =
+                                        SummarizationResult(summary = cached, isCacheHit = true)
+                                    isSummarizationLoading = false
+                                    return@launch
+                                }
+
+                                val text = paginator?.getPlainTextForChapter(chapterIndex)
+                                if (!text.isNullOrBlank()) {
+                                    var currentCost: Double? = null
+                                    var currentFreeRemaining: Int? = null
+                                    val finalSummaryBuilder = StringBuilder()
+                                    summarizeBookContent(
+                                        content = text,
+                                        authToken = token,
+                                        onUsageReceived = { cost, freeRemaining ->
+                                            currentCost = cost
+                                            currentFreeRemaining = freeRemaining
+                                            summarizationResult = summarizationResult?.copy(
+                                                cost = cost, freeRemaining = freeRemaining
+                                            ) ?: SummarizationResult(
+                                                cost = cost,
+                                                freeRemaining = freeRemaining
+                                            )
+                                        },
+                                        onUpdate = { chunk ->
+                                            finalSummaryBuilder.append(chunk)
+                                            val currentSummary = summarizationResult?.summary ?: ""
+                                            summarizationResult = SummarizationResult(
+                                                summary = currentSummary + chunk,
+                                                cost = currentCost,
+                                                freeRemaining = currentFreeRemaining
+                                            )
+                                        },
+                                        onError = { error ->
+                                            if (error == "INSUFFICIENT_CREDITS") {
+                                                showInsufficientCreditsDialog = true
+                                                showAiHubSheet = false
+                                                isSummarizationLoading = false
+                                            } else {
+                                                summarizationResult =
+                                                    SummarizationResult(error = error)
+                                            }
+                                        },
+                                        onFinish = {
+                                            isSummarizationLoading = false
+                                            val fullSummary = finalSummaryBuilder.toString()
+                                            if (fullSummary.isNotBlank()) {
+                                                val chapterTitle =
+                                                    chapters.getOrNull(chapterIndex)?.title
+                                                        ?: "Chapter ${chapterIndex + 1}"
+                                                summaryCacheManager.saveSummary(
+                                                    epubBook.title,
+                                                    chapterIndex,
+                                                    chapterTitle,
+                                                    fullSummary
+                                                )
+                                            }
+                                        })
+                                } else {
+                                    summarizationResult =
+                                        SummarizationResult(error = "Could not get chapter content.")
+                                    isSummarizationLoading = false
+                                }
+                            } else {
+                                summarizationResult =
+                                    SummarizationResult(error = "Could not determine current chapter.")
+                                isSummarizationLoading = false
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        val handleGenerateRecap: () -> Unit = {
+            if (credits <= 0) {
+                showInsufficientCreditsDialog = true
+                showAiHubSheet = false
+            } else {
+                showAiHubSheet = true
+                when (currentRenderMode) {
+                    RenderMode.VERTICAL_SCROLL -> {
+                        isRequestingRecapCfi = true
+                        webViewRefForTts?.evaluateJavascript(
+                            "javascript:CfiBridge.onCfiExtracted(window.getCurrentCfi());",
+                            null
+                        )
+                    }
+
+                    RenderMode.PAGINATED -> {
+                        val bookPaginator = paginator as? BookPaginator
+                        val chapterIndex = currentChapterInPaginatedMode
+
+                        if (bookPaginator != null && chapterIndex != null) {
+                            val startPage = bookPaginator.chapterStartPageIndices[chapterIndex] ?: 0
+                            val currentPageInChapter = paginatedPagerState.currentPage - startPage
+                            val charsScrolled = bookPaginator.getCharactersScrolledInChapter(
+                                chapterIndex,
+                                currentPageInChapter
+                            )
+                            runRecap(chapterIndex, charsScrolled.toInt())
+                        } else {
+                            bannerMessage =
+                                BannerMessage("Wait for book to load fully.", isError = true)
+                        }
+                    }
+                }
+            }
+        }
+
         Scaffold(
             snackbarHost = { SnackbarHost(snackbarHostState) },
             contentWindowInsets = WindowInsets.statusBars,
@@ -2552,6 +2772,7 @@ fun EpubReaderHost(
                                             ttsScope = scope,
                                             onTtsTextReady = { jsonString ->
                                                 scope.launch {
+                                                    val token = viewModel.getAuthToken()
                                                     Timber.tag("TTS_LIST_DIAG").d("Vertical: Processing received JSON. Length: ${jsonString.length}") // Add this
                                                     val ttsChunks = mutableListOf<TtsChunk>()
                                                     try {
@@ -2587,9 +2808,14 @@ fun EpubReaderHost(
                                                     Timber.d("Vertical: Final compiled TTS chunks size: ${ttsChunks.size}")
 
                                                     if (ttsChunks.isNotEmpty()) {
+                                                        if (currentTtsMode == com.aryan.reader.tts.TtsPlaybackManager.TtsMode.CLOUD && credits <= 0) {
+                                                            showInsufficientCreditsDialog = true
+                                                            ttsShouldStartOnChapterLoad = false
+                                                            return@launch
+                                                        }
+
                                                         ttsShouldStartOnChapterLoad = false
-                                                        val chapterTitle =
-                                                            chapters.getOrNull(currentChapterIndex)?.title
+                                                        val chapterTitle = chapters.getOrNull(currentChapterIndex)?.title
                                                         val coverUriString = coverImagePath?.let {
                                                             Uri.fromFile(File(it)).toString()
                                                         }
@@ -2600,7 +2826,8 @@ fun EpubReaderHost(
                                                             chapterTitle = chapterTitle,
                                                             coverImageUri = coverUriString,
                                                             ttsMode = currentTtsMode,
-                                                            playbackSource = "READER"
+                                                            playbackSource = "READER",
+                                                            authToken = token
                                                         )
                                                     } else {
                                                         Timber.w("No TTS chunks were created from JSON, not starting TTS."
@@ -2625,25 +2852,48 @@ fun EpubReaderHost(
                                             onContentReadyForSummarization = { content ->
                                                 Timber.d("Content received for summarization")
                                                 scope.launch {
+                                                    val token = viewModel.getAuthToken()
                                                     val chapterIndexToSave = currentChapterIndex
                                                     val bookTitleToSave = epubBook.title
                                                     val finalSummaryBuilder = StringBuilder()
 
+                                                    var currentCost: Double? = null
+                                                    var currentFreeRemaining: Int? = null
+
                                                     summarizeBookContent(
                                                         content = content,
+                                                        authToken = token,
+                                                        onUsageReceived = { cost: Double?, freeRemaining: Int? ->
+                                                            currentCost = cost
+                                                            currentFreeRemaining = freeRemaining
+                                                            summarizationResult = summarizationResult?.copy(
+                                                                cost = cost, freeRemaining = freeRemaining
+                                                            ) ?: SummarizationResult(cost = cost, freeRemaining = freeRemaining)
+                                                        },
                                                         onUpdate = { chunk ->
                                                             finalSummaryBuilder.append(chunk)
                                                             val currentSummary = summarizationResult?.summary ?: ""
-                                                            summarizationResult = SummarizationResult(summary = currentSummary + chunk)
+                                                            summarizationResult = SummarizationResult(
+                                                                summary = currentSummary + chunk,
+                                                                cost = currentCost,
+                                                                freeRemaining = currentFreeRemaining
+                                                            )
                                                         },
                                                         onError = { error ->
-                                                            summarizationResult = SummarizationResult(error = error)
+                                                            if (error == "INSUFFICIENT_CREDITS") {
+                                                                showInsufficientCreditsDialog = true
+                                                                showAiHubSheet = false
+                                                                isRecapLoading = false
+                                                            } else {
+                                                                recapResult = SummarizationResult(error = error)
+                                                            }
                                                         },
                                                         onFinish = {
                                                             isSummarizationLoading = false
                                                             val fullSummary = finalSummaryBuilder.toString()
                                                             if (fullSummary.isNotBlank()) {
-                                                                summaryCacheManager.saveSummary(bookTitleToSave, chapterIndexToSave, fullSummary)
+                                                                val chapterTitle = chapters.getOrNull(chapterIndexToSave)?.title ?: "Chapter ${chapterIndexToSave + 1}"
+                                                                summaryCacheManager.saveSummary(bookTitleToSave, chapterIndexToSave, chapterTitle, fullSummary)
                                                             }
                                                         }
                                                     )
@@ -3594,7 +3844,6 @@ fun EpubReaderHost(
                     modifier = Modifier.align(Alignment.TopCenter),
                     onOpenTtsSettings = { showTtsSettingsSheet = true },
                     onOpenDictionarySettings = { showDictionarySettingsSheet = true },
-                    onOpenDeviceVoiceSettings = { showDeviceVoiceSettingsSheet = true },
                     onOpenThemeSettings = { showThemePanel = true },
                     onOpenVisualOptions = { showVisualOptionsSheet = true },
                     onToggleReflow = if (onToggleReflow != null) {
@@ -3619,6 +3868,40 @@ fun EpubReaderHost(
                     targetValue = if (isAutoScrollCollapsed) 1f else 0f,
                     label = "AutoScrollAlignAnimation"
                 )
+
+                val ttsOverlayPadding by animateDpAsState(
+                    targetValue = if (showBars) (bottomPadding + 45.dp + 16.dp) else 32.dp,
+                    label = "TtsOverlayPadding"
+                )
+
+                val ttsAlignmentBias by animateFloatAsState(
+                    targetValue = if (isTtsCollapsed) 1f else 0f,
+                    label = "TtsAlignAnimation"
+                )
+
+                AnimatedVisibility(
+                    visible = isTtsSessionActive && showBars,
+                    enter = slideInVertically(animationSpec = tween(200)) { it } + fadeIn(animationSpec = tween(200)),
+                    exit = slideOutVertically(animationSpec = tween(200)) { it } + fadeOut(animationSpec = tween(200)),
+                    modifier = Modifier
+                        .align(BiasAlignment(ttsAlignmentBias, 1f))
+                        .padding(bottom = ttsOverlayPadding)
+                        .padding(horizontal = 16.dp)
+                ) {
+                    TtsOverlayControls(
+                        ttsController = ttsController,
+                        ttsState = ttsState,
+                        currentTtsMode = currentTtsMode,
+                        isCollapsed = isTtsCollapsed,
+                        onCollapseChange = { isTtsCollapsed = it },
+                        onOpenTtsSettings = { showTtsSettingsSheet = true },
+                        onClose = {
+                            userStoppedTts = true
+                            ttsController.stop()
+                        },
+                        credits = credits
+                    )
+                }
 
                 val isAutoScrollControlsVisible = isAutoScrollModeActive
 
@@ -3725,7 +4008,7 @@ fun EpubReaderHost(
                     isProUser = isProUser,
                     hiddenTools = hiddenTools,
                     currentTtsMode = currentTtsMode,
-                    onOpenTtsControls = { showTtsControlsSheet = true },
+                    onOpenAiHub = { showAiHubSheet = true },
                     onOpenSlider = {
                         when (currentRenderMode) {
                             RenderMode.VERTICAL_SCROLL -> {
@@ -3768,90 +4051,6 @@ fun EpubReaderHost(
                         showBars = true
                         showFormatAdjustmentBars = false
                     },
-                    onSummarize = {
-                        if (isProUser) {
-                            showSummarizationPopup = true
-                            isSummarizationLoading = true
-                            summarizationResult = null
-                            when (currentRenderMode) {
-                                RenderMode.VERTICAL_SCROLL -> {
-                                    webViewRefForTts?.evaluateJavascript("javascript:AiBridgeHelper.extractAndRelayTextForSummarization();") { result ->
-                                        Timber.d("JS summarization request: $result")
-                                    } ?: run {
-                                        isSummarizationLoading = false
-                                        summarizationResult = SummarizationResult(error = "WebView not available.")
-                                    }
-                                }
-                                RenderMode.PAGINATED -> {
-                                    scope.launch {
-                                        val currentPage = paginatedPagerState.currentPage
-                                        val chapterIndex = (paginator as? BookPaginator)?.findChapterIndexForPage(currentPage)
-                                        if (chapterIndex != null) {
-                                            val text = paginator?.getPlainTextForChapter(chapterIndex)
-                                            if (!text.isNullOrBlank()) {
-                                                summarizeBookContent(
-                                                    content = text,
-                                                    onUpdate = { chunk ->
-                                                        val currentSummary =
-                                                            summarizationResult?.summary
-                                                                ?: ""
-                                                        summarizationResult =
-                                                            SummarizationResult(
-                                                                summary = currentSummary + chunk
-                                                            )
-                                                    },
-                                                    onError = { error ->
-                                                        summarizationResult =
-                                                            SummarizationResult(
-                                                                error = error
-                                                            )
-                                                    },
-                                                    onFinish = {
-                                                        isSummarizationLoading =
-                                                            false
-                                                    }
-                                                )
-                                            } else {
-                                                summarizationResult = SummarizationResult(error = "Could not get chapter content.")
-                                                isSummarizationLoading = false
-                                            }
-                                        } else {
-                                            summarizationResult = SummarizationResult(error = "Could not determine current chapter.")
-                                            isSummarizationLoading = false
-                                        }
-                                    }
-                                }
-                            }
-                        } else {
-                            showSummarizationUpsellDialog = true
-                        }
-                    },
-                    onRecap = {
-                        when (currentRenderMode) {
-                            RenderMode.VERTICAL_SCROLL -> {
-                                isRequestingRecapCfi = true
-                                webViewRefForTts?.evaluateJavascript("javascript:CfiBridge.onCfiExtracted(window.getCurrentCfi());", null)
-                            }
-                            RenderMode.PAGINATED -> {
-                                val bookPaginator = paginator as? BookPaginator
-                                val chapterIndex = currentChapterInPaginatedMode
-
-                                if (bookPaginator != null && chapterIndex != null) {
-                                    val startPage = bookPaginator.chapterStartPageIndices[chapterIndex] ?: 0
-                                    val currentPageInChapter = paginatedPagerState.currentPage - startPage
-
-                                    val charsScrolled = bookPaginator.getCharactersScrolledInChapter(chapterIndex, currentPageInChapter)
-
-                                    Timber.d("Paginated Mode: Chapter $chapterIndex, PageInChapter $currentPageInChapter")
-                                    Timber.d("Paginated Mode: Chars Scrolled (Limit): $charsScrolled")
-
-                                    runRecap(chapterIndex, charsScrolled.toInt())
-                                } else {
-                                    bannerMessage = BannerMessage("Wait for book to load fully.", isError = true)
-                                }
-                            }
-                        }
-                    },
                     onToggleTts = {
                         if (isTtsSessionActive) {
                             Timber.d("TTS button clicked: Stopping TTS")
@@ -3873,9 +4072,6 @@ fun EpubReaderHost(
                                 }
                             }
                         }
-                    },
-                    onPlayPauseTts = {
-                        if (ttsState.isPlaying) ttsController.pause() else ttsController.resume()
                     },
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
@@ -3922,27 +4118,21 @@ fun EpubReaderHost(
                         .padding(horizontal = 16.dp)
                 )
 
+                val effectiveCurrentChapterIndex = if (currentRenderMode == RenderMode.PAGINATED) {
+                    currentChapterInPaginatedMode ?: currentChapterIndex
+                } else {
+                    currentChapterIndex
+                }
+
                 EpubReaderAiOverlays(
-                    showSummarizationPopup = showSummarizationPopup,
+                    bookTitle = epubBook.title,
+                    summaryCacheManager = summaryCacheManager,
                     summarizationResult = summarizationResult,
                     isSummarizationLoading = isSummarizationLoading,
-                    onDismissSummarization = {
-                        showSummarizationPopup = false
-                        isSummarizationLoading = false
-                        summarizationResult = null
-                    },
                     showSummarizationUpsellDialog = showSummarizationUpsellDialog,
                     onDismissSummarizationUpsell = { showSummarizationUpsellDialog = false },
-
-                    showRecapPopup = showRecapPopup,
                     recapResult = recapResult,
                     isRecapLoading = isRecapLoading,
-                    onDismissRecap = {
-                        showRecapPopup = false
-                        isRecapLoading = false
-                        recapResult = null
-                    },
-
                     showAiDefinitionPopup = showAiDefinitionPopup,
                     selectedTextForAi = selectedTextForAi,
                     aiDefinitionResult = aiDefinitionResult,
@@ -3962,12 +4152,31 @@ fun EpubReaderHost(
                     isTtsSessionActive = isTtsSessionActive,
                     onOpenExternalDictionary = { text ->
                         if (!selectedDictPackage.isNullOrEmpty()) {
-                            ExternalDictionaryHelper.launchDictionary(context, selectedDictPackage!!, text)
+                            ExternalDictionaryHelper.launchDictionary(
+                                context,
+                                selectedDictPackage!!,
+                                text
+                            )
                         } else {
-                            Toast.makeText(context, "Select an offline dictionary first.", Toast.LENGTH_SHORT).show()
+                            Toast.makeText(
+                                context,
+                                "Select an offline dictionary first.",
+                                Toast.LENGTH_SHORT
+                            ).show()
                             showDictionarySettingsSheet = true
                         }
-                    }
+                    },
+                    getAuthToken = { viewModel.getAuthToken() },
+                    credits = credits,
+                    isProUser = isProUser,
+                    currentChapterIndex = effectiveCurrentChapterIndex,
+                    chapterTitle = chapters.getOrNull(effectiveCurrentChapterIndex)?.title ?: "Chapter ${effectiveCurrentChapterIndex + 1}",
+                    showAiHubSheet = showAiHubSheet,
+                    onGenerateSummary = handleGenerateSummary,
+                    onGenerateRecap = handleGenerateRecap,
+                    onDismissAiHub = { showAiHubSheet = false },
+                    onClearSummary = { summarizationResult = null },
+                    onClearRecap = { recapResult = null }
                 )
 
                 if (isNavigatingToPosition) {
@@ -4087,8 +4296,8 @@ fun EpubReaderHost(
                                 highlightToNoteCfi = null
                             },
                             onCopy = {
-                                val clipboardManager = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
-                                val clip = android.content.ClipData.newPlainText("Copied Text", targetHighlight.text)
+                                val clipboardManager = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                val clip = ClipData.newPlainText("Copied Text", targetHighlight.text)
                                 clipboardManager.setPrimaryClip(clip)
                                 highlightToNoteCfi = null
                             },
@@ -4176,15 +4385,9 @@ fun EpubReaderHost(
                 onSpeakerChange = { newSpeaker ->
                     ttsController.changeSpeaker(newSpeaker)
                 },
-                isTtsActive = (ttsState.isPlaying || ttsState.isLoading) && ttsState.playbackSource == "READER"
-            )
-        }
-
-        if (showTtsControlsSheet) {
-            TtsControlsSheet(
-                onDismiss = { showTtsControlsSheet = false },
-                onOpenDeviceVoiceSettings = { showDeviceVoiceSettingsSheet = true },
-                ttsController = ttsController
+                isTtsActive = (ttsState.isPlaying || ttsState.isLoading) && ttsState.playbackSource == "READER",
+                getAuthToken = { viewModel.getAuthToken() },
+                bookTitle = epubBook.title
             )
         }
 
@@ -4224,13 +4427,6 @@ fun EpubReaderHost(
                     selectedSearchPackage = pkg
                     saveExternalSearchPackage(context, pkg)
                 }
-            )
-        }
-
-        if (showDeviceVoiceSettingsSheet) {
-            DeviceVoiceSettingsSheet(
-                isVisible = true,
-                onDismiss = { showDeviceVoiceSettingsSheet = false }
             )
         }
 
@@ -4294,6 +4490,26 @@ fun EpubReaderHost(
                 onDismiss = { showThemePanel = false },
                 customThemes = customThemes,
                 onCustomThemesUpdated = { customThemes = it; saveCustomThemes(context, it) }
+            )
+        }
+
+        if (showInsufficientCreditsDialog) {
+            AlertDialog(
+                onDismissRequest = { showInsufficientCreditsDialog = false },
+                icon = { Icon(painterResource(id = R.drawable.crown), contentDescription = null) },
+                title = { Text("Out of Credits") },
+                text = { Text("You don't have enough credits. Get Episteme Pro for 10 free Summaries per day, or add more credits to use Summaries, Cloud TTS and Story Recap.") },
+                confirmButton = {
+                    TextButton(onClick = {
+                        showInsufficientCreditsDialog = false
+                        onNavigateToPro()
+                    }) { Text("Get Pro / Add Credits") }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showInsufficientCreditsDialog = false }) {
+                        Text(stringResource(R.string.action_cancel))
+                    }
+                }
             )
         }
 

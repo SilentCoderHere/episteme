@@ -245,19 +245,19 @@
     <string name="feature_dict">Basic Dictionary</string>
     <string name="feature_dict_desc">Look up single words quickly</string>
     <string name="current_plan">Current Plan</string>
-    <!-- Promotional badge displayed on the Pro plan card. %% is a literal percent sign. -->
-    <string name="pro_sale_off" translatable="false">50%% OFF</string>
+    <!-- Promotional badge displayed on the Pro plan card. % is a literal percent sign. -->
+    <string name="pro_sale_off" translatable="false">50% OFF</string>
     <string name="loading_price">Loading price…</string>
     <string name="one_time_payment">One-time payment</string>
     <string name="lifetime_access">Lifetime Access</string>
     <string name="early_access_sale">Early Access Sale</string>
-    <string name="pro_includes">Everything in Free, plus:</string>
+    <string name="pro_includes">Features:</string>
     <string name="feature_cloud_sync">Cloud Sync Across Devices</string>
     <!-- "Google Drive" is a brand name — do not translate. -->
     <string name="feature_cloud_sync_desc">Keep your entire library, including book files and reading progress, synced across up to 4 devices.</string>
     <!-- "Summarization" is a Pro AI feature name. -->
     <string name="feature_summarize">Summarization</string>
-    <string name="feature_summarize_desc">Get quick summaries of chapters or pages</string>
+    <string name="feature_summarize_desc">Get 10 free summaries of chapters or pages per day</string>
     <!-- "Smart Dictionary" is a Pro AI feature name. -->
     <string name="feature_smart_dict">Smart Dictionary</string>
     <string name="feature_smart_dict_desc">Search phrases and even paragraphs, not just single words</string>
@@ -272,6 +272,7 @@
     <string name="upgrade_unavailable">Upgrade currently unavailable. Please check your internet and try again.</string>
     <!-- "Google" is a brand name. "Episteme Pro" is the product tier name — do not translate "Episteme". -->
     <string name="sign_in_to_purchase">Please sign in to your Google account to purchase Episteme Pro.</string>
+    <string name="sign_in_to_purchase_credits">Please sign in to your Google account to purchase credits.</string>
     <string name="verifying_purchase_desc">This may take a few moments. Your Pro status will be updated automatically.</string>
     <!-- "Pro" refers to the Episteme Pro product tier. -->
     <string name="dialog_existing_purchase_desc">This device already has a Pro purchase, but it\'s linked to a different account. Please sign in to the account that was used for the original purchase to restore your Pro features.</string>
@@ -511,7 +512,7 @@
     <string name="search_in_book">Search in book…</string>
     <string name="search_no_results_simple">No results found.</string>
 
-    <!-- Common.kt: SummarizationPopup — AI feature, not translated. -->
+    <!-- Common.kt: — AI feature, not translated. -->
     <string name="generating_summary" translatable="false">Generating summary…</string>
     <string name="action_stop">Stop</string>
     <string name="action_read_aloud">Read aloud</string>

@@ -32,7 +32,6 @@ import android.content.Context
 import android.content.pm.PackageManager
 import androidx.compose.material3.Switch
 import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material.icons.filled.Tune
 import androidx.compose.foundation.rememberScrollState
 import android.graphics.Bitmap
 import android.graphics.RectF
@@ -269,8 +268,8 @@ import androidx.paging.compose.itemKey
 import androidx.work.WorkInfo
 import com.aryan.reader.AiDefinitionPopup
 import com.aryan.reader.AiDefinitionResult
+import com.aryan.reader.AiHubBottomSheet
 import com.aryan.reader.BuildConfig
-import com.aryan.reader.DeviceVoiceSettingsSheet
 import com.aryan.reader.FileType
 import com.aryan.reader.HighlightColorPickerDialog
 import com.aryan.reader.MainViewModel
@@ -279,15 +278,14 @@ import com.aryan.reader.ReaderTheme
 import com.aryan.reader.ReaderThemePanel
 import com.aryan.reader.SearchResult
 import com.aryan.reader.SearchTopBar
-import com.aryan.reader.SummarizationPopup
 import com.aryan.reader.SummarizationResult
+import com.aryan.reader.SummaryCacheManager
 import com.aryan.reader.TooltipIconButton
 import com.aryan.reader.TtsSettingsSheet
-import com.aryan.reader.countWords
 import com.aryan.reader.epubreader.AutoScrollControls
 import com.aryan.reader.epubreader.DictionarySettingsDialog
 import com.aryan.reader.epubreader.ExternalDictionaryHelper
-import com.aryan.reader.epubreader.TtsControlsSheet
+import com.aryan.reader.epubreader.TtsOverlayControls
 import com.aryan.reader.fetchAiDefinition
 import com.aryan.reader.loadCustomThemes
 import com.aryan.reader.paginatedreader.TtsChunk
@@ -306,7 +304,6 @@ import com.aryan.reader.saveCustomThemes
 import com.aryan.reader.summarizationUrl
 import com.aryan.reader.tts.SpeakerSamplePlayer
 import com.aryan.reader.tts.TtsPlaybackManager
-import com.aryan.reader.tts.loadTtsMode
 import com.aryan.reader.tts.rememberTtsController
 import com.aryan.reader.tts.splitTextIntoChunks
 import io.legere.pdfiumandroid.api.Bookmark
@@ -1099,7 +1096,7 @@ private fun PdfTocTreeItem(
 @OptIn(UnstableApi::class)
 @Suppress("unused")
 private fun saveTtsMode(context: Context, mode: TtsPlaybackManager.TtsMode) {
-    val prefs = context.getSharedPreferences(SETTINGS_PREFS_NAME, Context.MODE_PRIVATE)
+    val prefs = context.getSharedPreferences("reader_prefs", Context.MODE_PRIVATE)
     prefs.edit { putString(TTS_MODE_KEY, mode.name) }
 }
 
@@ -1229,7 +1226,9 @@ fun PdfViewerScreen(
     var currentThemeId by remember { mutableStateOf(loadPdfThemeId(context)) }
     var customThemes by remember { mutableStateOf(loadCustomThemes(context)) }
     val documentCache = remember { DocumentCache(3) }
+    val summaryCacheManager = remember(context) { SummaryCacheManager(context) }
     val tabStateMap = remember { mutableStateMapOf<String, Int>() }
+    var showInsufficientCreditsDialog by remember { mutableStateOf(false) }
 
     val activeTheme = remember(currentThemeId, customThemes) {
         PdfBuiltInThemes.find { it.id == currentThemeId }
@@ -1298,6 +1297,7 @@ fun PdfViewerScreen(
     }
     var currentBookId by remember { mutableStateOf<String?>(null) }
     val bookId = currentBookId ?: effectivePdfUri.toString().hashCode().toString()
+    var documentMetadataTitle by remember { mutableStateOf<String?>(null) }
     val view = LocalView.current
     var isDockDragging by remember { mutableStateOf(false) }
     var initialScrollDone by remember { mutableStateOf(false) }
@@ -1320,14 +1320,24 @@ fun PdfViewerScreen(
     var isAutoScrollTempPaused by remember { mutableStateOf(false) }
     val autoScrollResumeJob = remember { mutableStateOf<Job?>(null) }
     var isAutoScrollCollapsed by remember { mutableStateOf(false) }
+    var isTtsCollapsed by remember { mutableStateOf(false) }
 
     var isMusicianMode by remember { mutableStateOf(loadPdfMusicianMode(context)) }
     var autoScrollUseSlider by remember { mutableStateOf(loadPdfAutoScrollUseSlider(context)) }
     var isStylusOnlyMode by remember { mutableStateOf(loadStylusOnlyMode(context)) }
-    var currentTtsMode by remember { mutableStateOf(loadTtsMode(context)) }
-    var showTtsSettingsSheet by remember { mutableStateOf(false) }
     var showTtsControlsSheet by remember { mutableStateOf(false) }
     var isKeepScreenOn by remember { mutableStateOf(loadKeepScreenOn(context)) }
+    val ttsController = rememberTtsController()
+    val ttsState by ttsController.ttsState.collectAsState()
+    ttsState.currentText
+    var currentTtsMode by remember {
+        mutableStateOf(
+            com.aryan.reader.tts.loadTtsMode(context).let {
+                if (BuildConfig.FLAVOR == "oss") TtsPlaybackManager.TtsMode.BASE else it
+            }
+        )
+    }
+    var showTtsSettingsSheet by remember { mutableStateOf(false) }
 
     DisposableEffect(isKeepScreenOn) {
         view.keepScreenOn = isKeepScreenOn
@@ -1341,8 +1351,6 @@ fun PdfViewerScreen(
     var selectedDictPackage by remember { mutableStateOf(loadExternalDictPackage(context)) }
     var selectedTranslatePackage by remember { mutableStateOf(loadExternalTranslatePackage(context)) }
     var selectedSearchPackage by remember { mutableStateOf(loadExternalSearchPackage(context)) }
-
-    var showDeviceVoiceSettingsSheet by remember { mutableStateOf(false) }
 
     fun triggerAutoScrollTempPause(durationMs: Long) {
         if (!isAutoScrollModeActive || !isAutoScrollPlaying) return
@@ -1584,6 +1592,19 @@ fun PdfViewerScreen(
             delay(500)
             lockedState = Triple(currentActiveScale, currentActiveOffset.x, currentActiveOffset.y)
             savePdfLockedState(context, bookId, currentActiveScale, currentActiveOffset.x, currentActiveOffset.y)
+        }
+    }
+
+    LaunchedEffect(ttsState.errorMessage) {
+        ttsState.errorMessage?.let { message ->
+            if (message == "INSUFFICIENT_CREDITS") {
+                showInsufficientCreditsDialog = true
+                ttsController.stop()
+            } else {
+                coroutineScope.launch {
+                    snackbarHostState.showSnackbar(message)
+                }
+            }
         }
     }
 
@@ -2648,7 +2669,7 @@ fun PdfViewerScreen(
 
     var ocrUsedForCurrentPageTts by remember { mutableStateOf(false) }
 
-    var showSummarizationPopup by remember { mutableStateOf(false) }
+    var showAiHubSheet by remember { mutableStateOf(false) }
     var summarizationResult by remember { mutableStateOf<SummarizationResult?>(null) }
     var isSummarizationLoading by remember { mutableStateOf(false) }
 
@@ -2659,16 +2680,17 @@ fun PdfViewerScreen(
     val scrubDebounceJob = remember { mutableStateOf<Job?>(null) }
     var startPageThumbnail by remember { mutableStateOf<Bitmap?>(null) }
 
-    val speakerPlayer =
-        remember(context, coroutineScope) { SpeakerSamplePlayer(context, coroutineScope) }
+    val speakerPlayer = remember(context, coroutineScope) {
+        SpeakerSamplePlayer(
+            context = context,
+            scope = coroutineScope,
+            getAuthToken = { viewModel.getAuthToken() }
+        )
+    }
 
     var clickedLinkUrl by remember { mutableStateOf<String?>(null) }
     val uriHandler = LocalUriHandler.current
     @Suppress("DEPRECATION") val clipboardManager = LocalClipboardManager.current
-
-    val ttsController = rememberTtsController()
-    val ttsState by ttsController.ttsState.collectAsState()
-    ttsState.currentText
 
     var showRenameBookmarkDialog by remember { mutableStateOf<PdfBookmark?>(null) }
 
@@ -2723,35 +2745,43 @@ fun PdfViewerScreen(
         }
     }
 
-    val onDictionaryLookupStable = remember(isProUser, executeWithOcrCheck, useOnlineDictionary, selectedDictPackage) {
+    val onDictionaryLookupStable = remember(executeWithOcrCheck, useOnlineDictionary, selectedDictPackage, uiState.credits, isProUser) {
         { text: String ->
             executeWithOcrCheck {
                 val isOss = BuildConfig.FLAVOR == "oss"
                 val effectiveUseOnline = !isOss && useOnlineDictionary
 
                 if (effectiveUseOnline) {
-                    val wordCount = countWords(text)
-                    if (isProUser || wordCount <= 1) {
+                    val wordCount = com.aryan.reader.countWords(text)
+                    if (wordCount > 1 && !isProUser) {
+                        showDictionaryUpsellDialog = true
+                    } else {
                         selectedTextForAi = text
                         showAiDefinitionPopup = true
                         coroutineScope.launch {
+                            val token = viewModel.getAuthToken()
                             isAiDefinitionLoading = true
                             aiDefinitionResult = null
                             fetchAiDefinition(
-                                text = text, onUpdate = { chunk ->
-                                val currentDefinition = aiDefinitionResult?.definition ?: ""
-                                aiDefinitionResult = AiDefinitionResult(
-                                    definition = currentDefinition + chunk
-                                )
-                            }, onError = { error ->
-                                aiDefinitionResult = AiDefinitionResult(error = error)
-                            }, onFinish = {
-                                isAiDefinitionLoading = false
-                            }, context = context
+                                text = text,
+                                authToken = token,
+                                onUpdate = { chunk ->
+                                    val currentDefinition = aiDefinitionResult?.definition ?: ""
+                                    aiDefinitionResult = AiDefinitionResult(definition = currentDefinition + chunk)
+                                },
+                                onError = { error ->
+                                    if (error == "INSUFFICIENT_CREDITS") {
+                                        showInsufficientCreditsDialog = true
+                                        showAiDefinitionPopup = false
+                                        isAiDefinitionLoading = false
+                                    } else {
+                                        aiDefinitionResult = AiDefinitionResult(error = error)
+                                    }
+                                },
+                                onFinish = { isAiDefinitionLoading = false },
+                                context = context
                             )
                         }
-                    } else {
-                        showDictionaryUpsellDialog = true
                     }
                 } else {
                     if (!selectedDictPackage.isNullOrEmpty()) {
@@ -2835,6 +2865,7 @@ fun PdfViewerScreen(
     }
 
     suspend fun summarizeCurrentPage(
+        authToken: String?,
         onUpdate: (SummarizationResult) -> Unit, onFinish: () -> Unit
     ) {
         val currentPageIndex = currentPage
@@ -2892,28 +2923,50 @@ fun PdfViewerScreen(
                     put("content_type", "image")
                     put("data", base64Image)
                 }
+                if (authToken != null) {
+                    connection.setRequestProperty("Authorization", "Bearer $authToken")
+                }
                 connection.outputStream.use { os ->
                     os.write(jsonPayload.toString().toByteArray(Charsets.UTF_8))
                 }
 
                 val responseCode = connection.responseCode
                 Timber.d("Summarization API response code: $responseCode")
+                if (responseCode == 402) {
+                    onUpdate(SummarizationResult(error = "INSUFFICIENT_CREDITS"))
+                    onFinish()
+                    return@withContext
+                }
 
                 if (responseCode == HttpURLConnection.HTTP_OK) {
                     val fullText = StringBuilder()
                     var lastResult: SummarizationResult? = null
+                    var currentCost: Double? = null
+                    var currentFreeRemaining: Int? = null
+
                     connection.inputStream.bufferedReader(Charsets.UTF_8).use { reader ->
                         var line: String?
                         while (reader.readLine().also { line = it } != null) {
                             try {
                                 val jsonResponse = JSONObject(line!!)
+
+                                val cost = if (jsonResponse.has("cost_deducted")) jsonResponse.optDouble("cost_deducted", -1.0) else -1.0
+                                val freeRemaining = jsonResponse.optInt("free_summaries_remaining", -1)
+
+                                if (cost > -1.0 || freeRemaining > -1) {
+                                    if (cost > -1.0) currentCost = cost
+                                    if (freeRemaining > -1) currentFreeRemaining = freeRemaining
+                                    lastResult = SummarizationResult(summary = fullText.toString(), cost = currentCost, freeRemaining = currentFreeRemaining)
+                                    onUpdate(lastResult)
+                                }
+
                                 jsonResponse.optString("chunk").takeIf { it.isNotEmpty() }?.let {
                                     fullText.append(it)
-                                    lastResult = SummarizationResult(summary = fullText.toString())
-                                    @Suppress("UNNECESSARY_NOT_NULL_ASSERTION") onUpdate(lastResult!!)
+                                    lastResult = SummarizationResult(summary = fullText.toString(), cost = currentCost, freeRemaining = currentFreeRemaining)
+                                    onUpdate(lastResult!!)
                                 }
                                 jsonResponse.optString("error").takeIf { it.isNotEmpty() }?.let {
-                                    lastResult = SummarizationResult(error = it)
+                                    lastResult = SummarizationResult(error = it, cost = currentCost, freeRemaining = currentFreeRemaining)
                                     onUpdate(lastResult)
                                 }
                             } catch (e: Exception) {
@@ -3032,11 +3085,17 @@ fun PdfViewerScreen(
     }
 
     fun startTts(pageToReadOverride: Int? = null, startCharIndex: Int? = null) {
+        if (currentTtsMode == TtsPlaybackManager.TtsMode.CLOUD && uiState.credits <= 0) {
+            showInsufficientCreditsDialog = true
+            return
+        }
+
         Timber.d("TTS button clicked: Starting TTS for current page/selection")
         if (pdfDocument == null || totalPages == 0) {
             return
         }
         coroutineScope.launch {
+            val token = viewModel.getAuthToken()
             val pageToRead = pageToReadOverride ?: currentPage
             var rawPageText: String? = null
             var tempPage: ReaderPage? = null
@@ -3108,7 +3167,8 @@ fun PdfViewerScreen(
                     chapterTitle = pageTitle,
                     coverImageUri = null,
                     ttsMode = currentTtsMode,
-                    playbackSource = "READER"
+                    playbackSource = "READER",
+                    authToken = token
                 )
 
                 if (isAutoPagingForTts) {
@@ -3269,6 +3329,7 @@ fun PdfViewerScreen(
         isLoadingDocument = true
         isDocumentReady = false
         errorMessage = null
+        documentMetadataTitle = null
 
         if (showPasswordDialog) isPasswordError = false
 
@@ -3336,6 +3397,7 @@ fun PdfViewerScreen(
                 }
 
                 pdfDocument = doc
+                documentMetadataTitle = (doc as? PdfDocumentWrapper)?.pdfDocument?.getDocumentMeta()?.title?.takeIf { it.isNotBlank() }
                 pfdState = currentPfdOpened
                 val pagesCount = doc.getPageCount()
 
@@ -3525,6 +3587,7 @@ fun PdfViewerScreen(
             }
         }
         previousPage = currentPage
+        summarizationResult = null
     }
 
     LaunchedEffect(pagerState.currentPage) {
@@ -3862,7 +3925,7 @@ fun PdfViewerScreen(
                 showBars = true
             }
 
-            showSummarizationPopup -> showSummarizationPopup = false
+            showAiHubSheet -> showAiHubSheet = false
             showPermissionRationaleDialog -> showPermissionRationaleDialog = false
             showSummarizationUpsellDialog -> showSummarizationUpsellDialog = false
             showAiDefinitionPopup -> showAiDefinitionPopup = false
@@ -3991,55 +4054,103 @@ fun PdfViewerScreen(
                                         }
                                     }
 
-                                    Box(modifier = Modifier.fillMaxSize()) {
-                                        LazyColumn(
-                                            state = listState,
-                                            modifier = Modifier
-                                                .fillMaxHeight()
-                                                .padding(end = 12.dp)
-                                        ) {
-                                            items(
-                                                items = visibleItemInfo,
-                                                key = { it.second.title + it.first }
-                                            ) { item ->
-                                                val (originalIndex, entry) = item
-
-                                                val nextItem = flatTableOfContents.getOrNull(originalIndex + 1)
-                                                val hasChildren = nextItem != null && nextItem.nestLevel > entry.nestLevel
-                                                val isExpanded = expandedEntryIndices.contains(originalIndex)
-                                                val isCurrentChapter = entry == currentTocEntry
-
-                                                PdfTocTreeItem(
-                                                    label = entry.title,
-                                                    nestLevel = entry.nestLevel,
-                                                    isExpanded = isExpanded,
-                                                    hasChildren = hasChildren,
-                                                    isCurrent = isCurrentChapter,
-                                                    onToggleExpand = {
-                                                        expandedEntryIndices = if (isExpanded) {
-                                                            expandedEntryIndices - originalIndex
-                                                        } else {
-                                                            expandedEntryIndices + originalIndex
-                                                        }
-                                                    },
-                                                    onClick = {
-                                                        coroutineScope.launch {
-                                                            drawerState.close()
-                                                            if (displayMode == DisplayMode.PAGINATION) {
-                                                                pagerState.scrollToPage(entry.pageIndex)
-                                                            } else {
-                                                                verticalReaderState.scrollToPage(entry.pageIndex)
-                                                            }
-                                                        }
+                                    val onScrollToCurrent = {
+                                        drawerScope.launch {
+                                            val targetEntry = currentTocEntry ?: return@launch
+                                            val targetOriginalIndex = flatTableOfContents.indexOf(targetEntry)
+                                            if (targetOriginalIndex != -1) {
+                                                var currentLevel = targetEntry.nestLevel
+                                                val newExpanded = expandedEntryIndices.toMutableSet()
+                                                for (i in targetOriginalIndex downTo 0) {
+                                                    val entry = flatTableOfContents[i]
+                                                    if (entry.nestLevel < currentLevel) {
+                                                        newExpanded.add(i)
+                                                        currentLevel = entry.nestLevel
                                                     }
-                                                )
+                                                }
+                                                expandedEntryIndices = newExpanded
+
+                                                delay(100)
+
+                                                val visibleIdx = visibleItemInfo.indexOfFirst { it.second == targetEntry }
+                                                if (visibleIdx != -1) {
+                                                    listState.animateScrollToItem(visibleIdx)
+                                                }
+                                            }
+                                        }
+                                        Unit
+                                    }
+
+                                    Column(modifier = Modifier.fillMaxSize()) {
+                                        Row(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .padding(horizontal = 4.dp),
+                                            horizontalArrangement = Arrangement.SpaceEvenly
+                                        ) {
+                                            TextButton(onClick = { expandedEntryIndices = flatTableOfContents.indices.toSet() }) {
+                                                Text("Expand All")
+                                            }
+                                            TextButton(onClick = { expandedEntryIndices = emptySet() }) {
+                                                Text("Collapse All")
+                                            }
+                                            TextButton(onClick = onScrollToCurrent) {
+                                                Text("Locate")
                                             }
                                         }
 
-                                        VerticalScrollbar(
-                                            listState = listState,
-                                            modifier = Modifier.align(Alignment.CenterEnd)
-                                        )
+                                        HorizontalDivider()
+
+                                        Box(modifier = Modifier.fillMaxWidth().weight(1f)) {
+                                            LazyColumn(
+                                                state = listState,
+                                                modifier = Modifier
+                                                    .fillMaxHeight()
+                                                    .padding(end = 12.dp)
+                                            ) {
+                                                items(
+                                                    items = visibleItemInfo,
+                                                    key = { it.second.title + it.first }
+                                                ) { item ->
+                                                    val (originalIndex, entry) = item
+
+                                                    val nextItem = flatTableOfContents.getOrNull(originalIndex + 1)
+                                                    val hasChildren = nextItem != null && nextItem.nestLevel > entry.nestLevel
+                                                    val isExpanded = expandedEntryIndices.contains(originalIndex)
+                                                    val isCurrentChapter = entry == currentTocEntry
+
+                                                    PdfTocTreeItem(
+                                                        label = entry.title,
+                                                        nestLevel = entry.nestLevel,
+                                                        isExpanded = isExpanded,
+                                                        hasChildren = hasChildren,
+                                                        isCurrent = isCurrentChapter,
+                                                        onToggleExpand = {
+                                                            expandedEntryIndices = if (isExpanded) {
+                                                                expandedEntryIndices - originalIndex
+                                                            } else {
+                                                                expandedEntryIndices + originalIndex
+                                                            }
+                                                        },
+                                                        onClick = {
+                                                            coroutineScope.launch {
+                                                                drawerState.close()
+                                                                if (displayMode == DisplayMode.PAGINATION) {
+                                                                    pagerState.scrollToPage(entry.pageIndex)
+                                                                } else {
+                                                                    verticalReaderState.scrollToPage(entry.pageIndex)
+                                                                }
+                                                            }
+                                                        }
+                                                    )
+                                                }
+                                            }
+
+                                            VerticalScrollbar(
+                                                listState = listState,
+                                                modifier = Modifier.align(Alignment.CenterEnd)
+                                            )
+                                        }
                                     }
                                 }
                             }
@@ -4723,6 +4834,7 @@ fun PdfViewerScreen(
                                                 },
                                                 richTextController = richTextController,
                                                 isStylusOnlyMode = isStylusOnlyMode,
+                                                isAutoScrollPlaying = isAutoScrollPlaying,
                                                 isHighlighterSnapEnabled = isHighlighterSnapEnabled,
                                                 isEditMode = isDrawingActive,
                                                 textBoxes = textBoxes.filter { it.pageIndex == pageIndex },
@@ -5833,9 +5945,10 @@ fun PdfViewerScreen(
                                             if (!hiddenTools.contains(PdfReaderTool.TTS_SETTINGS.name)) {
                                                 DropdownMenuItem(
                                                     text = { Text(stringResource(R.string.menu_tts_voice_settings)) },
+                                                    enabled = !isTtsSessionActive,
                                                     onClick = {
                                                         showMoreMenu = false
-                                                        showDeviceVoiceSettingsSheet = true
+                                                        showTtsSettingsSheet = true
                                                     },
                                                     leadingIcon = {
                                                         Icon(
@@ -5845,24 +5958,6 @@ fun PdfViewerScreen(
                                                         )
                                                     }
                                                 )
-
-                                                if (BuildConfig.DEBUG) {
-                                                    DropdownMenuItem(
-                                                        text = { Text(stringResource(R.string.menu_tts_settings_debug)) },
-                                                        onClick = {
-                                                            showMoreMenu = false
-                                                            showTtsSettingsSheet = true
-                                                        },
-                                                        leadingIcon = {
-                                                            Icon(
-                                                                painter = painterResource(id = R.drawable.text_to_speech),
-                                                                contentDescription = null,
-                                                                modifier = Modifier.size(20.dp)
-                                                            )
-                                                        }
-                                                    )
-                                                }
-                                                HorizontalDivider()
                                             }
                                             if (!hiddenTools.contains(PdfReaderTool.BOOKMARK.name)) {
                                                 DropdownMenuItem(text = {
@@ -6429,43 +6524,15 @@ fun PdfViewerScreen(
 
                             // AI feat
                             if (BuildConfig.FLAVOR != "oss" && !hiddenTools.contains(PdfReaderTool.AI_FEATURES.name)) {
-                                Box {
-                                    var showAiFeaturesMenu by remember { mutableStateOf(false) }
-                                    TooltipIconButton(
-                                        text = stringResource(R.string.tooltip_ai),
-                                        description = stringResource(R.string.tooltip_ai_desc),
-                                        onClick = { showAiFeaturesMenu = true }
-                                    ) {
-                                        Icon(
-                                            painter = painterResource(id = R.drawable.ai),
-                                            contentDescription = stringResource(R.string.tooltip_ai)
-                                        )
-                                    }
-                                    DropdownMenu(
-                                        expanded = showAiFeaturesMenu,
-                                        onDismissRequest = { showAiFeaturesMenu = false }) {
-                                        DropdownMenuItem(
-                                            text = {
-                                                Text(stringResource(R.string.action_summarize_page))
-                                            }, onClick = {
-                                                showAiFeaturesMenu = false
-                                                if (isProUser) {
-                                                    showSummarizationPopup = true
-                                                    coroutineScope.launch {
-                                                        isAiDefinitionLoading = true
-                                                        summarizationResult = null
-                                                        summarizeCurrentPage(onUpdate = { result ->
-                                                            summarizationResult = result
-                                                        }, onFinish = {
-                                                            isAiDefinitionLoading = false
-                                                        })
-                                                    }
-                                                } else {
-                                                    showSummarizationUpsellDialog = true
-                                                }
-                                            }, enabled = !isSummarizationLoading && pdfDocument != null
-                                        )
-                                    }
+                                TooltipIconButton(
+                                    text = stringResource(R.string.tooltip_ai),
+                                    description = stringResource(R.string.tooltip_ai_desc),
+                                    onClick = { showAiHubSheet = true }
+                                ) {
+                                    Icon(
+                                        painter = painterResource(id = R.drawable.ai),
+                                        contentDescription = stringResource(R.string.tooltip_ai)
+                                    )
                                 }
                             }
 
@@ -6506,72 +6573,25 @@ fun PdfViewerScreen(
 
                             // TTS
                             if (!hiddenTools.contains(PdfReaderTool.TTS_CONTROLS.name)) {
-                                Box {
-                                    Row(verticalAlignment = Alignment.CenterVertically) {
-                                        TooltipIconButton(
-                                            text = if (isTtsSessionActive) stringResource(R.string.tooltip_tts_stop)
-                                            else stringResource(R.string.tooltip_tts_start),
-                                            description = if (isTtsSessionActive) stringResource(R.string.tooltip_tts_stop_desc)
-                                            else stringResource(R.string.tooltip_tts_start_desc),
-                                            onClick = {
-                                                if (isTtsSessionActive) {
-                                                    Timber.d("TTS button clicked: Stopping TTS")
-                                                    ttsController.stop()
-                                                } else {
-                                                    startTtsWithPermissionCheck(null, null)
-                                                }
-                                            }) {
-                                            Icon(
-                                                painter = if (isTtsSessionActive) painterResource(id = R.drawable.close)
-                                                else painterResource(
-                                                    id = R.drawable.text_to_speech
-                                                ),
-                                                contentDescription = if (isTtsSessionActive) stringResource(R.string.content_desc_stop_tts) else stringResource(R.string.content_desc_start_tts)
-                                            )
-                                        }
-
+                                TooltipIconButton(
+                                    text = if (isTtsSessionActive) stringResource(R.string.tooltip_tts_stop)
+                                    else stringResource(R.string.tooltip_tts_start),
+                                    description = if (isTtsSessionActive) stringResource(R.string.tooltip_tts_stop_desc)
+                                    else stringResource(R.string.tooltip_tts_start_desc),
+                                    onClick = {
                                         if (isTtsSessionActive) {
-                                            TooltipIconButton(
-                                                text = if (ttsState.isPlaying)
-                                                    stringResource(R.string.tooltip_tts_pause)
-                                                else
-                                                    stringResource(R.string.tooltip_tts_resume),
-                                                description = if (ttsState.isPlaying)
-                                                    stringResource(R.string.tooltip_tts_pause_desc)
-                                                else
-                                                    stringResource(R.string.tooltip_tts_resume_desc),
-                                                onClick = {
-                                                    if (ttsState.isPlaying) {
-                                                        ttsController.pause()
-                                                    } else {
-                                                        ttsController.resume()
-                                                    }
-                                                }, enabled = !ttsState.isLoading
-                                            ) {
-                                                Icon(
-                                                    painter = painterResource(
-                                                        id = if (ttsState.isPlaying) R.drawable.pause
-                                                        else R.drawable.play
-                                                    ), contentDescription = if (ttsState.isPlaying) stringResource(R.string.content_desc_pause_tts)
-                                                    else stringResource(R.string.content_desc_resume_tts)
-                                                )
-                                            }
-
-                                            // Tune button for BASE mode
-                                            if (currentTtsMode == TtsPlaybackManager.TtsMode.BASE) {
-                                                TooltipIconButton(
-                                                    text = stringResource(R.string.tts_voice_adjustments),
-                                                    description = "Adjust voice speed and pitch",
-                                                    onClick = { showTtsControlsSheet = true }
-                                                ) {
-                                                    Icon(
-                                                        imageVector = Icons.Default.Tune,
-                                                        contentDescription = stringResource(R.string.tts_voice_adjustments)
-                                                    )
-                                                }
-                                            }
+                                            Timber.d("TTS button clicked: Stopping TTS")
+                                            ttsController.stop()
+                                        } else {
+                                            startTtsWithPermissionCheck(null, null)
                                         }
-                                    }
+                                    }) {
+                                    Icon(
+                                        painter = if (isTtsSessionActive) painterResource(id = R.drawable.close)
+                                        else painterResource(id = R.drawable.text_to_speech),
+                                        contentDescription = if (isTtsSessionActive) "Stop TTS" else "Start TTS",
+                                        tint = if (isTtsSessionActive) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
                                 }
                             }
 
@@ -7190,15 +7210,71 @@ fun PdfViewerScreen(
                     }
                 }
 
-                if (showSummarizationPopup) {
-                    SummarizationPopup(
-                        title = "Page Summary",
-                        result = summarizationResult,
-                        isLoading = isSummarizationLoading,
-                        onDismiss = { showSummarizationPopup = false },
-                        isMainTtsActive = isTtsSessionActive
+                if (showAiHubSheet) {
+                    val currentPageForDisplay = if (displayMode == DisplayMode.PAGINATION) {
+                        pagerState.currentPage
+                    } else {
+                        verticalReaderState.currentPage
+                    }
+                    val bookTitle = documentMetadataTitle ?: originalFileName
+
+                    AiHubBottomSheet(
+                        bookTitle = bookTitle,
+                        currentChapterIndex = currentPageForDisplay,
+                        chapterTitle = "Page ${currentPageForDisplay + 1}",
+                        summaryCacheManager = summaryCacheManager,
+                        summarizationResult = summarizationResult,
+                        isSummarizationLoading = isSummarizationLoading,
+                        onClearSummary = { summarizationResult = null },
+                        onGenerateSummary = { force ->
+                            if (!isProUser && uiState.credits <= 0) {
+                                showInsufficientCreditsDialog = true
+                                showAiHubSheet = false
+                            } else {
+                                coroutineScope.launch {
+                                    isSummarizationLoading = true
+                                    summarizationResult = null
+
+                                    val cached = if (!force) summaryCacheManager.getSummary(bookTitle, currentPageForDisplay) else null
+                                    if (cached != null) {
+                                        summarizationResult = SummarizationResult(summary = cached, isCacheHit = true)
+                                        isSummarizationLoading = false
+                                        return@launch
+                                    }
+
+                                    val token = viewModel.getAuthToken()
+                                    summarizeCurrentPage(
+                                        authToken = token,
+                                        onUpdate = { result ->
+                                            if (result.error == "INSUFFICIENT_CREDITS") {
+                                                showInsufficientCreditsDialog = true
+                                                showAiHubSheet = false
+                                                isSummarizationLoading = false
+                                            } else {
+                                                summarizationResult = result
+                                            }
+                                        }, onFinish = {
+                                            isSummarizationLoading = false
+                                            val finalSummary = summarizationResult?.summary
+                                            if (!finalSummary.isNullOrBlank() && summarizationResult?.error == null) {
+                                                summaryCacheManager.saveSummary(bookTitle, currentPageForDisplay, "Page ${currentPageForDisplay + 1}", finalSummary)
+                                            }
+                                        }
+                                    )
+                                }
+                            }
+                        },
+                        recapResult = null,
+                        isRecapLoading = false,
+                        onGenerateRecap = null,
+                        onDismiss = { showAiHubSheet = false },
+                        isMainTtsActive = isTtsSessionActive,
+                        getAuthToken = { viewModel.getAuthToken() },
+                        credits = uiState.credits,
+                        isProUser = isProUser
                     )
                 }
+
                 if (showPermissionRationaleDialog) {
                     AlertDialog(
                         onDismissRequest = { showPermissionRationaleDialog = false },
@@ -7252,6 +7328,26 @@ fun PdfViewerScreen(
                                 Text(stringResource(R.string.action_not_now))
                             }
                         })
+                }
+
+                if (showInsufficientCreditsDialog) {
+                    AlertDialog(
+                        onDismissRequest = { showInsufficientCreditsDialog = false },
+                        icon = { Icon(painterResource(id = R.drawable.crown), contentDescription = null) },
+                        title = { Text("Out of Credits") },
+                        text = { Text("You don't have enough credits. Get Episteme Pro for 10 free Summaries per day, or add more credits to use Summaries, Cloud TTS and Story Recap.") },
+                        confirmButton = {
+                            TextButton(onClick = {
+                                showInsufficientCreditsDialog = false
+                                onNavigateToPro()
+                            }) { Text("Get Pro / Add Credits") }
+                        },
+                        dismissButton = {
+                            TextButton(onClick = { showInsufficientCreditsDialog = false }) {
+                                Text(stringResource(R.string.action_cancel))
+                            }
+                        }
+                    )
                 }
 
                 if (showPasswordDialog) {
@@ -7342,7 +7438,8 @@ fun PdfViewerScreen(
                                     showDictionarySettingsSheet = true
                                 }
                             }
-                        }
+                        },
+                        getAuthToken = { viewModel.getAuthToken() }
                     )
                 }
                 if (showDictionaryUpsellDialog) {
@@ -7455,6 +7552,7 @@ fun PdfViewerScreen(
                 }
 
                 if (showTtsSettingsSheet) {
+                    val bookTitle = documentMetadataTitle ?: originalFileName
                     TtsSettingsSheet(
                         isVisible = true,
                         onDismiss = { showTtsSettingsSheet = false },
@@ -7468,15 +7566,9 @@ fun PdfViewerScreen(
                         onSpeakerChange = { newSpeaker ->
                             ttsController.changeSpeaker(newSpeaker)
                         },
-                        isTtsActive = isTtsSessionActive
-                    )
-                }
-
-                if (showTtsControlsSheet) {
-                    TtsControlsSheet(
-                        onDismiss = { showTtsControlsSheet = false },
-                        onOpenDeviceVoiceSettings = { showDeviceVoiceSettingsSheet = true },
-                        ttsController = ttsController
+                        isTtsActive = isTtsSessionActive,
+                        getAuthToken = { viewModel.getAuthToken() },
+                        bookTitle = bookTitle
                     )
                 }
 
@@ -7505,13 +7597,6 @@ fun PdfViewerScreen(
                             selectedSearchPackage = pkg
                             saveExternalSearchPackage(context, pkg)
                         }
-                    )
-                }
-
-                if (showDeviceVoiceSettingsSheet) {
-                    DeviceVoiceSettingsSheet(
-                        isVisible = true,
-                        onDismiss = { showDeviceVoiceSettingsSheet = false }
                     )
                 }
 
@@ -7776,6 +7861,39 @@ fun PdfViewerScreen(
                     targetValue = if (showBars) (56.dp + 16.dp) else 16.dp,
                     label = "AutoScrollPadding"
                 )
+
+                val ttsOverlayPadding by animateDpAsState(
+                    targetValue = if (showBars) (56.dp + 16.dp) else 16.dp,
+                    label = "TtsOverlayPadding"
+                )
+
+                val ttsAlignmentBias by animateFloatAsState(
+                    targetValue = if (isTtsCollapsed) 1f else 0f,
+                    label = "TtsAlignAnimation"
+                )
+
+                AnimatedVisibility(
+                    visible = isTtsSessionActive && showBars,
+                    enter = slideInVertically(animationSpec = tween(200)) { it } + fadeIn(animationSpec = tween(200)),
+                    exit = slideOutVertically(animationSpec = tween(200)) { it } + fadeOut(animationSpec = tween(200)),
+                    modifier = Modifier
+                        .align(BiasAlignment(ttsAlignmentBias, 1f))
+                        .padding(bottom = ttsOverlayPadding)
+                        .padding(horizontal = 16.dp)
+                ) {
+                    TtsOverlayControls(
+                        ttsController = ttsController,
+                        ttsState = ttsState,
+                        currentTtsMode = currentTtsMode,
+                        isCollapsed = isTtsCollapsed,
+                        onCollapseChange = { isTtsCollapsed = it },
+                        onOpenTtsSettings = { showTtsSettingsSheet = true },
+                        onClose = {
+                            ttsController.stop()
+                        },
+                        credits = uiState.credits
+                    )
+                }
 
                 val isAutoScrollControlsVisible = isAutoScrollModeActive
 

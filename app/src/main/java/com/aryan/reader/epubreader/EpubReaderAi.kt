@@ -33,8 +33,8 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextAlign
 import com.aryan.reader.AiDefinitionPopup
 import com.aryan.reader.AiDefinitionResult
+import com.aryan.reader.AiHubBottomSheet
 import com.aryan.reader.R
-import com.aryan.reader.SummarizationPopup
 import com.aryan.reader.SummarizationResult
 import com.aryan.reader.SummaryCacheManager
 import com.aryan.reader.epub.EpubBook
@@ -55,6 +55,8 @@ import java.net.URL
  */
 suspend fun summarizeBookContent(
     content: String,
+    authToken: String?,
+    onUsageReceived: (cost: Double?, freeRemaining: Int?) -> Unit = { _, _ -> },
     onUpdate: (String) -> Unit,
     onError: (String) -> Unit,
     onFinish: () -> Unit
@@ -74,6 +76,9 @@ suspend fun summarizeBookContent(
             connection.requestMethod = "POST"
             connection.setRequestProperty("Content-Type", "application/json; charset=UTF-8")
             connection.setRequestProperty("Accept", "application/json")
+            if (authToken != null) {
+                connection.setRequestProperty("Authorization", "Bearer $authToken")
+            }
             connection.connectTimeout = 15000
             connection.readTimeout = 120000
             connection.doOutput = true
@@ -88,16 +93,29 @@ suspend fun summarizeBookContent(
             }
 
             val responseCode = connection.responseCode
-            Timber.d("Summarization: Got response code $responseCode")
+
+            if (responseCode == 402) {
+                onError("INSUFFICIENT_CREDITS")
+                onFinish()
+                return@withContext
+            }
 
             if (responseCode == HttpURLConnection.HTTP_OK) {
                 var hasReceivedData = false
                 connection.inputStream.bufferedReader(Charsets.UTF_8).use { reader ->
                     var line: String?
                     while (reader.readLine().also { line = it } != null) {
-                        Timber.d("Summarization: Received line: $line")
                         try {
                             val jsonResponse = JSONObject(line!!)
+
+                            val cost = if (jsonResponse.has("cost_deducted")) jsonResponse.optDouble("cost_deducted", -1.0) else -1.0
+                            val freeRemaining = jsonResponse.optInt("free_summaries_remaining", -1)
+                            if (cost > -1.0 || freeRemaining > -1) {
+                                val finalCost = if (cost > -1.0) cost else null
+                                val finalRemaining = if (freeRemaining > -1) freeRemaining else null
+                                onUsageReceived(finalCost, finalRemaining)
+                            }
+
                             jsonResponse.optString("chunk").takeIf { it.isNotEmpty() }?.let {
                                 onUpdate(it)
                                 hasReceivedData = true
@@ -137,6 +155,7 @@ suspend fun summarizeBookContent(
  * Fetches past summaries from cache/network and combines with current context.
  */
 suspend fun executeRecapLogic(
+    authToken: String?,
     epubBook: EpubBook,
     chapterIndex: Int,
     characterLimit: Int,
@@ -145,6 +164,7 @@ suspend fun executeRecapLogic(
     context: Context,
     onProgressUpdate: (String) -> Unit,
     onResultUpdate: (String) -> Unit,
+    onCostReceived: (Double?) -> Unit = {},
     onError: (String) -> Unit,
     onFinish: () -> Unit
 ) {
@@ -176,18 +196,38 @@ suspend fun executeRecapLogic(
 
                 summarizeBookContent(
                     content = textToSummarize,
+                    authToken = authToken,
+                    onUsageReceived = { cost, _ ->
+                        Timber.i("[AI-Billing] Background past chapter summary cost: $cost credits")
+                    },
                     onUpdate = { sb.append(it) },
                     onError = {
                         Timber.e("Failed to summarize Ch $i for recap: $it")
                         latch.complete(false)
                     },
-                    onFinish = { latch.complete(true) }
+                    onFinish = {
+                        latch.complete(true)
+                        val summary = sb.toString()
+                        if (summary.isNotBlank()) {
+                            val chapterTitle = chapters.getOrNull(i)?.title ?: "Chapter ${i + 1}"
+                            summaryCacheManager.saveSummary(epubBook.title, i, chapterTitle, summary)
+                            pastSummaries.add(summary)
+                        }
+                    }
                 )
 
                 val success = latch.await()
                 if (success && sb.isNotEmpty()) {
                     val summary = sb.toString()
-                    summaryCacheManager.saveSummary(epubBook.title, i, summary)
+
+                    val chapterTitle = chapters.getOrNull(i)?.title ?: "Chapter ${i + 1}"
+
+                    summaryCacheManager.saveSummary(
+                        bookTitle = epubBook.title,
+                        chapterIndex = i,
+                        chapterTitle = chapterTitle,
+                        summary = summary
+                    )
                     pastSummaries.add(summary)
                 }
             }
@@ -223,7 +263,9 @@ suspend fun executeRecapLogic(
         pastSummaries = pastSummaries,
         currentText = finalContextText,
         context = context,
+        authToken = authToken,
         onUpdate = { chunk -> onResultUpdate(chunk) },
+        onCostReceived = onCostReceived,
         onError = { error -> onError(error) },
         onFinish = { onFinish() }
     )
@@ -234,16 +276,22 @@ suspend fun executeRecapLogic(
  */
 @Composable
 fun EpubReaderAiOverlays(
-    showSummarizationPopup: Boolean,
+    bookTitle: String,
+    currentChapterIndex: Int,
+    chapterTitle: String,
+    summaryCacheManager: SummaryCacheManager,
+    showAiHubSheet: Boolean,
     summarizationResult: SummarizationResult?,
     isSummarizationLoading: Boolean,
-    onDismissSummarization: () -> Unit,
-    showSummarizationUpsellDialog: Boolean,
-    onDismissSummarizationUpsell: () -> Unit,
-    showRecapPopup: Boolean,
+    onGenerateSummary: (Boolean) -> Unit,
     recapResult: SummarizationResult?,
     isRecapLoading: Boolean,
-    onDismissRecap: () -> Unit,
+    onGenerateRecap: () -> Unit,
+    onDismissAiHub: () -> Unit,
+    onClearSummary: () -> Unit = {},
+    onClearRecap: () -> Unit = {},
+    showSummarizationUpsellDialog: Boolean,
+    onDismissSummarizationUpsell: () -> Unit,
     showAiDefinitionPopup: Boolean,
     selectedTextForAi: String?,
     aiDefinitionResult: AiDefinitionResult?,
@@ -253,25 +301,30 @@ fun EpubReaderAiOverlays(
     onDismissDictionaryUpsell: () -> Unit,
     onNavigateToPro: () -> Unit,
     isTtsSessionActive: Boolean,
-    onOpenExternalDictionary: (String) -> Unit
+    onOpenExternalDictionary: (String) -> Unit,
+    getAuthToken: suspend () -> String?,
+    credits: Int,
+    isProUser: Boolean
 ) {
-    if (showSummarizationPopup) {
-        SummarizationPopup(
-            title = stringResource(R.string.ai_chapter_summary),
-            result = summarizationResult,
-            isLoading = isSummarizationLoading,
-            onDismiss = onDismissSummarization,
-            isMainTtsActive = isTtsSessionActive
-        )
-    }
-
-    if (showRecapPopup) {
-        SummarizationPopup(
-            title = stringResource(R.string.ai_story_recap_beta),
-            result = recapResult,
-            isLoading = isRecapLoading,
-            onDismiss = onDismissRecap,
+    if (showAiHubSheet) {
+        AiHubBottomSheet(
+            bookTitle = bookTitle,
+            currentChapterIndex = currentChapterIndex,
+            chapterTitle = chapterTitle,
+            summaryCacheManager = summaryCacheManager,
+            summarizationResult = summarizationResult,
+            isSummarizationLoading = isSummarizationLoading,
+            onGenerateSummary = onGenerateSummary,
+            recapResult = recapResult,
+            isRecapLoading = isRecapLoading,
+            onGenerateRecap = onGenerateRecap,
+            onDismiss = onDismissAiHub,
+            onClearSummary = onClearSummary,
+            onClearRecap = onClearRecap,
             isMainTtsActive = isTtsSessionActive,
+            getAuthToken = getAuthToken,
+            credits = credits,
+            isProUser = isProUser
         )
     }
 
@@ -312,7 +365,8 @@ fun EpubReaderAiOverlays(
             isMainTtsActive = isTtsSessionActive,
             onOpenExternalDictionary = {
                 selectedTextForAi?.let { text -> onOpenExternalDictionary(text) }
-            }
+            },
+            getAuthToken = getAuthToken
         )
     }
 

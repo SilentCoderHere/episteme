@@ -37,6 +37,8 @@ import androidx.media3.common.util.UnstableApi
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
 import com.aryan.reader.BuildConfig
+import com.aryan.reader.epubreader.loadTtsPitch
+import com.aryan.reader.epubreader.loadTtsSpeechRate
 import com.aryan.reader.tts.TtsPlaybackManager.TtsState
 import com.google.common.util.concurrent.ListenableFuture
 import com.google.common.util.concurrent.MoreExecutors
@@ -65,15 +67,12 @@ private fun loadSpeaker(context: Context): String {
 }
 
 @OptIn(UnstableApi::class)
-@Suppress("KotlinConstantConditions")
 fun loadTtsMode(context: Context): TtsPlaybackManager.TtsMode {
     val prefs = context.getSharedPreferences("reader_prefs", Context.MODE_PRIVATE)
     val savedModeName = prefs.getString("tts_mode", TtsPlaybackManager.TtsMode.BASE.name)
         ?: TtsPlaybackManager.TtsMode.BASE.name
 
-    val isCloudAllowed = BuildConfig.DEBUG &&
-            BuildConfig.IS_PRO &&
-            BuildConfig.TTS_WORKER_URL.isNotBlank()
+    val isCloudAllowed = BuildConfig.TTS_WORKER_URL.isNotBlank()
 
     return if (isCloudAllowed) {
         try {
@@ -159,7 +158,8 @@ class TtsController(context: Context) : Player.Listener {
         chapterTitle: String?,
         coverImageUri: String?,
         ttsMode: TtsPlaybackManager.TtsMode,
-        playbackSource: String = "READER"
+        playbackSource: String = "READER",
+        authToken: String? = null
     ) {
         if (chunks.isEmpty()) {
             Timber.w("TtsController: start called with empty chunks!")
@@ -181,19 +181,12 @@ class TtsController(context: Context) : Player.Listener {
             putString(KEY_COVER_IMAGE_URI, coverImageUri)
             putString(KEY_TTS_MODE, ttsMode.name)
             putString(KEY_PLAYBACK_SOURCE, playbackSource)
+            putString(KEY_AUTH_TOKEN, authToken)
+            putFloat("playback_speed", loadTtsSpeechRate(context))
+            putFloat("playback_pitch", loadTtsPitch(context))
         }
+        Timber.tag("TTS_CLOUD_DIAG").d("TtsController sending START. Mode: $ttsMode, Chunks: ${chunks.size}, Token present: ${!authToken.isNullOrBlank()}")
         mediaController?.sendCustomCommand(START_TTS_COMMAND, args)
-
-        val metadataBuilder = androidx.media3.common.MediaMetadata.Builder()
-            .setArtist(bookTitle)
-            .setTitle(chapterTitle ?: "Reading Aloud")
-        coverImageUri?.let { metadataBuilder.setArtworkUri(it.toUri()) }
-
-        val metadata = MediaItem.Builder()
-            .setMediaId("tts_session")
-            .setMediaMetadata(metadataBuilder.build())
-            .build()
-        mediaController?.setMediaItem(metadata)
     }
 
     fun pause() {
@@ -224,6 +217,10 @@ class TtsController(context: Context) : Player.Listener {
     @Suppress("unused")
     fun changeTtsMode(mode: String) {
         Timber.d("UI sending CHANGE_TTS_MODE command.")
+        val prefs = context.getSharedPreferences("reader_prefs", Context.MODE_PRIVATE)
+        prefs.edit { putString("tts_mode", mode) }
+        _ttsState.value = _ttsState.value.copy(ttsMode = mode)
+
         val args = Bundle().apply {
             putString(KEY_TTS_MODE, mode)
         }
@@ -261,6 +258,7 @@ class TtsController(context: Context) : Player.Listener {
             val startOffset = mediaItemExtras?.getInt("startOffset", -1) ?: -1
             val currentWordSourceCfi = customState.getString("currentWordSourceCfi")
             val currentWordStartOffset = customState.getInt("currentWordStartOffset", -1)
+            val serviceMode = customState.getString("ttsMode", _ttsState.value.ttsMode)
 
             val currentState = _ttsState.value
             _ttsState.value = currentState.copy(
@@ -288,9 +286,20 @@ class TtsController(context: Context) : Player.Listener {
                 currentWordSourceCfi = if (isPlaybackActive) currentWordSourceCfi else null,
                 currentWordStartOffset = if (isPlaybackActive) currentWordStartOffset else -1,
                 sessionFinished = sessionFinished,
-                playbackSource = playbackSource
+                playbackSource = playbackSource,
+                ttsMode = serviceMode
             )
         }
+    }
+
+
+
+    fun setPlaybackParameters(speed: Float, pitch: Float) {
+        val args = Bundle().apply {
+            putFloat("speed", speed)
+            putFloat("pitch", pitch)
+        }
+        mediaController?.sendCustomCommand(SET_PLAYBACK_PARAMS_COMMAND, args)
     }
 
     fun release() {
