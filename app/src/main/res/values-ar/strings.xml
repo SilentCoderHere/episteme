@@ -174,11 +174,11 @@
     <string name="one_time_payment">دفع لمرة واحدة</string>
     <string name="lifetime_access">وصول مدى الحياة</string>
     <string name="early_access_sale">تخفيضات الوصول المبكر</string>
-    <string name="pro_includes">كل ما في الخطة المجانية، بالإضافة إلى:</string>
+    <string name="pro_includes">المميزات:</string>
     <string name="feature_cloud_sync">مزامنة سحابية عبر الأجهزة</string>
     <string name="feature_cloud_sync_desc">حافظ على مزامنة مكتبتك بالكامل، بما في ذلك ملفات الكتب وتقدم القراءة، عبر ما يصل إلى 4 أجهزة.</string>
     <string name="feature_summarize">التلخيص</string>
-    <string name="feature_summarize_desc">احصل على ملخصات سريعة للفصول أو الصفحات</string>
+    <string name="feature_summarize_desc">احصل على 10 ملخصات مجانية للفصول أو الصفحات يوميًا</string>
     <string name="feature_smart_dict">القاموس الذكي</string>
     <string name="feature_smart_dict_desc">ابحث عن العبارات وحتى الفقرات، وليس مجرد كلمات فردية</string>
     <string name="feature_priority">طلبات الميزات ذات الأولوية</string>
@@ -223,7 +223,7 @@
     <string name="dialog_clear_book_cache_desc">سيؤدي هذا إلى مسح كافة الصفحات التي تمت معالجتها في وضع تقسيم الصفحات. يساعد هذا في إصلاح مشكلات التنسيق، ولكنه سيتطلب إعادة معالجة الكتب في المرة القادمة التي تفتحها فيها.</string>
     <string name="action_confirm_clear">تأكيد ومسح</string>
     <string name="dialog_clear_reflow_cache">مسح التخزين المؤقت لإعادة التدفق</string>
-    <string name="dialog_clear_reflow_cache_desc">سيؤدي هذا إلى حذف جميع نسخ \"Text View\" التي تم إنشاؤها لملفات PDF الخاصة بك ومسح التخزين المؤقت للصور/HTML المرتبطة بها. ستظل ملفات PDF الأصلية كما هي دون أي تغيير.</string>
+    <string name="dialog_clear_reflow_cache_desc">سيؤدي هذا الإجراء إلى حذف جميع نسخ \"عرض النص\" التي تم إنشاؤها لملفات PDF الخاصة بك، ومسح التخزين المؤقت للصور وHTML المرتبطة بها. لن تتأثر ملفات PDF الأصلية بأي تغيير.</string>
     <string name="tooltip_back">رجوع</string>
     <string name="tooltip_dictionary">قاموس</string>
     <string name="tooltip_more_options">المزيد من الخيارات</string>
@@ -337,7 +337,7 @@
     <string name="error_import_file_failed">فشل استيراد الملف.</string>
     <string name="error_file_location_not_found">تعذر العثور على موقع الملف.</string>
     <string name="error_load_generated_text_view">فشل تحميل عرض النص المُنشأ.</string>
-    <string name="error_text_view_generation_failed">فشل إنشاء text view.</string>
+    <string name="error_text_view_generation_failed">فشل إنشاء عرض النص.</string>
     <string name="error_load_fb2">فشل تحميل ملف FB2: %1$s</string>
     <string name="error_load_file">فشل تحميل الملف: %1$s</string>
     <string name="error_load_mobi">فشل تحميل ملف MOBI: %1$s</string>
@@ -413,7 +413,7 @@
     <string name="tooltip_theme_desc">إعدادات السمة</string>
     <string name="content_desc_more_options">مزيد من الخيارات</string>
     <string name="menu_view_original_pdf">عرض ملف PDF الأصلي</string>
-    <string name="menu_delete_text_view">حذف text view</string>
+    <string name="menu_delete_text_view">حذف عرض النص</string>
     <string name="menu_reading_mode_vertical">وضع القراءة: عمودي</string>
     <string name="menu_reading_mode_paginated">وضع القراءة: صفحات</string>
     <string name="content_desc_enabled">مفعّل</string>
@@ -425,7 +425,7 @@
     <string name="menu_realistic_page_turns">تقليب صفحات واقعي</string>
     <string name="menu_keep_screen_on">إبقاء الشاشة قيد التشغيل</string>
     <string name="menu_visual_options">خيارات العرض</string>
-    <string name="menu_auto_scroll">تمرير تلقائي</string>
+    <string name="menu_auto_scroll">التمرير التلقائي</string>
     <string name="menu_tts_voice_settings">إعدادات صوت القراءة الآلية</string>
     <string name="menu_tts_settings_debug">إعدادات القراءة الآلية (تصحيح الأخطاء)</string>
     <string name="content_desc_navigate_slider">التنقل بشريط التمرير</string>
@@ -641,4 +641,5 @@
     <string name="label_font_color">لون الخط</string>
     <string name="label_highlight_color">مُظلِل</string>
     <string name="msg_page_unavailable">الصفحة غير متوفرة</string>
+    <string name="sign_in_to_purchase_credits">يرجى تسجيل الدخول إلى حساب Google الخاص بك لشراء رصيد.</string>
 </resources>
