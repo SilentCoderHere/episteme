@@ -174,11 +174,11 @@
     <string name="your_library_empty">Ihre Bibliothek ist leer</string>
     <string name="your_library_empty_desc">Wählen Sie eine Datei zum Lesen aus oder synchronisieren Sie einen lokalen Ordner, um automatisch Bücher zu importieren.</string>
     <string name="early_access_sale">Early-Access Angebot</string>
-    <string name="pro_includes">Alles aus Kostenlos, plus:</string>
+    <string name="pro_includes">Funktionen:</string>
     <string name="feature_cloud_sync">Cloud-Synchronisierung über Geräte</string>
     <string name="feature_cloud_sync_desc">Halten Sie Ihre gesamte Bibliothek, einschließlich Buchdateien und Lesefortschritt, synchronisiert über bis zu 4 Geräte.</string>
     <string name="feature_summarize">Zusammenfassen</string>
-    <string name="feature_summarize_desc">Erhalten Sie schnelle Zusammenfassungen von Kapiteln oder Seiten</string>
+    <string name="feature_summarize_desc">Erhalten Sie 10 kostenlose Zusammenfassungen von Kapiteln oder Seiten pro Tag</string>
     <string name="feature_smart_dict">Smartes Wörterbuch</string>
     <string name="feature_smart_dict_desc">Suche Phrasen und sogar Absätze, nicht nur einzelne Wörter</string>
     <string name="feature_priority">Priorisierte Feature-Anfragen</string>
