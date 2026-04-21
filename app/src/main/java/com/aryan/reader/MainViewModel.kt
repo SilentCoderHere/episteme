@@ -32,6 +32,7 @@ import android.net.Uri
 import android.os.Build
 import android.provider.DocumentsContract
 import android.provider.OpenableColumns
+import androidx.compose.ui.graphics.toArgb
 import androidx.core.content.edit
 import androidx.core.net.toUri
 import androidx.credentials.exceptions.GetCredentialCancellationException
@@ -113,6 +114,7 @@ import java.util.UUID
 import java.util.concurrent.CancellationException
 import java.util.concurrent.TimeUnit
 import androidx.core.graphics.createBitmap
+import io.legere.pdfiumandroid.PdfiumCore
 import kotlinx.coroutines.flow.distinctUntilChanged
 
 private const val KEY_RENDER_MODE = "render_mode"
@@ -135,6 +137,24 @@ data class NavigationEvent(
 enum class AddBooksSource(val displayName: String) {
     UNSHELVED("Unshelved"), ALL_BOOKS("All Books")
 }
+
+enum class AppThemeMode(val displayName: String) {
+    SYSTEM("System"),
+    LIGHT("Light"),
+    DARK("Dark")
+}
+
+enum class AppContrastOption(val displayName: String, val value: Double) {
+    STANDARD("Standard", 0.0),
+    MEDIUM("Medium", 0.5),
+    HIGH("High", 1.0)
+}
+
+data class CustomAppTheme(
+    val id: String,
+    val name: String,
+    val seedColor: androidx.compose.ui.graphics.Color
+)
 
 enum class FileType {
     PDF, EPUB, MOBI, MD, TXT, HTML, FB2, CBZ, CBR, CB7, DOCX, ODT, FODT
@@ -245,6 +265,11 @@ data class ReaderScreenState(
     val showExternalFileSavePromptFor: String? = null,
     val externalFileBehavior: String = "ASK",
     val useStrictFileFilter: Boolean = false,
+    val appThemeMode: AppThemeMode = AppThemeMode.SYSTEM,
+    val appContrastOption: AppContrastOption = AppContrastOption.STANDARD,
+    val appTextDimFactor: Float = 1.0f,
+    val appSeedColor: androidx.compose.ui.graphics.Color? = null,
+    val customAppThemes: List<CustomAppTheme> = emptyList()
 )
 
 open class MainViewModel(application: Application) : AndroidViewModel(application) {
@@ -355,7 +380,16 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
             } ?: emptyList(),
             activeTabBookId = prefs.getString(KEY_ACTIVE_TAB, null),
             externalFileBehavior = prefs.getString(KEY_EXTERNAL_FILE_BEHAVIOR, "ASK") ?: "ASK",
-            useStrictFileFilter = prefs.getBoolean(KEY_USE_STRICT_FILE_FILTER, false)
+            useStrictFileFilter = prefs.getBoolean(KEY_USE_STRICT_FILE_FILTER, false),
+            appThemeMode = try {
+                AppThemeMode.valueOf(prefs.getString(KEY_APP_THEME_MODE, AppThemeMode.SYSTEM.name) ?: AppThemeMode.SYSTEM.name)
+            } catch (_: Exception) { AppThemeMode.SYSTEM },
+            appContrastOption = try {
+                AppContrastOption.valueOf(prefs.getString(KEY_APP_CONTRAST_OPTION, AppContrastOption.STANDARD.name) ?: AppContrastOption.STANDARD.name)
+            } catch (_: Exception) { AppContrastOption.STANDARD },
+            appTextDimFactor = prefs.getFloat(KEY_APP_TEXT_DIM_FACTOR, 1.0f),
+            appSeedColor = if (prefs.contains(KEY_APP_SEED_COLOR)) androidx.compose.ui.graphics.Color(prefs.getInt(KEY_APP_SEED_COLOR, 0)) else null,
+            customAppThemes = loadCustomAppThemes(prefs)
         )
     )
 
@@ -2631,6 +2665,28 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
             title = displayName
 
             if (type == FileType.PDF) {
+                try {
+                    val pdfiumCore = PdfiumCore(appContext)
+                    appContext.contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
+                        val pdfDocument = pdfiumCore.newDocument(pfd)
+                        val meta = pdfiumCore.getDocumentMeta(pdfDocument)
+
+                        val extractedTitle = meta.title
+                        if (!extractedTitle.isNullOrBlank()) {
+                            title = extractedTitle
+                        }
+
+                        val extractedAuthor = meta.author
+                        if (!extractedAuthor.isNullOrBlank()) {
+                            author = extractedAuthor
+                        }
+
+                        pdfiumCore.closeDocument(pdfDocument)
+                    }
+                } catch (e: Exception) {
+                    Timber.e(e, "Failed to extract PDF title using PdfiumCore")
+                }
+
                 val pdfCoverGenerator = PdfCoverGenerator(appContext)
                 val coverBitmap = pdfCoverGenerator.generateCover(uri)
                 if (coverBitmap != null) {
@@ -4491,6 +4547,82 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
         _internalState.update { it.copy(useStrictFileFilter = enabled) }
     }
 
+    private fun loadCustomAppThemes(prefs: SharedPreferences): List<CustomAppTheme> {
+        val jsonString = prefs.getString(KEY_CUSTOM_APP_THEMES, "[]") ?: "[]"
+        val themes = mutableListOf<CustomAppTheme>()
+        try {
+            val jsonArray = JSONArray(jsonString)
+            for (i in 0 until jsonArray.length()) {
+                val obj = jsonArray.getJSONObject(i)
+                themes.add(
+                    CustomAppTheme(
+                        id = obj.getString("id"),
+                        name = obj.getString("name"),
+                        seedColor = androidx.compose.ui.graphics.Color(obj.getInt("seedColor"))
+                    )
+                )
+            }
+        } catch (e: Exception) {
+            Timber.e(e, "Failed to parse custom app themes")
+        }
+        return themes
+    }
+
+    fun setAppThemeMode(mode: AppThemeMode) {
+        _internalState.update { it.copy(appThemeMode = mode) }
+        prefs.edit { putString(KEY_APP_THEME_MODE, mode.name) }
+    }
+
+    fun setAppContrastOption(option: AppContrastOption) {
+        _internalState.update { it.copy(appContrastOption = option) }
+        prefs.edit { putString(KEY_APP_CONTRAST_OPTION, option.name) }
+    }
+
+    fun setAppTextDimFactor(factor: Float) {
+        _internalState.update { it.copy(appTextDimFactor = factor) }
+        prefs.edit { putFloat(KEY_APP_TEXT_DIM_FACTOR, factor) }
+    }
+
+    fun setAppSeedColor(color: androidx.compose.ui.graphics.Color?) {
+        _internalState.update { it.copy(appSeedColor = color) }
+        prefs.edit {
+            if (color == null) {
+                remove(KEY_APP_SEED_COLOR)
+            } else {
+                putInt(KEY_APP_SEED_COLOR, (color).toArgb())
+            }
+        }
+    }
+
+    fun addCustomAppTheme(theme: CustomAppTheme) {
+        val current = _internalState.value.customAppThemes.filter { it.id != theme.id } + theme
+        _internalState.update { it.copy(customAppThemes = current) }
+        saveCustomAppThemes(current)
+        setAppSeedColor(theme.seedColor)
+    }
+
+    fun deleteCustomAppTheme(themeId: String) {
+        val current = _internalState.value.customAppThemes.filter { it.id != themeId }
+        _internalState.update { it.copy(customAppThemes = current) }
+        saveCustomAppThemes(current)
+        if (_internalState.value.appSeedColor != null && !current.any { it.seedColor == _internalState.value.appSeedColor }) {
+            setAppSeedColor(null)
+        }
+    }
+
+    private fun saveCustomAppThemes(themes: List<CustomAppTheme>) {
+        val jsonArray = JSONArray()
+        themes.forEach { theme ->
+            val obj = JSONObject().apply {
+                put("id", theme.id)
+                put("name", theme.name)
+                put("seedColor", (theme.seedColor).toArgb())
+            }
+            jsonArray.put(obj)
+        }
+        prefs.edit { putString(KEY_CUSTOM_APP_THEMES, jsonArray.toString()) }
+    }
+
     suspend fun getAuthToken(): String? {
         return authRepository.getIdToken()
     }
@@ -4518,6 +4650,11 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
         private const val KEY_ACTIVE_TAB = "active_tab_book_id"
         private const val KEY_EXTERNAL_FILE_BEHAVIOR = "external_file_behavior"
         private const val KEY_USE_STRICT_FILE_FILTER = "use_strict_file_filter"
+        private const val KEY_APP_THEME_MODE = "app_theme_mode"
+        private const val KEY_APP_CONTRAST_OPTION = "app_contrast_option"
+        private const val KEY_APP_SEED_COLOR = "app_seed_color"
+        private const val KEY_APP_TEXT_DIM_FACTOR = "app_text_dim_factor"
+        private const val KEY_CUSTOM_APP_THEMES = "custom_app_themes"
 
         val SUPPORTED_MIME_TYPES = arrayOf(
             "application/pdf", "application/epub+zip", "application/x-mobipocket-ebook",

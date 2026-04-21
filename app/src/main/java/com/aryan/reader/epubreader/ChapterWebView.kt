@@ -126,20 +126,21 @@ class AutoScrollJsBridge(
     }
 }
 
-@Suppress("unused") // function used by JavaScript
+@Suppress("unused")
 class TtsJsBridge(
     private val scope: CoroutineScope,
     private val ttsStructuredTextHandler: suspend (String) -> Unit
 ) {
     @JavascriptInterface
     fun onStructuredTextExtracted(json: String) {
-        Timber.tag("TTS_LIST_DIAG").d("Bridge received JSON: $json")
+        Timber.tag("TTS_CHAPTER_CHANGE_DIAG").d("JS Bridge received JSON. Length: ${json.length}")
         if (json.isNotBlank() && json != "[]") {
-            scope.launch {
+            scope.launch(kotlinx.coroutines.Dispatchers.Default) {
                 ttsStructuredTextHandler(json)
             }
         } else {
-            scope.launch {
+            Timber.tag("TTS_CHAPTER_CHANGE_DIAG").w("JS Bridge received empty or blank JSON. This may trigger a chapter skip.")
+            scope.launch(kotlinx.coroutines.Dispatchers.Default) {
                 ttsStructuredTextHandler("[]")
             }
         }
@@ -301,6 +302,17 @@ class AiJsBridge(
     }
 }
 
+@Suppress("unused")
+class FootnoteJsBridge(
+    private val onFootnoteRequestCallback: (String) -> Unit
+) {
+    @JavascriptInterface
+    fun onFootnoteRequested(htmlContent: String) {
+        Timber.tag("FootnoteDiag").d("Kotlin Bridge received footnote content. Length: ${htmlContent.length}")
+        onFootnoteRequestCallback(htmlContent)
+    }
+}
+
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
 fun ChapterWebView(
@@ -350,6 +362,7 @@ fun ChapterWebView(
     onSearch: (String) -> Unit,
     onNoteRequested: (String?) -> Unit,
     onContentReadyForSummarization: suspend (String) -> Unit,
+    onFootnoteRequested: (String) -> Unit,
     currentFontFamily: ReaderFont,
     customFontPath: String? = null,
     currentTextAlign: ReaderTextAlign,
@@ -537,6 +550,15 @@ fun ChapterWebView(
                             consoleMessage?.let {
                                 val message = it.message()
                                 when {
+                                    message.startsWith("FootnoteDiag:") -> {
+                                        Timber.tag("FootnoteDiag")
+                                            .d("JS -> ${message.substringAfter("FootnoteDiag: ")}")
+                                    }
+
+                                    message.startsWith("TTS_CHAPTER_CHANGE_DIAG:") -> {
+                                        Timber.tag("TTS_CHAPTER_CHANGE_DIAG").d("JS -> ${message.substringAfter("TTS_CHAPTER_CHANGE_DIAG: ")}")
+                                    }
+
                                     message.startsWith("BookmarkDiagnosis") -> {
                                         Timber.tag("BookmarkDiagnosis")
                                             .d("JS -> ${message.substringAfter("BookmarkDiagnosis: ")}")
@@ -623,6 +645,12 @@ fun ChapterWebView(
                     addJavascriptInterface(TtsJsBridge(ttsScope, onTtsTextReady), "TtsBridge")
                     addJavascriptInterface(
                         AiJsBridge(ttsScope, onContentReadyForSummarization), "AiBridge"
+                    )
+
+                    addJavascriptInterface(
+                        FootnoteJsBridge { html ->
+                            this.post { onFootnoteRequested(html) }
+                        }, "FootnoteBridge"
                     )
 
                     webViewClient = object : WebViewClient() {
