@@ -28,6 +28,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
 import android.database.Cursor
+import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Build
 import android.provider.DocumentsContract
@@ -115,7 +116,9 @@ import java.util.concurrent.CancellationException
 import java.util.concurrent.TimeUnit
 import androidx.core.graphics.createBitmap
 import io.legere.pdfiumandroid.PdfiumCore
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.flow.distinctUntilChanged
+import java.util.concurrent.Executors.newSingleThreadExecutor
 
 private const val KEY_RENDER_MODE = "render_mode"
 private const val KEY_FOLDER_SYNC_ENABLED = "folder_sync_enabled"
@@ -276,15 +279,21 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
     private val appContext: Context = application.applicationContext
     private val authRepository = AuthRepository(appContext)
     private val recentFilesRepository = RecentFilesRepository(appContext)
-    private val pdfTextRepository = PdfTextRepository(appContext)
 
-    private val bookCacheDao = BookCacheDatabase.getDatabase(application).bookCacheDao()
-    private val epubParser = EpubParser(appContext)
-    private val mobiParser = MobiParser(appContext)
-    private val fb2Parser = com.aryan.reader.epub.Fb2Parser(appContext)
-    private val odtParser = com.aryan.reader.epub.OdtParser(appContext)
-    private val singleFileImporter = SingleFileImporter(appContext)
-    private val bookImporter = BookImporter(appContext)
+    private val pdfTextRepository by lazy { PdfTextRepository(appContext) }
+    private val bookCacheDao by lazy { BookCacheDatabase.getDatabase(application).bookCacheDao() }
+    private val epubParser by lazy { EpubParser(appContext) }
+    private val mobiParser by lazy { MobiParser(appContext) }
+    private val fb2Parser by lazy { com.aryan.reader.epub.Fb2Parser(appContext) }
+    private val odtParser by lazy { com.aryan.reader.epub.OdtParser(appContext) }
+    private val singleFileImporter by lazy { SingleFileImporter(appContext) }
+    private val bookImporter by lazy { BookImporter(appContext) }
+    private val pageLayoutRepository by lazy { PageLayoutRepository(appContext) }
+    private val pdfRichTextRepository by lazy { com.aryan.reader.pdf.PdfRichTextRepository(appContext) }
+    private val pdfTextBoxRepository by lazy { PdfTextBoxRepository(appContext) }
+    private val pdfHighlightRepository by lazy { PdfHighlightRepository(appContext) }
+    private val pdfAnnotationRepository by lazy { PdfAnnotationRepository(appContext) }
+
     private val prefs: SharedPreferences =
         application.getSharedPreferences("reader_user_prefs", Context.MODE_PRIVATE)
     private val firestoreRepository = FirestoreRepository()
@@ -301,15 +310,32 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
     private val feedbackRepository = FeedbackRepository(appContext)
     private var feedbackListener: Any? = null
     private val importMutex = Mutex()
-    private val pageLayoutRepository = PageLayoutRepository(appContext)
-    private val pdfRichTextRepository = com.aryan.reader.pdf.PdfRichTextRepository(appContext)
-    private val pdfTextBoxRepository = PdfTextBoxRepository(appContext)
-    private val pdfHighlightRepository = PdfHighlightRepository(appContext)
     private val _navigationEvent = Channel<NavigationEvent>(Channel.BUFFERED)
     @Suppress("unused")
     val navigationEvent = _navigationEvent.receiveAsFlow()
     private var pendingSwitchDeferred: CompletableDeferred<Boolean>? = null
     private var externalOpenedBookId: String? = null
+
+    private var panelDetector: com.aryan.reader.ml.IPanelDetector? = null
+
+    private val mlDispatcher = newSingleThreadExecutor().asCoroutineDispatcher()
+
+    private fun getOrInitDetector(context: Context): com.aryan.reader.ml.IPanelDetector? {
+        if (panelDetector == null && BuildConfig.DEBUG) {
+            val modelFile = File(context.getExternalFilesDir(null), "best_float16.tflite")
+            if (modelFile.exists()) {
+                try {
+                    val clazz = Class.forName("com.aryan.reader.ml.ComicPanelDetector")
+                    panelDetector = clazz.getConstructor(File::class.java).newInstance(modelFile) as com.aryan.reader.ml.IPanelDetector
+                } catch (e: Exception) {
+                    Timber.e(e, "Failed to instantiate ComicPanelDetector via reflection")
+                }
+            } else {
+                Timber.e("Model file best_float16.tflite not found in external files dir")
+            }
+        }
+        return panelDetector
+    }
 
     data class PageModificationResult(
         val layout: List<VirtualPage>,
@@ -502,7 +528,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
     }.stateIn(
         scope = viewModelScope,
         started = SharingStarted.WhileSubscribed(5000),
-        initialValue = ReaderScreenState()
+        initialValue = _internalState.value
     )
 
     fun setTabsEnabled(enabled: Boolean) {
@@ -796,7 +822,9 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
 
     init {
         Timber.d("ViewModel instance created.")
-        PDFBoxResourceLoader.init(getApplication())
+        viewModelScope.launch(Dispatchers.IO) {
+            PDFBoxResourceLoader.init(getApplication())
+        }
         val currentOpenCount = prefs.getInt(KEY_APP_OPEN_COUNT, 0)
         prefs.edit { putInt(KEY_APP_OPEN_COUNT, currentOpenCount + 1) }
 
@@ -1180,8 +1208,6 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
             }
         }
     }
-
-    private val pdfAnnotationRepository = PdfAnnotationRepository(appContext)
 
     private fun getFastFileId(context: Context, uri: Uri): String {
         var result = uri.toString()
@@ -4410,6 +4436,8 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
         super.onCleared()
         prefs.unregisterOnSharedPreferenceChangeListener(prefsListener)
         firestoreRepository.removeListener(feedbackListener)
+        panelDetector?.close()
+        panelDetector = null
         Timber.d("ViewModel instance cleared (onCleared).")
     }
 
@@ -4625,6 +4653,104 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
 
     suspend fun getAuthToken(): String? {
         return authRepository.getIdToken()
+    }
+
+    fun testPanelDetection(context: Context) {
+        viewModelScope.launch(mlDispatcher) {
+            try {
+                val modelFile = File(context.getExternalFilesDir(null), "best_float16.tflite")
+                if (!modelFile.exists()) {
+                    withContext(Dispatchers.Main) { showBanner("Model not found", isError = true) }
+                    return@launch
+                }
+
+                val cbzItem = uiState.value.contextualActionItems.firstOrNull { it.type == FileType.CBZ }
+                    ?: uiState.value.allRecentFiles.firstOrNull { it.type == FileType.CBZ }
+
+                if (cbzItem == null) {
+                    withContext(Dispatchers.Main) { showBanner("No CBZ found in Library.", isError = true) }
+                    return@launch
+                }
+
+                val uri = cbzItem.getUri() ?: return@launch
+                Timber.d("BATCH TEST START: ${cbzItem.displayName}")
+
+                var cacheFile: File? = null
+                try {
+                    val detector = getOrInitDetector(context) ?: run {
+                        withContext(Dispatchers.Main) { showBanner("Model could not be loaded", isError = true) }
+                        return@launch
+                    }
+                    cacheFile = File(context.cacheDir, "temp_test_batch.cbz")
+                    context.contentResolver.openInputStream(uri)?.use { input ->
+                        cacheFile.outputStream().use { output -> input.copyTo(output) }
+                    }
+
+                    // 1. Initialize Model Once
+                    val initStartTime = System.currentTimeMillis()
+                    val initDuration = System.currentTimeMillis() - initStartTime
+                    Timber.d(">>> [BATCH] Model Initialization: ${initDuration}ms")
+
+                    val archiveDoc = com.aryan.reader.pdf.ArchiveDocumentWrapper(cacheFile)
+                    val totalPages = archiveDoc.getPageCount()
+
+                    val startIndex = 3
+                    val numPagesToTest = 10
+                    val endIndex = minOf(startIndex + numPagesToTest - 1, totalPages - 1)
+
+                    val resultsLog = StringBuilder()
+                    resultsLog.append("Batch Results:\n")
+
+                    // 2. Loop through pages
+                    for (i in startIndex..endIndex) {
+                        val page = archiveDoc.openPage(i)
+                        if (page != null) {
+                            val w = page.getPageWidthPoint()
+                            val h = page.getPageHeightPoint()
+                            if (w > 0 && h > 0) {
+                                val bitmap = androidx.core.graphics.createBitmap(w, h)
+                                page.renderPageBitmap(bitmap, 0, 0, w, h, false)
+
+                                // Measure precise inference time
+                                val pageStartTime = System.currentTimeMillis()
+                                val panels = detector.detectPanels(bitmap)
+                                val pageDuration = System.currentTimeMillis() - pageStartTime
+
+                                val logLine = "Page $i: ${pageDuration}ms (Found ${panels.size} panels)"
+                                Timber.d(">>>[BATCH] $logLine")
+                                resultsLog.append("$logLine\n")
+                                bitmap.recycle()
+                                delay(20)
+                            }
+                            page.close()
+                        }
+                    }
+                    archiveDoc.close()
+
+                    withContext(Dispatchers.Main) {
+                        Timber.i(resultsLog.toString())
+                        showBanner("Batch test complete! Check logs for page-by-page timings.")
+                    }
+
+                } finally {
+                    cacheFile?.delete()
+                }
+            } catch (e: Exception) {
+                Timber.e(e, "Batch test failed")
+            }
+        }
+    }
+
+    suspend fun detectComicPanels(bitmap: Bitmap, context: Context): List<android.graphics.RectF> {
+        return withContext(mlDispatcher) {
+            try {
+                val detector = getOrInitDetector(context)
+                detector?.detectPanels(bitmap) ?: emptyList()
+            } catch (e: Exception) {
+                Timber.e(e, "Error during panel detection")
+                emptyList()
+            }
+        }
     }
 
     companion object {

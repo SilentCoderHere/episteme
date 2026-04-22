@@ -30,8 +30,10 @@ android {
         applicationId = "com.aryan.reader"
         minSdk = 26
         targetSdk = 35
-        versionCode = 44
-        versionName = "1.0.43"
+        versionCode = 45
+        versionName = "1.0.45"
+
+        resourceConfigurations += setOf("en", "ar", "de", "tr")
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         externalNativeBuild {
@@ -227,6 +229,13 @@ dependencies {
     implementation("org.zwobble.mammoth:mammoth:1.4.2")
 
     implementation("com.materialkolor:material-kolor:5.0.0-alpha07")
+
+    debugImplementation("org.tensorflow:tensorflow-lite:2.17.0")
+    debugImplementation("org.tensorflow:tensorflow-lite-support:0.5.0")
+    debugImplementation("org.tensorflow:tensorflow-lite-gpu:2.17.0")
+    debugImplementation("org.tensorflow:tensorflow-lite-gpu-api:2.17.0")
+
+    implementation("androidx.core:core-splashscreen:1.2.0")
 }
 
 spotless {

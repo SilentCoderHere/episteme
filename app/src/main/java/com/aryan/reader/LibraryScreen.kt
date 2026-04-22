@@ -22,28 +22,17 @@
 
 package com.aryan.reader
 
+import android.annotation.SuppressLint
 import android.net.Uri
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
-import androidx.compose.material.icons.filled.PushPin
-import androidx.compose.material.icons.filled.FilterList
-import androidx.compose.material3.ModalBottomSheet
-import androidx.compose.material3.rememberModalBottomSheetState
-import com.aryan.reader.opds.OpdsViewModel
-import com.aryan.reader.opds.OpdsEntry
-import com.aryan.reader.opds.OpdsCatalog
-import org.jsoup.Jsoup
-import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.FilterChip
-import androidx.compose.material3.AssistChip
 import androidx.compose.foundation.horizontalScroll
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -52,6 +41,8 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -67,6 +58,9 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.PagerState
 import androidx.compose.foundation.pager.rememberPagerState
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -74,24 +68,28 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.FilterList
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.FolderSpecial
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.AssistChip
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
@@ -100,6 +98,7 @@ import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextFieldDefaults
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -133,9 +132,13 @@ import coil.compose.AsyncImage
 import coil.request.ImageRequest
 import com.aryan.reader.data.RecentFileItem
 import com.aryan.reader.opds.OpdsAcquisition
+import com.aryan.reader.opds.OpdsCatalog
+import com.aryan.reader.opds.OpdsEntry
+import com.aryan.reader.opds.OpdsViewModel
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import org.jsoup.Jsoup
 import timber.log.Timber
 import java.io.File
 import java.text.SimpleDateFormat
@@ -147,6 +150,7 @@ private fun getBookCountString(count: Int): String {
     return pluralStringResource(id = R.plurals.book_count, count, count)
 }
 
+@SuppressLint("LocalContextGetResourceValueCall")
 @Composable
 fun LibraryScreen(
     viewModel: MainViewModel,
@@ -605,6 +609,7 @@ fun LibraryScreenContent(
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
+                                .statusBarsPadding()
                                 .height(64.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
@@ -918,7 +923,7 @@ private fun ShelfDetailScreen(
     var showMoreMenu by remember { mutableStateOf(false) }
 
     Scaffold(
-        modifier = Modifier.statusBarsPadding(),
+        modifier = Modifier,
         topBar = {
             if (isContextualModeActive) {
                 ContextualTopAppBar(
@@ -1071,7 +1076,7 @@ private fun AddBooksModeScreen(
     var showSourceMenu by remember { mutableStateOf(false) }
 
     Scaffold(
-        modifier = Modifier.statusBarsPadding(),
+        modifier = Modifier,
         topBar = {
             CustomTopAppBar(
                 title = { Text(stringResource(R.string.add_to_shelf, shelfName)) },
@@ -1256,13 +1261,21 @@ private fun ShelfListItem(
     onItemClick: () -> Unit,
     onItemLongClick: () -> Unit,
 ) {
-    Surface(
-        shape = MaterialTheme.shapes.medium,
-        tonalElevation = if (isSelected) 8.dp else 2.dp,
-        shadowElevation = 4.dp,
-        border = if (isSelected) BorderStroke(2.dp, MaterialTheme.colorScheme.primary) else null,
+    androidx.compose.material3.ElevatedCard(
+        shape = MaterialTheme.shapes.large,
+        colors = androidx.compose.material3.CardDefaults.elevatedCardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceContainerLow
+        ),
+        elevation = androidx.compose.material3.CardDefaults.elevatedCardElevation(
+            defaultElevation = if (isSelected) 8.dp else 2.dp
+        ),
         modifier = Modifier
             .fillMaxWidth()
+            .then(
+                if (isSelected) Modifier.border(2.dp, MaterialTheme.colorScheme.primary, MaterialTheme.shapes.large)
+                else Modifier
+            )
+            .clip(MaterialTheme.shapes.large)
             .combinedClickable(
                 onClick = onItemClick,
                 onLongClick = {
@@ -1318,123 +1331,170 @@ private fun LibraryListItem(
         item.coverImagePath?.let { File(it) } ?: placeholder
     }
 
-    Surface(
-        shape = MaterialTheme.shapes.medium,
-        tonalElevation = if (isSelected) 8.dp else 2.dp,
-        shadowElevation = 4.dp,
-        border = if (isSelected) BorderStroke(2.dp, MaterialTheme.colorScheme.primary) else null,
+    androidx.compose.material3.ElevatedCard(
+        shape = MaterialTheme.shapes.large,
+        colors = androidx.compose.material3.CardDefaults.elevatedCardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceContainerLow
+        ),
+        elevation = androidx.compose.material3.CardDefaults.elevatedCardElevation(
+            defaultElevation = if (isSelected) 6.dp else 2.dp
+        ),
         modifier = Modifier
             .fillMaxWidth()
             .graphicsLayer { alpha = if (item.isAvailable) 1.0f else 0.8f }
+            .then(
+                if (isSelected) Modifier.border(2.dp, MaterialTheme.colorScheme.primary, MaterialTheme.shapes.large)
+                else Modifier
+            )
+            .clip(MaterialTheme.shapes.large)
             .combinedClickable(
                 onClick = onItemClick,
                 onLongClick = onItemLongClick
             )
     ) {
         Row(
-            modifier = Modifier.padding(12.dp),
-            verticalAlignment = Alignment.Top
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 14.dp, vertical = 12.dp)
+                .height(132.dp),
+            verticalAlignment = Alignment.Top,
+            horizontalArrangement = Arrangement.spacedBy(16.dp)
         ) {
-            AsyncImage(
-                model = ImageRequest.Builder(context)
-                    .data(imageModel)
-                    .error(placeholder)
-                    .fallback(placeholder)
-                    .crossfade(true)
-                    .build(),
-                contentDescription = item.displayName,
-                contentScale = ContentScale.Crop,
+            Box(
                 modifier = Modifier
-                    .size(width = 70.dp, height = 100.dp)
-                    .clip(MaterialTheme.shapes.small)
-            )
+                    .fillMaxHeight()
+                    .aspectRatio(0.7f)
+                    .clip(MaterialTheme.shapes.medium)
+                    .border(0.5.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f), MaterialTheme.shapes.medium)
+            ) {
+                AsyncImage(
+                    model = ImageRequest.Builder(context)
+                        .data(imageModel)
+                        .error(placeholder)
+                        .fallback(placeholder)
+                        .crossfade(true)
+                        .build(),
+                    contentDescription = item.displayName,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize()
+                )
 
-            Spacer(modifier = Modifier.width(16.dp))
-
-            Column(modifier = Modifier.weight(1f)) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    if (item.sourceFolderUri != null) {
-                        Icon(
-                            imageVector = Icons.Default.Folder,
-                            contentDescription = null,
-                            modifier = Modifier.size(16.dp),
-                            tint = MaterialTheme.colorScheme.secondary
-                        )
-                        Spacer(modifier = Modifier.width(4.dp))
+                if (isSelected) {
+                    Box(
+                        modifier = Modifier.matchParentSize().background(MaterialTheme.colorScheme.primary.copy(alpha = 0.2f)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(Icons.Default.Check, contentDescription = "Selected", modifier = Modifier.size(36.dp).background(MaterialTheme.colorScheme.primary, CircleShape).padding(6.dp), tint = MaterialTheme.colorScheme.onPrimary)
                     }
-                    val isOpdsStream = item.uriString?.startsWith("opds-pse://") == true
-                    if (isOpdsStream) {
-                        Icon(
-                            imageVector = Icons.Default.Cloud,
-                            contentDescription = "OPDS Stream",
-                            modifier = Modifier.size(16.dp),
-                            tint = MaterialTheme.colorScheme.tertiary
+                }
+            }
+
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxHeight()
+            ) {
+                Row(
+                    verticalAlignment = Alignment.Top,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = item.cardTitle(),
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.SemiBold,
+                            maxLines = 2,
+                            minLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                            lineHeight = 20.sp
                         )
-                        Spacer(modifier = Modifier.width(4.dp))
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = item.cardAuthor(),
+                            style = MaterialTheme.typography.bodySmall,
+                            maxLines = 1,
+                            minLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
                     }
 
-                    if (isPinned) {
-                        Icon(
-                            imageVector = Icons.Default.PushPin,
-                            contentDescription = "Pinned",
-                            modifier = Modifier.size(16.dp),
-                            tint = MaterialTheme.colorScheme.primary
+                    if (item.sourceFolderUri != null || item.isOpdsStream() || isPinned) {
+                        FileStatusBadges(
+                            item = item,
+                            isPinned = isPinned
                         )
-                        Spacer(modifier = Modifier.width(4.dp))
                     }
+                }
 
-                    Text(
-                        text = item.customName ?: item.title ?: item.displayName,
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.Bold,
-                        maxLines = 2,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.weight(1f, fill = false)
-                    )
-                    if (!item.isAvailable) {
-                        Spacer(modifier = Modifier.width(8.dp))
-                        if (isDownloading) {
-                            CircularProgressIndicator(modifier = Modifier.size(18.dp))
-                        } else {
-                            Icon(
-                                imageVector = Icons.Filled.Info,
-                                contentDescription = "Not available locally",
-                                modifier = Modifier.size(18.dp),
-                                tint = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
+                Spacer(modifier = Modifier.height(10.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    FileTypeBadge(type = item.type, overlay = false)
+
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(28.dp),
+                        contentAlignment = Alignment.CenterStart
+                    ) {
+                        if (!item.isAvailable) {
+                            Surface(
+                                shape = RoundedCornerShape(50),
+                                color = if (isDownloading) {
+                                    MaterialTheme.colorScheme.primaryContainer
+                                } else {
+                                    MaterialTheme.colorScheme.errorContainer
+                                },
+                                contentColor = if (isDownloading) {
+                                    MaterialTheme.colorScheme.onPrimaryContainer
+                                } else {
+                                    MaterialTheme.colorScheme.onErrorContainer
+                                }
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    if (isDownloading) {
+                                        CircularProgressIndicator(
+                                            modifier = Modifier.size(14.dp),
+                                            strokeWidth = 2.dp
+                                        )
+                                    } else {
+                                        Icon(
+                                            Icons.Filled.Info,
+                                            contentDescription = stringResource(R.string.not_available_locally),
+                                            modifier = Modifier.size(14.dp)
+                                        )
+                                    }
+                                    Text(
+                                        text = if (isDownloading) {
+                                            stringResource(R.string.status_downloading)
+                                        } else {
+                                            stringResource(R.string.not_available_locally)
+                                        },
+                                        style = MaterialTheme.typography.labelSmall,
+                                        fontWeight = FontWeight.Medium
+                                    )
+                                }
+                            }
                         }
                     }
                 }
-                item.author?.takeIf { it.isNotBlank() }?.let {
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        text = it,
-                        style = MaterialTheme.typography.bodyMedium,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
 
-                Spacer(modifier = Modifier.height(8.dp))
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    FileTypeBadge(type = item.type, overlay = false)
+                Spacer(modifier = Modifier.weight(1f))
 
-                    item.progressPercentage?.let {
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            text = "•",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            text = "${it.toInt()}% complete",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.primary
-                        )
-                    }
-                }
+                ReadingProgressSection(
+                    progressPercentage = item.progressPercentage,
+                    compact = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
             }
         }
     }

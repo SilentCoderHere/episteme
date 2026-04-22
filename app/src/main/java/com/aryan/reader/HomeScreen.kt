@@ -22,13 +22,14 @@
 
 package com.aryan.reader
 
+import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.BorderStroke
+import androidx.appcompat.app.AppCompatDelegate
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -41,6 +42,7 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -57,20 +59,18 @@ import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.Cloud
-import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.FolderSpecial
 import androidx.compose.material.icons.filled.FormatListNumbered
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.PhoneAndroid
-import androidx.compose.material.icons.filled.PushPin
 import androidx.compose.material.icons.filled.VerifiedUser
 import androidx.compose.material.icons.outlined.AccountCircle
 import androidx.compose.material3.AlertDialog
@@ -132,6 +132,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.os.LocaleListCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.navigation.NavHostController
 import coil.compose.AsyncImage
@@ -183,6 +184,7 @@ fun HomeScreen(
         var showStrictFilterDialog by remember { mutableStateOf(false) }
         var showClearBookCacheDialog by remember { mutableStateOf(false) }
         var showClearReflowCacheDialog by remember { mutableStateOf(false) }
+        var showLanguageDialog by remember { mutableStateOf(false) }
 
         val feedbackResult =
             navController.currentBackStackEntry?.savedStateHandle?.getLiveData<String>("banner_message")
@@ -335,7 +337,9 @@ fun HomeScreen(
                                         showStrictFilterDialog = true
                                     }
                                 },
-                                onAppThemeClick = { showAppThemePanel = true }
+                                onAppThemeClick = { showAppThemePanel = true },
+                                onTestPanelDetectionClick = { viewModel.testPanelDetection(context) },
+                                onLanguageClick = { showLanguageDialog = true }
                             )
                         } else {
                             ContextualTopAppBar(
@@ -507,6 +511,10 @@ fun HomeScreen(
                             },
                             onDismiss = { showStrictFilterDialog = false }
                         )
+                    }
+
+                    if (showLanguageDialog) {
+                        LanguageSelectionDialog(onDismiss = { showLanguageDialog = false })
                     }
 
                     if (showAppThemePanel) {
@@ -749,6 +757,8 @@ fun RecentFileCard(
     isDownloading: Boolean,
 ) {
     val context = LocalContext.current
+    val progressPercent = item.progressPercentage?.takeIf { it > 0f }?.coerceIn(0f, 100f)?.toInt()
+    val authorText = item.author?.takeIf { it.isNotBlank() && !it.equals("Unknown", ignoreCase = true) } ?: " "
     val placeholder = when (item.type) {
         FileType.PDF -> R.drawable.pdf_placeholder
         FileType.EPUB, FileType.MOBI, FileType.FB2, FileType.MD, FileType.TXT, FileType.HTML, FileType.CBZ, FileType.CBR, FileType.CB7, FileType.DOCX, FileType.ODT, FileType.FODT -> R.drawable.epub_placeholder
@@ -757,88 +767,70 @@ fun RecentFileCard(
         item.coverImagePath?.let { File(it) } ?: placeholder
     }
 
-    Surface(
-        modifier = modifier.graphicsLayer { alpha = if (item.isAvailable) 1.0f else 0.8f },
-        shape = MaterialTheme.shapes.medium,
-        tonalElevation = if (isSelected) 8.dp else 2.dp,
-        shadowElevation = 4.dp,
-        border = if (isSelected) BorderStroke(2.dp, MaterialTheme.colorScheme.primary) else null
-    ) {
-        Column(
-            modifier = Modifier.combinedClickable(
-                onClick = onClick, onLongClick = onLongClick
+    androidx.compose.material3.ElevatedCard(
+        modifier = modifier
+            .graphicsLayer { alpha = if (item.isAvailable) 1.0f else 0.8f }
+            .then(
+                if (isSelected) Modifier.border(2.dp, MaterialTheme.colorScheme.primary, MaterialTheme.shapes.large)
+                else Modifier
             )
-        ) {
-            Box {
+            .clip(MaterialTheme.shapes.large)
+            .combinedClickable(onClick = onClick, onLongClick = onLongClick),
+        shape = MaterialTheme.shapes.large,
+        colors = androidx.compose.material3.CardDefaults.elevatedCardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceContainerHigh
+        ),
+        elevation = androidx.compose.material3.CardDefaults.elevatedCardElevation(
+            defaultElevation = if (isSelected) 6.dp else 2.dp
+        )
+    ) {
+        Column(modifier = Modifier.fillMaxWidth()) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .aspectRatio(0.74f)
+            ) {
                 AsyncImage(
                     model = ImageRequest.Builder(context).data(imageModel).error(placeholder)
                         .fallback(placeholder).crossfade(true).build(),
                     contentDescription = item.displayName,
                     contentScale = ContentScale.Crop,
-                    modifier = Modifier.height(160.dp).fillMaxWidth(),
+                    modifier = Modifier.fillMaxSize()
                 )
 
-                if (item.sourceFolderUri != null) {
-                    Box(
-                        modifier = Modifier.align(Alignment.TopEnd).padding(8.dp).background(
-                                color = MaterialTheme.colorScheme.secondaryContainer,
-                                shape = CircleShape
-                            ).padding(4.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Folder,
-                            contentDescription = stringResource(R.string.local_folder),
-                            modifier = Modifier.size(16.dp),
-                            tint = MaterialTheme.colorScheme.onSecondaryContainer
+                Box(
+                    modifier = Modifier.fillMaxSize().background(
+                        androidx.compose.ui.graphics.Brush.verticalGradient(
+                            0f to Color.Black.copy(alpha = 0.15f),
+                            0.3f to Color.Transparent,
+                            0.6f to Color.Transparent,
+                            1f to Color.Black.copy(alpha = 0.5f)
                         )
-                    }
-                }
+                    )
+                )
 
-                val isOpdsStream = item.uriString?.startsWith("opds-pse://") == true
-                if (isOpdsStream) {
-                    Box(
-                        modifier = Modifier.align(Alignment.TopEnd).padding(8.dp).background(
-                                color = MaterialTheme.colorScheme.tertiaryContainer,
-                                shape = CircleShape
-                            ).padding(4.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Cloud,
-                            contentDescription = stringResource(R.string.opds_stream),
-                            modifier = Modifier.size(16.dp),
-                            tint = MaterialTheme.colorScheme.onTertiaryContainer
-                        )
-                    }
-                }
-
-                if (isPinned) {
-                    Box(
-                        modifier = Modifier.align(Alignment.TopStart).padding(8.dp).background(
-                                color = MaterialTheme.colorScheme.primaryContainer,
-                                shape = CircleShape
-                            ).padding(4.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.PushPin,
-                            contentDescription = stringResource(R.string.pinned),
-                            modifier = Modifier.size(16.dp),
-                            tint = MaterialTheme.colorScheme.onPrimaryContainer
-                        )
-                    }
+                if (item.sourceFolderUri != null || item.isOpdsStream() || isPinned) {
+                    FileStatusBadges(
+                        item = item,
+                        isPinned = isPinned,
+                        overlay = true,
+                        modifier = Modifier
+                            .align(Alignment.TopStart)
+                            .padding(10.dp)
+                    )
                 }
 
                 if (!item.isAvailable) {
                     Box(
-                        modifier = Modifier
-                            .matchParentSize()
-                            .background(MaterialTheme.colorScheme.scrim.copy(alpha = 0.2f)),
+                        modifier = Modifier.matchParentSize()
+                            .background(MaterialTheme.colorScheme.scrim.copy(alpha = 0.5f)),
                         contentAlignment = Alignment.Center
                     ) {
                         if (isDownloading) {
                             CircularProgressIndicator(color = Color.White)
                         } else {
                             Icon(
-                                imageVector = Icons.Filled.Info,
+                                Icons.Filled.Info,
                                 contentDescription = stringResource(R.string.not_available_locally),
                                 modifier = Modifier.size(48.dp),
                                 tint = Color.White
@@ -846,39 +838,131 @@ fun RecentFileCard(
                         }
                     }
                 }
-                Box(
-                    modifier = Modifier.align(Alignment.BottomEnd).padding(8.dp)
-                ) {
+
+                if (isSelected) {
+                    Box(
+                        modifier = Modifier.matchParentSize()
+                            .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.2f)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            Icons.Default.Check,
+                            contentDescription = "Selected",
+                            modifier = Modifier.size(48.dp)
+                                .background(MaterialTheme.colorScheme.primary, CircleShape)
+                                .padding(8.dp),
+                            tint = MaterialTheme.colorScheme.onPrimary
+                        )
+                    }
+                }
+
+                Box(modifier = Modifier.align(Alignment.BottomEnd).padding(8.dp)) {
                     FileTypeBadge(type = item.type, overlay = true)
+                }
+
+                progressPercent?.let { percent ->
+                    Surface(
+                        modifier = Modifier
+                            .align(Alignment.BottomStart)
+                            .padding(8.dp),
+                        shape = RoundedCornerShape(50),
+                        color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.95f),
+                        contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
+                        border = androidx.compose.foundation.BorderStroke(
+                            1.dp,
+                            Color.White.copy(alpha = 0.14f)
+                        )
+                    ) {
+                        Text(
+                            text = "$percent%",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                        )
+                    }
                 }
             }
 
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(80.dp)
-                    .padding(horizontal = 8.dp, vertical = 4.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.Center
+                    .background(MaterialTheme.colorScheme.surfaceContainerLow)
+                    .padding(horizontal = 14.dp, vertical = 12.dp),
+                horizontalAlignment = Alignment.Start
             ) {
                 Text(
-                    text = item.customName ?: item.title?.takeIf { it.isNotBlank() } ?: item.displayName,
-                    style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.SemiBold),
+                    text = item.cardTitle(),
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold,
                     maxLines = 2,
+                    minLines = 2,
                     overflow = TextOverflow.Ellipsis,
-                    textAlign = TextAlign.Center,
-                    modifier = Modifier.weight(1f)
+                    modifier = Modifier.fillMaxWidth(),
+                    lineHeight = 20.sp
                 )
 
-                Box(
-                    modifier = Modifier.height(20.dp), contentAlignment = Alignment.Center
-                ) {
-                    item.progressPercentage?.let { progress ->
-                        Text(
-                            text = stringResource(R.string.progress_complete, progress.toInt()),
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.primary
-                        )
+                Spacer(modifier = Modifier.height(4.dp))
+
+                Text(
+                    text = authorText,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    minLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                if (!item.isAvailable) {
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(28.dp),
+                        contentAlignment = Alignment.CenterStart
+                    ) {
+                        Surface(
+                            shape = RoundedCornerShape(50),
+                            color = if (isDownloading) {
+                                MaterialTheme.colorScheme.primaryContainer
+                            } else {
+                                MaterialTheme.colorScheme.errorContainer
+                            },
+                            contentColor = if (isDownloading) {
+                                MaterialTheme.colorScheme.onPrimaryContainer
+                            } else {
+                                MaterialTheme.colorScheme.onErrorContainer
+                            }
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                if (isDownloading) {
+                                    CircularProgressIndicator(
+                                        modifier = Modifier.size(14.dp),
+                                        strokeWidth = 2.dp
+                                    )
+                                } else {
+                                    Icon(
+                                        Icons.Filled.Info,
+                                        contentDescription = stringResource(R.string.not_available_locally),
+                                        modifier = Modifier.size(14.dp)
+                                    )
+                                }
+                                Text(
+                                    text = if (isDownloading) {
+                                        stringResource(R.string.status_downloading)
+                                    } else {
+                                        stringResource(R.string.not_available_locally)
+                                    },
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontWeight = FontWeight.Medium
+                                )
+                            }
+                        }
                     }
                 }
             }
@@ -902,7 +986,9 @@ fun DefaultTopAppBar(
     onTabsToggle: (Boolean) -> Unit,
     onExternalFileBehaviorClick: () -> Unit,
     onStrictFilterToggleClick: () -> Unit,
-    onAppThemeClick: () -> Unit
+    onAppThemeClick: () -> Unit,
+    onTestPanelDetectionClick: () -> Unit,
+    onLanguageClick: () -> Unit
 ) {
     var showOptionsMenu by remember { mutableStateOf(false) }
     var showLimitMenu by remember { mutableStateOf(false) }
@@ -986,6 +1072,13 @@ fun DefaultTopAppBar(
                 })
 
                 HorizontalDivider()
+
+                DropdownMenuItem(text = { Text("Language") }, onClick = {
+                    onLanguageClick()
+                    showOptionsMenu = false
+                })
+
+                HorizontalDivider()
                 DropdownMenuItem(text = { Text(stringResource(R.string.options_clear_book_cache)) }, onClick = {
                     onClearCache()
                     showOptionsMenu = false
@@ -994,6 +1087,14 @@ fun DefaultTopAppBar(
                     onClearReflowCache()
                     showOptionsMenu = false
                 })
+
+                if (BuildConfig.DEBUG) {
+                    HorizontalDivider()
+                    DropdownMenuItem(text = { Text("Test Panel ML Detection") }, onClick = {
+                        onTestPanelDetectionClick()
+                        showOptionsMenu = false
+                    })
+                }
 
                 if (BuildConfig.DEBUG && BuildConfig.FLAVOR != "oss") {
                     HorizontalDivider()
@@ -1760,6 +1861,7 @@ fun ThemeSwatch(
     }
 }
 
+@SuppressLint("UnrememberedMutableState")
 @Composable
 fun CreateAppThemeDialog(
     initialColor: Color = Color(0xFF6750A4),
@@ -1915,4 +2017,47 @@ fun CreateAppThemeDialog(
             }
         }
     }
+}
+
+@Composable
+fun LanguageSelectionDialog(onDismiss: () -> Unit) {
+    val currentLocales = AppCompatDelegate.getApplicationLocales()
+    val currentTag = if (!currentLocales.isEmpty) currentLocales.get(0)?.language ?: "en" else "en"
+
+    val languages = listOf(
+        "en" to "English (Default)",
+        "ar" to "العربية (Arabic)",
+        "de" to "Deutsch (German)",
+        "tr" to "Türkçe (Turkish)"
+    )
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Language") },
+        text = {
+            Column {
+                languages.forEach { (tag, name) ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable {
+                                AppCompatDelegate.setApplicationLocales(
+                                    LocaleListCompat.forLanguageTags(tag)
+                                )
+                                onDismiss()
+                            }
+                            .padding(vertical = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        RadioButton(selected = currentTag == tag, onClick = null)
+                        Spacer(modifier = Modifier.width(16.dp))
+                        Text(name)
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text(stringResource(R.string.action_cancel)) }
+        }
+    )
 }
