@@ -97,11 +97,14 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.navigationBars
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
 
 const val SETTINGS_PREFS_NAME = "epub_reader_settings"
 private const val TEXT_ALIGN_KEY = "reader_text_align"
 private const val FONT_SIZE_KEY = "reader_font_size"
 private const val LINE_HEIGHT_KEY = "reader_line_height"
+private const val PARAGRAPH_GAP_KEY = "reader_paragraph_gap"
 private const val AUTO_SCROLL_SPEED_KEY = "reader_auto_scroll_speed"
 private const val FONT_FAMILY_KEY = "reader_font_family"
 private const val TAP_TO_NAVIGATE_ENABLED_KEY = "tap_to_navigate_enabled"
@@ -111,7 +114,30 @@ private const val PAGE_INFO_MODE_KEY = "reader_page_info_mode"
 private const val PULL_TO_TURN_ENABLED_KEY = "reader_pull_to_turn_enabled"
 
 const val DEFAULT_FONT_SIZE_VAL = 1.0f
-const val DEFAULT_LINE_HEIGHT_VAL = 1.6f
+const val DEFAULT_LINE_HEIGHT_VAL = 1.0f
+const val DEFAULT_PARAGRAPH_GAP_VAL = 1.0f
+private const val TTS_SPEECH_RATE_KEY = "tts_speech_rate"
+private const val TTS_PITCH_KEY = "tts_pitch"
+
+fun saveTtsSpeechRate(context: Context, rate: Float) {
+    val prefs = context.getSharedPreferences(SETTINGS_PREFS_NAME, Context.MODE_PRIVATE)
+    prefs.edit { putFloat(TTS_SPEECH_RATE_KEY, rate) }
+}
+
+fun loadTtsSpeechRate(context: Context): Float {
+    val prefs = context.getSharedPreferences(SETTINGS_PREFS_NAME, Context.MODE_PRIVATE)
+    return prefs.getFloat(TTS_SPEECH_RATE_KEY, 1.0f)
+}
+
+fun saveTtsPitch(context: Context, pitch: Float) {
+    val prefs = context.getSharedPreferences(SETTINGS_PREFS_NAME, Context.MODE_PRIVATE)
+    prefs.edit { putFloat(TTS_PITCH_KEY, pitch) }
+}
+
+fun loadTtsPitch(context: Context): Float {
+    val prefs = context.getSharedPreferences(SETTINGS_PREFS_NAME, Context.MODE_PRIVATE)
+    return prefs.getFloat(TTS_PITCH_KEY, 1.0f)
+}
 
 enum class ReaderFont(val id: String, val displayName: String, val fontFamilyName: String) {
     ORIGINAL("original", "Original", "Original"),
@@ -143,6 +169,7 @@ enum class PageInfoMode(val id: Int, val title: String) {
 data class FormatSettings(
     val fontSize: Float,
     val lineHeight: Float,
+    val paragraphGap: Float,
     val font: ReaderFont,
     val customPath: String?,
     val textAlign: ReaderTextAlign
@@ -151,6 +178,7 @@ data class FormatSettings(
 private const val FORMAT_IS_LOCAL_PREFIX = "format_is_local_"
 private const val LOCAL_FONT_SIZE_PREFIX = "local_font_size_"
 private const val LOCAL_LINE_HEIGHT_PREFIX = "local_line_height_"
+private const val LOCAL_PARAGRAPH_GAP_PREFIX = "local_paragraph_gap_"
 private const val LOCAL_FONT_FAMILY_PREFIX = "local_font_family_"
 private const val LOCAL_TEXT_ALIGN_PREFIX = "local_text_align_"
 
@@ -169,6 +197,7 @@ fun saveLocalReaderSettings(
     bookId: String,
     fontSize: Float,
     lineHeight: Float,
+    paragraphGap: Float,
     fontFamily: ReaderFont,
     customFontPath: String?,
     textAlign: ReaderTextAlign
@@ -177,6 +206,7 @@ fun saveLocalReaderSettings(
     prefs.edit {
         putFloat(LOCAL_FONT_SIZE_PREFIX + bookId, fontSize)
         putFloat(LOCAL_LINE_HEIGHT_PREFIX + bookId, lineHeight)
+        putFloat(LOCAL_PARAGRAPH_GAP_PREFIX + bookId, paragraphGap)
         if (customFontPath != null) {
             putString(LOCAL_FONT_FAMILY_PREFIX + bookId, "custom|$customFontPath")
         } else {
@@ -218,6 +248,18 @@ fun loadPullToTurn(context: Context): Boolean {
     return prefs.getBoolean(PULL_TO_TURN_ENABLED_KEY, true)
 }
 
+private const val PULL_TO_TURN_MULTIPLIER_KEY = "reader_pull_to_turn_multiplier"
+
+fun savePullToTurnMultiplier(context: Context, multiplier: Float) {
+    val prefs = context.getSharedPreferences(SETTINGS_PREFS_NAME, Context.MODE_PRIVATE)
+    prefs.edit { putFloat(PULL_TO_TURN_MULTIPLIER_KEY, multiplier) }
+}
+
+fun loadPullToTurnMultiplier(context: Context): Float {
+    val prefs = context.getSharedPreferences(SETTINGS_PREFS_NAME, Context.MODE_PRIVATE)
+    return prefs.getFloat(PULL_TO_TURN_MULTIPLIER_KEY, 1.0f)
+}
+
 fun loadFormatSettings(context: Context, bookId: String, isLocal: Boolean): FormatSettings {
     val prefs = context.getSharedPreferences(SETTINGS_PREFS_NAME, Context.MODE_PRIVATE)
 
@@ -231,6 +273,12 @@ fun loadFormatSettings(context: Context, bookId: String, isLocal: Boolean): Form
         prefs.getFloat(LOCAL_LINE_HEIGHT_PREFIX + bookId, DEFAULT_LINE_HEIGHT_VAL)
     } else {
         prefs.getFloat(LINE_HEIGHT_KEY, DEFAULT_LINE_HEIGHT_VAL)
+    }
+
+    val paragraphGap = if (isLocal && prefs.contains(LOCAL_PARAGRAPH_GAP_PREFIX + bookId)) {
+        prefs.getFloat(LOCAL_PARAGRAPH_GAP_PREFIX + bookId, DEFAULT_PARAGRAPH_GAP_VAL)
+    } else {
+        prefs.getFloat(PARAGRAPH_GAP_KEY, DEFAULT_PARAGRAPH_GAP_VAL)
     }
 
     val savedFontVal = if (isLocal && prefs.contains(LOCAL_FONT_FAMILY_PREFIX + bookId)) {
@@ -252,7 +300,7 @@ fun loadFormatSettings(context: Context, bookId: String, isLocal: Boolean): Form
     }
     val textAlign = ReaderTextAlign.entries.find { it.id == alignId } ?: ReaderTextAlign.DEFAULT
 
-    return FormatSettings(fontSize, lineHeight, font, customPath, textAlign)
+    return FormatSettings(fontSize, lineHeight, paragraphGap, font, customPath, textAlign)
 }
 
 fun getComposeFontFamily(
@@ -290,6 +338,7 @@ fun saveReaderSettings(
     context: Context,
     fontSize: Float,
     lineHeight: Float,
+    paragraphGap: Float,
     fontFamily: ReaderFont,
     customFontPath: String?,
     textAlign: ReaderTextAlign
@@ -298,6 +347,7 @@ fun saveReaderSettings(
     prefs.edit {
         putFloat(FONT_SIZE_KEY, fontSize)
         putFloat(LINE_HEIGHT_KEY, lineHeight)
+        putFloat(PARAGRAPH_GAP_KEY, paragraphGap)
         if (customFontPath != null) {
             putString(FONT_FAMILY_KEY, "custom|$customFontPath")
         } else {
@@ -344,6 +394,8 @@ fun ReaderTextFormatPanel(
     onFontSizeChange: (Float) -> Unit,
     currentLineHeight: Float,
     onLineHeightChange: (Float) -> Unit,
+    currentParagraphGap: Float, // NEW
+    onParagraphGapChange: (Float) -> Unit, // NEW
     currentFont: ReaderFont,
     currentCustomFontName: String?,
     onFontOptionClick: () -> Unit,
@@ -362,10 +414,10 @@ fun ReaderTextFormatPanel(
         modifier = modifier
     ) {
         Surface(
-            shape = RoundedCornerShape(28.dp),
-            color = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.95f),
+            shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
+            color = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.98f),
             tonalElevation = 0.dp,
-            shadowElevation = 0.dp,
+            shadowElevation = 8.dp,
             border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.8f)),
             modifier = Modifier
                 .fillMaxWidth()
@@ -374,6 +426,7 @@ fun ReaderTextFormatPanel(
             Column(
                 modifier = Modifier.padding(16.dp)
             ) {
+                // Header Row (Local/Global + Close/Reset)
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
@@ -389,13 +442,13 @@ fun ReaderTextFormatPanel(
                                 .padding(4.dp)
                         ) {
                             Text(
-                                text = if (isLocalMode) "Local Format" else "Global Format",
+                                text = if (isLocalMode) stringResource(R.string.format_local) else stringResource(R.string.format_global),
                                 style = MaterialTheme.typography.labelLarge,
                                 color = MaterialTheme.colorScheme.primary
                             )
                             Icon(
                                 imageVector = Icons.Default.ArrowDropDown,
-                                contentDescription = "Select Mode",
+                                contentDescription = stringResource(R.string.content_desc_select_mode),
                                 tint = MaterialTheme.colorScheme.primary,
                                 modifier = Modifier.size(20.dp)
                             )
@@ -405,8 +458,8 @@ fun ReaderTextFormatPanel(
                             DropdownMenuItem(
                                 text = {
                                     Column {
-                                        Text("Global Format", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold)
-                                        Text("Applies to all files", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                        Text(stringResource(R.string.format_global), style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold)
+                                        Text(stringResource(R.string.auto_scroll_applies_all_files), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                     }
                                 },
                                 onClick = { onLocalModeToggle(false); showModeMenu = false },
@@ -416,8 +469,8 @@ fun ReaderTextFormatPanel(
                             DropdownMenuItem(
                                 text = {
                                     Column {
-                                        Text("Local Format", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold)
-                                        Text("Saved for this file only", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                        Text(stringResource(R.string.format_local), style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold)
+                                        Text(stringResource(R.string.auto_scroll_saved_for_file), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                     }
                                 },
                                 onClick = { onLocalModeToggle(true); showModeMenu = false },
@@ -428,92 +481,119 @@ fun ReaderTextFormatPanel(
 
                     Row(horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
                         TextButton(onClick = onReset, contentPadding = PaddingValues(horizontal = 8.dp)) {
-                            Text("Reset")
+                            Text(stringResource(R.string.action_reset))
                         }
                         IconButton(onClick = onClose, modifier = Modifier.size(32.dp)) {
-                            Icon(Icons.Default.Close, "Close", tint = MaterialTheme.colorScheme.error, modifier = Modifier.size(18.dp))
+                            Icon(Icons.Default.Close, stringResource(R.string.action_close), tint = MaterialTheme.colorScheme.error, modifier = Modifier.size(18.dp))
                         }
                     }
                 }
 
                 Spacer(Modifier.height(16.dp))
 
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(16.dp),
-                    verticalAlignment = Alignment.CenterVertically
+                // FONT & ALIGNMENT SECTION
+                Text(
+                    text = stringResource(R.string.section_font_alignment),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.primary,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(start = 4.dp, bottom = 8.dp)
+                )
+
+                // Font Button (Full width)
+                Surface(
+                    onClick = onFontOptionClick,
+                    shape = RoundedCornerShape(12.dp),
+                    color = MaterialTheme.colorScheme.secondaryContainer,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(52.dp)
                 ) {
-                    Surface(
-                        onClick = onFontOptionClick,
-                        shape = RoundedCornerShape(12.dp),
-                        color = MaterialTheme.colorScheme.secondaryContainer,
-                        modifier = Modifier
-                            .weight(0.45f)
-                            .height(48.dp)
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        modifier = Modifier.padding(horizontal = 16.dp)
                     ) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            modifier = Modifier.padding(horizontal = 12.dp)
-                        ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                text = stringResource(R.string.label_aa_preview),
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onSecondaryContainer,
+                                modifier = Modifier.padding(end = 12.dp)
+                            )
                             Text(
                                 text = currentCustomFontName ?: currentFont.displayName,
-                                style = MaterialTheme.typography.labelLarge,
+                                style = MaterialTheme.typography.titleSmall,
                                 color = MaterialTheme.colorScheme.onSecondaryContainer,
                                 maxLines = 1, overflow = TextOverflow.Ellipsis
                             )
-                            Icon(
-                                imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
-                                contentDescription = null,
-                                tint = MaterialTheme.colorScheme.onSecondaryContainer,
-                                modifier = Modifier.size(16.dp)
-                            )
                         }
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onSecondaryContainer,
+                            modifier = Modifier.size(20.dp)
+                        )
                     }
+                }
 
-                    Surface(
-                        shape = RoundedCornerShape(12.dp),
-                        color = MaterialTheme.colorScheme.surfaceVariant,
-                        modifier = Modifier
-                            .weight(0.55f)
-                            .height(48.dp)
-                    ) {
-                        Row {
-                            ReaderTextAlign.entries.forEach { align ->
-                                val isSelected = currentTextAlign == align
-                                Column(
-                                    modifier = Modifier
-                                        .fillMaxHeight()
-                                        .weight(1f)
-                                        .background(if (isSelected) MaterialTheme.colorScheme.primary else Color.Transparent)
-                                        .clickable { onTextAlignChange(align) },
-                                    horizontalAlignment = Alignment.CenterHorizontally,
-                                    verticalArrangement = Arrangement.Center
-                                ) {
-                                    Icon(
-                                        painter = androidx.compose.ui.res.painterResource(id = align.iconResId),
-                                        contentDescription = align.displayName,
-                                        tint = if (isSelected) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant,
-                                        modifier = Modifier.size(18.dp)
-                                    )
-                                    Text(
-                                        text = align.displayName,
-                                        style = MaterialTheme.typography.labelSmall,
-                                        fontSize = 10.sp,
-                                        color = if (isSelected) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
-                                }
+                Spacer(Modifier.height(8.dp))
+
+                // Alignment Button (Full width Segmented)
+                Surface(
+                    shape = RoundedCornerShape(12.dp),
+                    color = MaterialTheme.colorScheme.surfaceVariant,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(48.dp)
+                ) {
+                    Row {
+                        ReaderTextAlign.entries.forEach { align ->
+                            val isSelected = currentTextAlign == align
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxHeight()
+                                    .weight(1f)
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .background(if (isSelected) MaterialTheme.colorScheme.primary else Color.Transparent)
+                                    .clickable { onTextAlignChange(align) },
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                verticalArrangement = Arrangement.Center
+                            ) {
+                                Icon(
+                                    painter = painterResource(id = align.iconResId),
+                                    contentDescription = align.displayName,
+                                    tint = if (isSelected) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.size(20.dp)
+                                )
+                                Text(
+                                    text = align.displayName,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontSize = 11.sp,
+                                    color = if (isSelected) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant
+                                )
                             }
                         }
                     }
                 }
 
-                Spacer(Modifier.height(16.dp))
+                Spacer(Modifier.height(24.dp))
+
+                // LAYOUT & SPACING SECTION
+                Text(
+                    text = stringResource(R.string.section_layout_spacing),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.primary,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(start = 4.dp, bottom = 8.dp)
+                )
 
                 // Sliders
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    // Size
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                        Text("Size", style = MaterialTheme.typography.labelMedium, modifier = Modifier.width(55.dp))
+                        Text(stringResource(R.string.label_font_size), style = MaterialTheme.typography.labelMedium, modifier = Modifier.width(40.dp))
                         Slider(
                             value = currentFontSize,
                             onValueChange = onFontSizeChange,
@@ -521,20 +601,34 @@ fun ReaderTextFormatPanel(
                             steps = 24,
                             modifier = Modifier.weight(1f)
                         )
-                        Text("%.1fx".format(currentFontSize), style = MaterialTheme.typography.labelMedium, modifier = Modifier.width(35.dp), textAlign = TextAlign.End)
+                        Text(if (currentFontSize in 0.99f..1.01f) stringResource(R.string.label_original) else "%.1fx".format(currentFontSize), style = MaterialTheme.typography.labelMedium, modifier = Modifier.width(40.dp), textAlign = TextAlign.End)
                     }
+                    // Lines
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                        Text("Spacing", style = MaterialTheme.typography.labelMedium, modifier = Modifier.width(55.dp))
+                        Text(stringResource(R.string.label_line_height), style = MaterialTheme.typography.labelMedium, modifier = Modifier.width(40.dp))
                         Slider(
                             value = currentLineHeight,
                             onValueChange = onLineHeightChange,
-                            valueRange = 1.0f..2.5f,
-                            steps = 14,
+                            valueRange = 1.0f..3.0f,
+                            steps = 19,
                             modifier = Modifier.weight(1f)
                         )
-                        Text("%.1fx".format(currentLineHeight), style = MaterialTheme.typography.labelMedium, modifier = Modifier.width(35.dp), textAlign = TextAlign.End)
+                        Text(if (currentLineHeight <= 1.01f) stringResource(R.string.label_original) else "%.1fx".format(currentLineHeight), style = MaterialTheme.typography.labelMedium, modifier = Modifier.width(40.dp), textAlign = TextAlign.End)
+                    }
+                    // Paragraph Gap
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Text(stringResource(R.string.label_paragraph_gap), style = MaterialTheme.typography.labelMedium, modifier = Modifier.width(40.dp))
+                        Slider(
+                            value = currentParagraphGap,
+                            onValueChange = onParagraphGapChange,
+                            valueRange = 0.0f..3.0f,
+                            steps = 29,
+                            modifier = Modifier.weight(1f)
+                        )
+                        Text(if (currentParagraphGap in 0.99f..1.01f) stringResource(R.string.label_original) else "%.1fx".format(currentParagraphGap), style = MaterialTheme.typography.labelMedium, modifier = Modifier.width(40.dp), textAlign = TextAlign.End)
                     }
                 }
+                Spacer(Modifier.height(8.dp))
             }
         }
     }
@@ -560,15 +654,15 @@ fun FontSelectionSheetContent(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Text("Select Font", style = MaterialTheme.typography.titleMedium)
+            Text(stringResource(R.string.select_font), style = MaterialTheme.typography.titleMedium)
             IconButton(onClick = onDismiss) {
-                Icon(Icons.Default.Close, contentDescription = "Close")
+                Icon(Icons.Default.Close, contentDescription = stringResource(R.string.action_close))
             }
         }
 
         TabRow(selectedTabIndex = selectedTabIndex) {
-            Tab(selected = selectedTabIndex == 0, onClick = { selectedTabIndex = 0 }, text = { Text("Presets") })
-            Tab(selected = selectedTabIndex == 1, onClick = { selectedTabIndex = 1 }, text = { Text("Imported") })
+            Tab(selected = selectedTabIndex == 0, onClick = { selectedTabIndex = 0 }, text = { Text(stringResource(R.string.tab_presets)) })
+            Tab(selected = selectedTabIndex == 1, onClick = { selectedTabIndex = 1 }, text = { Text(stringResource(R.string.tab_imported)) })
         }
 
         Box(modifier = Modifier.heightIn(min = 200.dp, max = 400.dp)) {
@@ -582,7 +676,7 @@ fun FontSelectionSheetContent(
                                     Text(font.displayName, fontFamily = getComposeFontFamily(font, null))
                                 },
                                 trailingContent = {
-                                    if (isSelected) Icon(Icons.Default.Check, contentDescription = "Selected", tint = MaterialTheme.colorScheme.primary)
+                                    if (isSelected) Icon(Icons.Default.Check, contentDescription = stringResource(R.string.content_desc_selected), tint = MaterialTheme.colorScheme.primary)
                                 },
                                 modifier = Modifier.clickable { onFontSelected(font, null) },
                                 colors = if (isSelected) ListItemDefaults.colors(containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.3f)) else ListItemDefaults.colors()
@@ -599,14 +693,14 @@ fun FontSelectionSheetContent(
                             ) {
                                 Icon(Icons.Default.Add, contentDescription = null)
                                 Spacer(Modifier.width(8.dp))
-                                Text("Import from Files")
+                                Text(stringResource(R.string.button_import_from_files))
                             }
                         }
 
                         if (customFonts.isEmpty()) {
                             Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                                 Text(
-                                    "No imported fonts yet.",
+                                    stringResource(R.string.no_imported_fonts_yet),
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     modifier = Modifier.padding(bottom = 32.dp)
                                 )
@@ -627,7 +721,7 @@ fun FontSelectionSheetContent(
                                             if (isSelected) {
                                                 Icon(
                                                     imageVector = Icons.Default.Check,
-                                                    contentDescription = "Selected",
+                                                    contentDescription = stringResource(R.string.content_desc_selected),
                                                     tint = MaterialTheme.colorScheme.primary
                                                 )
                                             }
@@ -646,6 +740,18 @@ fun FontSelectionSheetContent(
     }
 }
 
+private const val REMOVE_EDGE_PADDING_KEY = "reader_remove_edge_padding"
+
+fun saveRemoveEdgePadding(context: Context, enabled: Boolean) {
+    val prefs = context.getSharedPreferences(SETTINGS_PREFS_NAME, Context.MODE_PRIVATE)
+    prefs.edit { putBoolean(REMOVE_EDGE_PADDING_KEY, enabled) }
+}
+
+fun loadRemoveEdgePadding(context: Context): Boolean {
+    val prefs = context.getSharedPreferences(SETTINGS_PREFS_NAME, Context.MODE_PRIVATE)
+    return prefs.getBoolean(REMOVE_EDGE_PADDING_KEY, false)
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun VisualOptionsSheet(
@@ -655,6 +761,10 @@ fun VisualOptionsSheet(
     onPageInfoModeChange: (PageInfoMode) -> Unit,
     pullToTurnEnabled: Boolean,
     onPullToTurnChange: (Boolean) -> Unit,
+    removeEdgePadding: Boolean,
+    onRemoveEdgePaddingChange: (Boolean) -> Unit,
+    pullToTurnMultiplier: Float,
+    onPullToTurnMultiplierChange: (Float) -> Unit,
     onDismiss: () -> Unit
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
@@ -674,16 +784,16 @@ fun VisualOptionsSheet(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Text("Visual Options", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                Text(stringResource(R.string.menu_visual_options), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
                 IconButton(onClick = onDismiss) {
-                    Icon(Icons.Default.Close, contentDescription = "Close")
+                    Icon(Icons.Default.Close, contentDescription = stringResource(R.string.action_close))
                 }
             }
             Spacer(modifier = Modifier.height(16.dp))
 
             // System UI
-            Text("System UI (Status & Navigation Bars)", style = MaterialTheme.typography.titleMedium)
-            Text("Control the visibility of the device's system bars.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(stringResource(R.string.visual_options_system_ui), style = MaterialTheme.typography.titleMedium)
+            Text(stringResource(R.string.visual_options_system_ui_desc), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             Spacer(modifier = Modifier.height(12.dp))
             OptionSegmentedControl(
                 options = SystemUiMode.entries,
@@ -695,8 +805,8 @@ fun VisualOptionsSheet(
             Spacer(modifier = Modifier.height(24.dp))
 
             // Progress Bar
-            Text("Progress Bar", style = MaterialTheme.typography.titleMedium)
-            Text("The reading progress and chapter indicator at the bottom of the screen.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(stringResource(R.string.visual_options_progress_bar), style = MaterialTheme.typography.titleMedium)
+            Text(stringResource(R.string.visual_options_progress_bar_desc), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             Spacer(modifier = Modifier.height(12.dp))
             OptionSegmentedControl(
                 options = PageInfoMode.entries,
@@ -711,9 +821,53 @@ fun VisualOptionsSheet(
             Surface(
                 shape = RoundedCornerShape(12.dp),
                 color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { onPullToTurnChange(!pullToTurnEnabled) }
+                            .padding(16.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(stringResource(R.string.visual_options_seamless_chapter), style = MaterialTheme.typography.titleMedium)
+                            Text(stringResource(R.string.visual_options_seamless_chapter_desc), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        Spacer(modifier = Modifier.width(16.dp))
+                        Switch(checked = !pullToTurnEnabled, onCheckedChange = { onPullToTurnChange(!it) })
+                    }
+
+                    AnimatedVisibility(visible = pullToTurnEnabled) {
+                        Column(modifier = Modifier.padding(start = 16.dp, end = 16.dp, bottom = 16.dp)) {
+                            HorizontalDivider(modifier = Modifier.padding(bottom = 12.dp), color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.2f))
+                            Text("Pull Distance to Change Chapter", style = MaterialTheme.typography.titleSmall)
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text("Short", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                Slider(
+                                    value = pullToTurnMultiplier,
+                                    onValueChange = onPullToTurnMultiplierChange,
+                                    valueRange = 0.5f..2.0f,
+                                    steps = 14,
+                                    modifier = Modifier.weight(1f).padding(horizontal = 12.dp)
+                                )
+                                Text("Long", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                        }
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(24.dp))
+
+            Surface(
+                shape = RoundedCornerShape(12.dp),
+                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clickable { onPullToTurnChange(!pullToTurnEnabled) }
+                    .clickable { onRemoveEdgePaddingChange(!removeEdgePadding) }
             ) {
                 Row(
                     modifier = Modifier.padding(16.dp),
@@ -721,11 +875,11 @@ fun VisualOptionsSheet(
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
-                        Text("Seamless Chapter Transition", style = MaterialTheme.typography.titleMedium)
-                        Text("Instantly load the next/previous chapter when scrolling past the end, without the pull-to-refresh animation.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text(stringResource(R.string.visual_options_edge_padding), style = MaterialTheme.typography.titleMedium)
+                        Text(stringResource(R.string.visual_options_edge_padding_desc), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                     Spacer(modifier = Modifier.width(16.dp))
-                    Switch(checked = !pullToTurnEnabled, onCheckedChange = { onPullToTurnChange(!it) })
+                    Switch(checked = removeEdgePadding, onCheckedChange = { onRemoveEdgePaddingChange(it) })
                 }
             }
 

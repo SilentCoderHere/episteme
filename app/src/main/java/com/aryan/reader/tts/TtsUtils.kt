@@ -21,35 +21,188 @@ package com.aryan.reader.tts
 
 import android.content.Context
 import android.media.MediaPlayer
-import timber.log.Timber
+import androidx.annotation.OptIn
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
-import androidx.core.net.toUri
+import androidx.media3.common.util.UnstableApi
 import com.aryan.reader.BuildConfig
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import org.json.JSONObject
-import java.net.HttpURLConnection
-import java.net.URL
+import timber.log.Timber
+import java.io.File
+import java.io.RandomAccessFile
+import java.security.MessageDigest
+import kotlin.math.ln
+import kotlin.math.pow
 
 const val googleCloudWorkerTtsUrl = BuildConfig.TTS_WORKER_URL
 
-const val TTS_SAMPLE_TEXT = "The greater danger for most of us lies not in setting our aim too high and falling short; but in setting our aim too low, and achieving our mark."
-
 const val TTS_CHUNK_MAX_LENGTH = 250
+const val DEFAULT_SPEAKER_ID = "Aoede"
 
-const val DEFAULT_SPEAKER_ID = "en-US-Standard-F"
+data class GeminiVoice(val id: String, val name: String, val description: String)
 
-@Suppress("unused")
-val GOOGLE_TTS_SPEAKERS = listOf(
-    "US Female: F" to "en-US-Standard-F",
-    "US Female: H" to "en-US-Standard-H",
-    "US Male: I" to "en-US-Standard-I",
-    "US Male: J" to "en-US-Standard-J"
+val GEMINI_TTS_SPEAKERS = listOf(
+    GeminiVoice("Zephyr", "Zephyr", "Bright, Higher pitch"),
+    GeminiVoice("Puck", "Puck", "Upbeat, Middle pitch"),
+    GeminiVoice("Charon", "Charon", "Informative, Lower pitch"),
+    GeminiVoice("Kore", "Kore", "Firm, Middle pitch"),
+    GeminiVoice("Fenrir", "Fenrir", "Excitable, Lower middle pitch"),
+    GeminiVoice("Leda", "Leda", "Youthful, Higher pitch"),
+    GeminiVoice("Orus", "Orus", "Firm, Lower middle pitch"),
+    GeminiVoice("Aoede", "Aoede", "Breezy, Middle pitch"),
+    GeminiVoice("Callirrhoe", "Callirrhoe", "Easy-going, Middle pitch"),
+    GeminiVoice("Autonoe", "Autonoe", "Bright, Middle pitch"),
+    GeminiVoice("Enceladus", "Enceladus", "Breathy, Lower pitch"),
+    GeminiVoice("Iapetus", "Iapetus", "Clear, Lower middle pitch"),
+    GeminiVoice("Umbriel", "Umbriel", "Easy-going, Lower middle pitch"),
+    GeminiVoice("Algieba", "Algieba", "Smooth, Lower pitch"),
+    GeminiVoice("Despina", "Despina", "Smooth, Middle pitch"),
+    GeminiVoice("Erinome", "Erinome", "Clear, Middle pitch"),
+    GeminiVoice("Algenib", "Algenib", "Gravelly, Lower pitch"),
+    GeminiVoice("Rasalgethi", "Rasalgethi", "Informative, Middle pitch"),
+    GeminiVoice("Laomedeia", "Laomedeia", "Upbeat, Higher pitch"),
+    GeminiVoice("Achernar", "Achernar", "Soft, Higher pitch"),
+    GeminiVoice("Alnilam", "Alnilam", "Firm, Lower middle pitch"),
+    GeminiVoice("Schedar", "Schedar", "Even, Lower middle pitch"),
+    GeminiVoice("Gacrux", "Gacrux", "Mature, Middle pitch"),
+    GeminiVoice("Pulcherrima", "Pulcherrima", "Forward, Middle pitch"),
+    GeminiVoice("Achird", "Achird", "Friendly, Lower middle pitch"),
+    GeminiVoice("Zubenelgenubi", "Zubenelgenubi", "Casual, Lower middle pitch"),
+    GeminiVoice("Vindemiatrix", "Vindemiatrix", "Gentle, Middle pitch"),
+    GeminiVoice("Sadachbia", "Sadachbia", "Lively, Lower pitch"),
+    GeminiVoice("Sadaltager", "Sadaltager", "Lively, Lower pitch"),
+    GeminiVoice("Sulafat", "Sulafat", "Warn, Middle pitch"),
 )
+
+data class TtsChapterCacheInfo(
+    val chapterTitle: String,
+    val chunkCount: Int,
+    val totalChunks: Int?,
+    val sizeBytes: Long,
+    val directory: File,
+    val matchingFiles: List<File> = emptyList()
+)
+
+fun formatBytes(bytes: Long): String {
+    if (bytes < 1024) return "$bytes B"
+    val exp = (ln(bytes.toDouble()) / ln(1024.0)).toInt()
+    val pre = "KMGTPE"[exp - 1]
+    return String.format("%.1f %cB", bytes / 1024.0.pow(exp.toDouble()), pre)
+}
+
+class TtsCacheManager(private val context: Context) {
+    private fun sanitize(name: String): String = name.replace(Regex("[^a-zA-Z0-9.-]"), "_")
+
+    private fun hash(input: String): String {
+        val bytes = MessageDigest.getInstance("SHA-256").digest(input.toByteArray())
+        return bytes.joinToString("") { "%02x".format(it) }.take(16)
+    }
+
+    fun saveTotalChunks(bookTitle: String, chapterTitle: String?, totalChunks: Int) {
+        val baseDir = File(context.filesDir, "TTS_Cache")
+        val bookDir = File(baseDir, sanitize(bookTitle.take(50)))
+        val chapterDir = File(bookDir, sanitize((chapterTitle ?: "Unknown_Chapter").take(50)))
+        if (!chapterDir.exists()) chapterDir.mkdirs()
+        val metaFile = File(chapterDir, "total_chunks.txt")
+        metaFile.writeText(totalChunks.toString())
+    }
+
+    @OptIn(UnstableApi::class)
+    fun getCacheFile(
+        bookTitle: String,
+        chapterTitle: String?,
+        text: String,
+        speakerId: String,
+        mode: TtsPlaybackManager.TtsMode
+    ): File {
+        val baseDir = File(context.filesDir, "TTS_Cache")
+        val bookDir = File(baseDir, sanitize(bookTitle.take(50)))
+        val chapterDir = File(bookDir, sanitize((chapterTitle ?: "Unknown_Chapter").take(50)))
+        if (!chapterDir.exists()) {
+            chapterDir.mkdirs()
+        }
+
+        val hashParams = hash(text + speakerId + mode.name)
+        val safeSpeaker = sanitize(speakerId)
+
+        return File(chapterDir, "cached_chunk_${safeSpeaker}_$hashParams.wav")
+    }
+
+    fun getBookCacheDir(bookTitle: String): File {
+        val baseDir = File(context.filesDir, "TTS_Cache")
+        return File(baseDir, sanitize(bookTitle.take(50)))
+    }
+
+    fun getChapterCaches(bookTitle: String, speakerFilter: String? = null): List<TtsChapterCacheInfo> {
+        val bookDir = getBookCacheDir(bookTitle)
+        if (!bookDir.exists()) return emptyList()
+
+        return bookDir.listFiles()?.filter { it.isDirectory }?.mapNotNull { chapterDir ->
+            val files = chapterDir.listFiles()?.filter { file ->
+                if (!file.isFile || !file.name.endsWith(".wav")) return@filter false
+                if (speakerFilter == null || speakerFilter == "All") return@filter true
+
+                val parts = file.name.split("_")
+
+                val speakerInName = if (parts.size >= 5 && parts[2].all { it.isDigit() }) {
+                    parts[3]
+                } else if (parts.size >= 4) {
+                    parts[2]
+                } else null
+
+                speakerInName == speakerFilter
+            } ?: emptyList()
+
+            if (files.isEmpty()) null
+            else {
+                val size = files.sumOf { it.length() }
+                val metaFile = File(chapterDir, "total_chunks.txt")
+                val total = if (metaFile.exists()) metaFile.readText().toIntOrNull() else null
+
+                TtsChapterCacheInfo(
+                    chapterTitle = chapterDir.name,
+                    chunkCount = files.size,
+                    totalChunks = total,
+                    sizeBytes = size,
+                    directory = chapterDir,
+                    matchingFiles = files
+                )
+            }
+        }?.sortedBy { it.chapterTitle } ?: emptyList()
+    }
+
+    fun deleteChapterCache(chapterDir: File) {
+        chapterDir.deleteRecursively()
+    }
+
+    fun deleteSpecificFiles(files: List<File>, chapterDir: File) {
+        files.forEach { it.delete() }
+        if (chapterDir.listFiles()?.isEmpty() == true) {
+            chapterDir.deleteRecursively()
+        }
+    }
+
+    fun clearBookCache(bookTitle: String) {
+        getBookCacheDir(bookTitle).deleteRecursively()
+    }
+}
+
+fun patchWavHeader(file: File, pcmDataLength: Int) {
+    try {
+        RandomAccessFile(file, "rw").use { raf ->
+            raf.seek(4)
+            raf.writeInt(Integer.reverseBytes(36 + pcmDataLength))
+            raf.seek(40)
+            raf.writeInt(Integer.reverseBytes(pcmDataLength))
+        }
+    } catch (e: Exception) {
+        Timber.tag("TTS_CLOUD_DIAG").e(e, "Failed to patch WAV header for cached file")
+    }
+}
 
 fun splitTextIntoChunks(text: String, maxLengthPerChunk: Int = TTS_CHUNK_MAX_LENGTH): List<String> {
     if (text.isBlank()) return emptyList()
@@ -88,31 +241,44 @@ fun splitTextIntoChunks(text: String, maxLengthPerChunk: Int = TTS_CHUNK_MAX_LEN
     return chunks
 }
 
+@UnstableApi
 class SpeakerSamplePlayer(
     private val context: Context,
-    private val scope: CoroutineScope
+    private val scope: CoroutineScope,
+    private val getAuthToken: suspend () -> String?
 ) {
     private val sampleMediaPlayer = MediaPlayer()
     var loadingSpeakerId by mutableStateOf<String?>(null)
     var playingSpeakerId by mutableStateOf<String?>(null)
 
+    val cachedSpeakers = androidx.compose.runtime.mutableStateListOf<String>()
+
+    private val httpClient = okhttp3.OkHttpClient()
+    @OptIn(UnstableApi::class)
+    private val liveClient = TtsService.GeminiLiveClient(httpClient)
+
     init {
+        // Read initially existing files
+        scope.launch(Dispatchers.IO) {
+            val files = context.cacheDir.listFiles { _, name -> name.startsWith("sample_") && name.endsWith(".wav") }
+            val ids = files?.map { it.name.removePrefix("sample_").removeSuffix(".wav") } ?: emptyList()
+            withContext(Dispatchers.Main) {
+                cachedSpeakers.addAll(ids)
+            }
+        }
+
         sampleMediaPlayer.setOnErrorListener { mp, what, extra ->
             Timber.e("MediaPlayer error: what=$what, extra=$extra. Resetting.")
             playingSpeakerId = null
             loadingSpeakerId = null
-            try {
-                mp.reset()
-            } catch (e: IllegalStateException) {
-                Timber.e("Error resetting MediaPlayer: ${e.message}")
-            }
+            try { mp.reset() } catch (_: Exception) {}
             true
         }
     }
 
-    @Suppress("unused")
     fun playOrStop(speakerId: String) {
         scope.launch {
+            liveClient.close()
             when {
                 playingSpeakerId == speakerId -> {
                     sampleMediaPlayer.stop()
@@ -122,51 +288,49 @@ class SpeakerSamplePlayer(
                 loadingSpeakerId == speakerId -> {
                     loadingSpeakerId = null
                 }
-                else -> playSample(speakerId)
+                else -> {
+                    playSample(speakerId)
+                }
             }
         }
     }
 
+    @OptIn(UnstableApi::class)
     private suspend fun playSample(speakerId: String) {
-        if (sampleMediaPlayer.isPlaying) {
-            sampleMediaPlayer.stop()
-        }
+        if (sampleMediaPlayer.isPlaying) sampleMediaPlayer.stop()
         sampleMediaPlayer.reset()
         loadingSpeakerId = speakerId
         playingSpeakerId = null
 
         withContext(Dispatchers.IO) {
+            val cacheFile = File(context.cacheDir, "sample_$speakerId.wav")
             try {
-                val url = URL(googleCloudWorkerTtsUrl)
-                val connection = url.openConnection() as HttpURLConnection
-                connection.requestMethod = "POST"
-                connection.setRequestProperty("Content-Type", "application/json; charset=UTF-8")
-                connection.setRequestProperty("Accept", "application/json")
-                connection.connectTimeout = 15000
-                connection.readTimeout = 30000
-                connection.doOutput = true
-                connection.doInput = true
+                if (!cacheFile.exists()) {
+                    val bucketName = "reader-9fc469d7.firebasestorage.app"
+                    val sampleUrl = "https://firebasestorage.googleapis.com/v0/b/$bucketName/o/samples%2Fsample_${speakerId}.wav?alt=media"
 
-                val jsonPayload = JSONObject().apply {
-                    put("text", TTS_SAMPLE_TEXT)
-                    put("speaker", speakerId)
-                }
-                connection.outputStream.use { os ->
-                    os.write(jsonPayload.toString().toByteArray(Charsets.UTF_8))
-                }
+                    val request = okhttp3.Request.Builder()
+                        .url(sampleUrl)
+                        .build()
 
-
-                if (connection.responseCode == HttpURLConnection.HTTP_OK) {
-                    val responseBody = connection.inputStream.bufferedReader().use { it.readText() }
-                    val audioBase64 = JSONObject(responseBody).getString("audio_base64")
-
-                    val dataUri = "data:audio/mpeg;base64,$audioBase64"
-
-                    withContext(Dispatchers.Main) {
-                        if (loadingSpeakerId != speakerId) {
-                            return@withContext
+                    val response = httpClient.newCall(request).execute()
+                    if (response.isSuccessful) {
+                        response.body?.byteStream()?.use { input ->
+                            cacheFile.outputStream().use { output ->
+                                input.copyTo(output)
+                            }
                         }
-                        sampleMediaPlayer.setDataSource(context, dataUri.toUri())
+                    } else {
+                        Timber.e("Failed to download sample for $speakerId. HTTP ${response.code}")
+                        throw Exception("Failed to cache sample")
+                    }
+                }
+
+                if (cacheFile.exists()) {
+                    withContext(Dispatchers.Main) {
+                        if (!cachedSpeakers.contains(speakerId)) cachedSpeakers.add(speakerId)
+                        if (loadingSpeakerId != speakerId) return@withContext
+                        sampleMediaPlayer.setDataSource(cacheFile.absolutePath)
                         sampleMediaPlayer.setOnPreparedListener { mp ->
                             if (loadingSpeakerId == speakerId) {
                                 mp.start()
@@ -180,16 +344,54 @@ class SpeakerSamplePlayer(
                         sampleMediaPlayer.prepareAsync()
                     }
                 } else {
-                    Timber.e("Failed to fetch sample for $speakerId. Code: ${connection.responseCode}")
-                    withContext(Dispatchers.Main) { if (loadingSpeakerId == speakerId) loadingSpeakerId = null }
+                    throw Exception("Sample file missing after download attempt")
                 }
             } catch (e: Exception) {
-                Timber.e(e, "Exception playing sample for $speakerId: ${e.message}")
+                Timber.e(e, "Exception playing sample for $speakerId")
                 withContext(Dispatchers.Main) { if (loadingSpeakerId == speakerId) loadingSpeakerId = null }
             }
         }
     }
+
+    fun clearSamples() {
+        scope.launch(Dispatchers.IO) {
+            val files = context.cacheDir.listFiles { _, name -> name.startsWith("sample_") && name.endsWith(".wav") }
+            files?.forEach { it.delete() }
+            withContext(Dispatchers.Main) {
+                cachedSpeakers.clear()
+            }
+        }
+    }
+
+    @OptIn(UnstableApi::class)
     fun release() {
         sampleMediaPlayer.release()
+        liveClient.close()
     }
+}
+
+fun createWavHeaderUnknownLength(sampleRate: Int): ByteArray {
+    val numChannels = 1
+    val bitsPerSample = 16
+    val byteRate = sampleRate * numChannels * bitsPerSample / 8
+    val blockAlign = numChannels * bitsPerSample / 8
+
+    val header = java.nio.ByteBuffer.allocate(44)
+    header.order(java.nio.ByteOrder.LITTLE_ENDIAN)
+
+    header.put("RIFF".toByteArray(Charsets.US_ASCII))
+    header.putInt(0x7FFFFFFF)
+    header.put("WAVE".toByteArray(Charsets.US_ASCII))
+    header.put("fmt ".toByteArray(Charsets.US_ASCII))
+    header.putInt(16)
+    header.putShort(1.toShort())
+    header.putShort(numChannels.toShort())
+    header.putInt(sampleRate)
+    header.putInt(byteRate)
+    header.putShort(blockAlign.toShort())
+    header.putShort(bitsPerSample.toShort())
+    header.put("data".toByteArray(Charsets.US_ASCII))
+    header.putInt(0x7FFFFFFF - 36)
+
+    return header.array()
 }

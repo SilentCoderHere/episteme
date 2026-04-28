@@ -35,14 +35,11 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.ime
-import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -97,6 +94,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.PlatformTextStyle
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextStyle
@@ -117,7 +115,6 @@ import com.aryan.reader.R
 import com.aryan.reader.data.CustomFontEntity
 import timber.log.Timber
 import java.io.File
-import kotlin.math.max
 import kotlin.math.roundToInt
 
 private enum class ColorMenuMode {
@@ -175,18 +172,6 @@ fun TextAnnotationDock(
     val fontSizes = listOf(12.sp, 14.sp, 16.sp, 18.sp, 20.sp, 24.sp, 30.sp)
     val focusManager = LocalFocusManager.current
 
-    val density = LocalDensity.current
-    val imeBottom = WindowInsets.ime.getBottom(density)
-    val navBottom = WindowInsets.navigationBars.getBottom(density)
-    val spacerHeightPx = max(0, imeBottom - navBottom)
-    val spacerHeightDp = with(density) { spacerHeightPx.toDp() }
-
-    val effectiveSpacerHeight = if (spacerHeightDp > 0.dp) {
-        spacerHeightDp
-    } else {
-        bottomDockPadding
-    }
-
     LaunchedEffect(activePopup) {
         if (activePopup == ActivePopup.NONE) {
             activeMenuMode = ColorMenuMode.PALETTE
@@ -199,7 +184,7 @@ fun TextAnnotationDock(
 
             val dockBarHeight = 48.dp
             val margin = 8.dp
-            val finalOffsetY = -(effectiveSpacerHeight + dockBarHeight + margin)
+            val finalOffsetY = -(bottomDockPadding + dockBarHeight + margin)
 
             val isFocusable = activeMenuMode == ColorMenuMode.SPECTRUM || activePopup == ActivePopup.FONT_FAMILY
 
@@ -211,7 +196,6 @@ fun TextAnnotationDock(
             ) {
                 when (activePopup) {
                     ActivePopup.FONT_FAMILY -> {
-                        // Re-using the logic from your EPUB FontSelectionSheetContent but adapted for a Popup
                         Surface(
                             shape = RoundedCornerShape(16.dp),
                             color = Color(0xFF1E1E1E),
@@ -229,12 +213,12 @@ fun TextAnnotationDock(
                                     Tab(
                                         selected = selectedTabIndex == 0,
                                         onClick = { selectedTabIndex = 0 },
-                                        text = { Text("Presets", fontSize = 12.sp) }
+                                        text = { Text(stringResource(R.string.tab_presets), fontSize = 12.sp) }
                                     )
                                     Tab(
                                         selected = selectedTabIndex == 1,
                                         onClick = { selectedTabIndex = 1 },
-                                        text = { Text("Imported", fontSize = 12.sp) }
+                                        text = { Text(stringResource(R.string.tab_imported), fontSize = 12.sp) }
                                     )
                                 }
 
@@ -244,7 +228,7 @@ fun TextAnnotationDock(
                                             item {
                                                 val isSelected = currentFontName == "Default" || currentFontName == null
                                                 FontItem(
-                                                    name = "Default System Font",
+                                                    name = stringResource(R.string.font_default_system),
                                                     isSelected = isSelected,
                                                     fontFamily = FontFamily.Default,
                                                     onClick = {
@@ -281,12 +265,12 @@ fun TextAnnotationDock(
                                             ) {
                                                 Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(16.dp))
                                                 Spacer(Modifier.width(8.dp))
-                                                Text("Import", fontSize = 12.sp)
+                                                Text(stringResource(R.string.action_import), fontSize = 12.sp)
                                             }
 
                                             if (customFonts.isEmpty()) {
                                                 Text(
-                                                    "No fonts imported",
+                                                    stringResource(R.string.msg_no_fonts_imported),
                                                     color = Color.Gray,
                                                     modifier = Modifier.fillMaxWidth().padding(16.dp),
                                                     textAlign = TextAlign.Center,
@@ -320,7 +304,7 @@ fun TextAnnotationDock(
                     ActivePopup.COLOR -> {
                         if (activeMenuMode == ColorMenuMode.PALETTE) {
                             ColorPickerBubble(
-                                title = "Font color",
+                                title = stringResource(R.string.label_font_color),
                                 currentColor = currentStyle.color.takeIf { it != Color.Unspecified }
                                     ?: Color.Black,
                                 palette = textColorPalette,
@@ -359,7 +343,7 @@ fun TextAnnotationDock(
                     ActivePopup.BACKGROUND -> {
                         if (activeMenuMode == ColorMenuMode.PALETTE) {
                             ColorPickerBubble(
-                                title = "Highlight",
+                                title = stringResource(R.string.label_highlight_color),
                                 currentColor = when (currentStyle.background) {
                                     Color.Unspecified, Color.Transparent -> Color.Transparent
                                     else -> currentStyle.background
@@ -724,7 +708,7 @@ fun TextAnnotationDock(
                     }
                 }
             }
-            Spacer(modifier = Modifier.height(effectiveSpacerHeight))
+            Spacer(modifier = Modifier.height(bottomDockPadding))
         }
     }
 }

@@ -69,6 +69,15 @@ class InteractiveWebView(
 
             override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
                 Timber.d("onSingleTapConfirmed")
+
+                val hitTestResult = this@InteractiveWebView.hitTestResult
+                val type = hitTestResult.type
+
+                if (type == HitTestResult.SRC_ANCHOR_TYPE || type == HitTestResult.SRC_IMAGE_ANCHOR_TYPE) {
+                    Timber.d("Tap was on a link. Consuming tap, not toggling app bars.")
+                    return true
+                }
+
                 onSingleTap()
                 return true
             }
@@ -117,12 +126,16 @@ class InteractiveWebView(
                 }
 
                 if (currentDragOperation != DragOperation.NONE && oldDragOperation == DragOperation.NONE) {
-                    Timber.d("Drag operation started ($currentDragOperation), disabling text selection."
-                    )
+                    Timber.d("Drag operation started ($currentDragOperation), disabling text selection.")
                     evaluateJavascript(
                         "javascript:if(window.setTextSelectionEnabled) window.setTextSelectionEnabled(false);",
                         null
                     )
+
+                    val cancelEvent = MotionEvent.obtain(event)
+                    cancelEvent.action = MotionEvent.ACTION_CANCEL
+                    super.onTouchEvent(cancelEvent)
+                    cancelEvent.recycle()
                 }
             }
 

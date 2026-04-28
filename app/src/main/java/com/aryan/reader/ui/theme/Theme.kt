@@ -19,9 +19,7 @@
  */
 package com.aryan.reader.ui.theme
 
-import android.annotation.SuppressLint
 import android.os.Build
-import androidx.annotation.RequiresApi
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.lightColorScheme
@@ -29,7 +27,11 @@ import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.dynamicDarkColorScheme
 import androidx.compose.material3.dynamicLightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
+import androidx.compose.ui.graphics.Color
+import com.materialkolor.PaletteStyle
 import androidx.compose.ui.platform.LocalContext
+import com.materialkolor.dynamicColorScheme
 
 private val lightScheme = lightColorScheme(
     primary = primaryLight,
@@ -111,21 +113,67 @@ private val darkScheme = darkColorScheme(
 fun AppTheme(
     darkTheme: Boolean = isSystemInDarkTheme(),
     dynamicColor: Boolean = true,
+    seedColor: Color? = null,
+    contrastLevel: Double = 0.0,
+    textDimFactor: Float = 1.0f,
     content: @Composable () -> Unit
 ) {
     val supportsDynamicColor = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
+    val context = LocalContext.current
 
-    val colorScheme = when {
-        dynamicColor && supportsDynamicColor -> {
-            val context = LocalContext.current
-            if (darkTheme) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context)
+    val baseColorScheme = remember(
+        darkTheme, dynamicColor, supportsDynamicColor, seedColor, contrastLevel
+    ) {
+        when {
+            seedColor != null -> dynamicColorScheme(
+                seedColor = seedColor,
+                isDark = darkTheme,
+                contrastLevel = contrastLevel,
+                style = PaletteStyle.Fidelity
+            )
+            dynamicColor && supportsDynamicColor -> {
+                if (darkTheme) dynamicDarkColorScheme(context)
+                else dynamicLightColorScheme(context)
+            }
+            darkTheme -> darkScheme
+            else -> lightScheme
         }
-        darkTheme -> darkScheme
-        else -> lightScheme
+    }
+
+    val finalColorScheme = remember(baseColorScheme, textDimFactor) {
+        if (textDimFactor >= 1.0f) {
+            baseColorScheme
+        } else {
+            baseColorScheme.copy(
+                primary = baseColorScheme.primary.copy(alpha = textDimFactor),
+                secondary = baseColorScheme.secondary.copy(alpha = textDimFactor),
+                tertiary = baseColorScheme.tertiary.copy(alpha = textDimFactor),
+                error = baseColorScheme.error.copy(alpha = textDimFactor),
+                primaryContainer = baseColorScheme.primaryContainer.copy(alpha = textDimFactor),
+                secondaryContainer = baseColorScheme.secondaryContainer.copy(alpha = textDimFactor),
+                tertiaryContainer = baseColorScheme.tertiaryContainer.copy(alpha = textDimFactor),
+                errorContainer = baseColorScheme.errorContainer.copy(alpha = textDimFactor),
+                outline = baseColorScheme.outline.copy(alpha = textDimFactor),
+                outlineVariant = baseColorScheme.outlineVariant.copy(alpha = textDimFactor),
+                inversePrimary = baseColorScheme.inversePrimary.copy(alpha = textDimFactor),
+                inverseOnSurface = baseColorScheme.inverseOnSurface.copy(alpha = textDimFactor),
+                onPrimary = baseColorScheme.onPrimary.copy(alpha = textDimFactor),
+                onSecondary = baseColorScheme.onSecondary.copy(alpha = textDimFactor),
+                onTertiary = baseColorScheme.onTertiary.copy(alpha = textDimFactor),
+                onBackground = baseColorScheme.onBackground.copy(alpha = textDimFactor),
+                onSurface = baseColorScheme.onSurface.copy(alpha = textDimFactor),
+                onSurfaceVariant = baseColorScheme.onSurfaceVariant.copy(alpha = textDimFactor),
+                onError = baseColorScheme.onError.copy(alpha = textDimFactor),
+                onPrimaryContainer = baseColorScheme.onPrimaryContainer.copy(alpha = textDimFactor),
+                onSecondaryContainer = baseColorScheme.onSecondaryContainer.copy(alpha = textDimFactor),
+                onTertiaryContainer = baseColorScheme.onTertiaryContainer.copy(alpha = textDimFactor),
+                onErrorContainer = baseColorScheme.onErrorContainer.copy(alpha = textDimFactor),
+            )
+        }
     }
 
     MaterialTheme(
-        colorScheme = colorScheme,
+        colorScheme = finalColorScheme,
         typography = AppTypography,
         content = content
     )

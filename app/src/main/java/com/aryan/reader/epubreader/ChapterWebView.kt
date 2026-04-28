@@ -72,6 +72,7 @@ import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntRect
 import androidx.compose.ui.unit.IntSize
@@ -81,8 +82,8 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupPositionProvider
 import androidx.core.net.toUri
+import com.aryan.reader.R
 import com.aryan.reader.ReaderTexture
-import com.aryan.reader.paginatedreader.PaginatedTextSelectionMenu
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
 import org.json.JSONObject
@@ -125,20 +126,21 @@ class AutoScrollJsBridge(
     }
 }
 
-@Suppress("unused") // function used by JavaScript
+@Suppress("unused")
 class TtsJsBridge(
     private val scope: CoroutineScope,
     private val ttsStructuredTextHandler: suspend (String) -> Unit
 ) {
     @JavascriptInterface
     fun onStructuredTextExtracted(json: String) {
-        Timber.tag("TTS_LIST_DIAG").d("Bridge received JSON: $json")
+        Timber.tag("TTS_CHAPTER_CHANGE_DIAG").d("JS Bridge received JSON. Length: ${json.length}")
         if (json.isNotBlank() && json != "[]") {
-            scope.launch {
+            scope.launch(kotlinx.coroutines.Dispatchers.Default) {
                 ttsStructuredTextHandler(json)
             }
         } else {
-            scope.launch {
+            Timber.tag("TTS_CHAPTER_CHANGE_DIAG").w("JS Bridge received empty or blank JSON. This may trigger a chapter skip.")
+            scope.launch(kotlinx.coroutines.Dispatchers.Default) {
                 ttsStructuredTextHandler("[]")
             }
         }
@@ -280,7 +282,9 @@ private data class CustomMenuState(
     val selectionBounds: Rect,
     val finishActionModeCallback: () -> Unit,
     val cfi: String? = null,
-    val isExistingHighlight: Boolean = false
+    val isExistingHighlight: Boolean = false,
+    val note: String? = null,
+    val selectedColor: HighlightColor? = null
 )
 
 @Suppress("unused")
@@ -295,6 +299,17 @@ class AiJsBridge(
                 onContentReady(text)
             }
         }
+    }
+}
+
+@Suppress("unused")
+class FootnoteJsBridge(
+    private val onFootnoteRequestCallback: (String) -> Unit
+) {
+    @JavascriptInterface
+    fun onFootnoteRequested(htmlContent: String) {
+        Timber.tag("FootnoteDiag").d("Kotlin Bridge received footnote content. Length: ${htmlContent.length}")
+        onFootnoteRequestCallback(htmlContent)
     }
 }
 
@@ -320,6 +335,7 @@ fun ChapterWebView(
     onTopChunkUpdated: (Int) -> Unit,
     currentFontSize: Float,
     currentLineHeight: Float,
+    currentParagraphGap: Float,
     onChapterInitiallyScrolled: () -> Unit,
     modifier: Modifier = Modifier,
     onTap: () -> Unit,
@@ -344,7 +360,9 @@ fun ChapterWebView(
     onWordSelectedForAiDefinition: (String) -> Unit,
     onTranslate: (String) -> Unit,
     onSearch: (String) -> Unit,
+    onNoteRequested: (String?) -> Unit,
     onContentReadyForSummarization: suspend (String) -> Unit,
+    onFootnoteRequested: (String) -> Unit,
     currentFontFamily: ReaderFont,
     customFontPath: String? = null,
     currentTextAlign: ReaderTextAlign,
@@ -368,6 +386,7 @@ fun ChapterWebView(
     val jsToInject = remember(context) { getJsToInject(context) }
 
     var showPaletteManager by remember { mutableStateOf(false) }
+    val latestUserHighlights by rememberUpdatedState(userHighlights)
 
     val textureBase64 by remember(activeTextureId) {
         mutableStateOf(
@@ -411,8 +430,8 @@ fun ChapterWebView(
         val urlToShow = showExternalLinkDialog!!
         AlertDialog(
             onDismissRequest = { showExternalLinkDialog = null },
-            title = { Text("External Link") },
-            text = { Text("You clicked on an external link:\n\n$urlToShow\n\nWhat would you like to do?") },
+            title = { Text(stringResource(R.string.dialog_external_link_title)) },
+            text = { Text(stringResource(R.string.dialog_external_link_desc, urlToShow)) },
             confirmButton = {
                 Row(horizontalArrangement = Arrangement.End) {
                     TextButton(onClick = {
@@ -421,23 +440,21 @@ fun ChapterWebView(
                             context.startActivity(intent)
                         } catch (e: ActivityNotFoundException) {
                             Timber.e(e, "No activity found to handle intent for URL: $urlToShow")
-                            Toast.makeText(
-                                context, "No browser found to open the link.", Toast.LENGTH_LONG
-                            ).show()
+                            Toast.makeText(context, context.getString(R.string.error_no_browser), Toast.LENGTH_LONG).show()
                         }
                         showExternalLinkDialog = null
-                    }) { Text("Open") }
+                    }) { Text(stringResource(R.string.action_open)) }
                     TextButton(onClick = {
                         val clipboard =
                             context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                         val clip = ClipData.newPlainText("Copied Link", urlToShow)
                         clipboard.setPrimaryClip(clip)
                         showExternalLinkDialog = null
-                    }) { Text("Copy") }
+                    }) { Text(stringResource(R.string.action_copy)) }
                 }
             },
             dismissButton = {
-                TextButton(onClick = { showExternalLinkDialog = null }) { Text("Cancel") }
+                TextButton(onClick = { showExternalLinkDialog = null }) { Text(stringResource(R.string.action_cancel)) }
             })
     }
 
@@ -453,6 +470,7 @@ fun ChapterWebView(
             key,
             currentFontSize,
             currentLineHeight,
+            currentParagraphGap,
             currentFontFamily,
             currentTextAlign
         ) {
@@ -461,7 +479,7 @@ fun ChapterWebView(
                 Timber.d(
                     "InteractiveWebView factory for $chapterTitle (Key: $key), isDarkTheme: $isDarkTheme, initialScroll: $initialScrollTarget"
                 )
-                val webView = InteractiveWebView(
+                @Suppress("unused") val webView = InteractiveWebView(
                     context = ctx,
                     onSingleTap = onTap,
                     onPotentialScroll = onPotentialScroll,
@@ -511,32 +529,11 @@ fun ChapterWebView(
                             onClickCallback = { cfi, text, left, top, right, bottom ->
                                 this.post {
                                     onHighlightClicked()
-
-                                    val densityValue = density.density
-                                    val locationOnScreen = IntArray(2)
-                                    this.getLocationOnScreen(locationOnScreen)
-                                    val xOffset = locationOnScreen[0]
-                                    val yOffset = locationOnScreen[1]
-
-                                    val rect = Rect(
-                                        (left * densityValue).toInt() + xOffset,
-                                        (top * densityValue).toInt() + yOffset,
-                                        (right * densityValue).toInt() + xOffset,
-                                        (bottom * densityValue).toInt() + yOffset
+                                    localWebViewRef?.evaluateJavascript(
+                                        "javascript:if(window.getSelection) window.getSelection().removeAllRanges();",
+                                        null
                                     )
-
-                                    customMenuState = CustomMenuState(
-                                        selectedText = text,
-                                        selectionBounds = rect,
-                                        finishActionModeCallback = {
-                                            localWebViewRef?.evaluateJavascript(
-                                                "javascript:if(window.getSelection) window.getSelection().removeAllRanges();",
-                                                null
-                                            )
-                                        },
-                                        cfi = cfi,
-                                        isExistingHighlight = true
-                                    )
+                                    onNoteRequested(cfi)
                                 }
                             }
                         ), "HighlightBridge"
@@ -553,6 +550,15 @@ fun ChapterWebView(
                             consoleMessage?.let {
                                 val message = it.message()
                                 when {
+                                    message.startsWith("FootnoteDiag:") -> {
+                                        Timber.tag("FootnoteDiag")
+                                            .d("JS -> ${message.substringAfter("FootnoteDiag: ")}")
+                                    }
+
+                                    message.startsWith("TTS_CHAPTER_CHANGE_DIAG:") -> {
+                                        Timber.tag("TTS_CHAPTER_CHANGE_DIAG").d("JS -> ${message.substringAfter("TTS_CHAPTER_CHANGE_DIAG: ")}")
+                                    }
+
                                     message.startsWith("BookmarkDiagnosis") -> {
                                         Timber.tag("BookmarkDiagnosis")
                                             .d("JS -> ${message.substringAfter("BookmarkDiagnosis: ")}")
@@ -578,6 +584,11 @@ fun ChapterWebView(
                                         )
                                     }
 
+                                    message.startsWith("PosSaveDiag:") -> {
+                                        Timber.tag("PosSaveDiag")
+                                            .d("JS -> ${message.substringAfter("PosSaveDiag: ")}")
+                                    }
+
                                     message.startsWith("HIGHLIGHT_DEBUG:") -> {
                                         Timber.d(
                                             "JS -> ${message.substringAfter("HIGHLIGHT_DEBUG: ")}"
@@ -588,6 +599,11 @@ fun ChapterWebView(
                                         Timber.d(
                                             "JS -> ${message.substringAfter("ReaderFontDiagnosis: ")}"
                                         )
+                                    }
+
+                                    message.startsWith("NavDiag:") -> {
+                                        Timber.tag("NavDiag")
+                                            .d("JS -> ${message.substringAfter("NavDiag: ")}")
                                     }
 
                                     message.startsWith("AutoScrollDiagnosis") -> {
@@ -629,6 +645,12 @@ fun ChapterWebView(
                     addJavascriptInterface(TtsJsBridge(ttsScope, onTtsTextReady), "TtsBridge")
                     addJavascriptInterface(
                         AiJsBridge(ttsScope, onContentReadyForSummarization), "AiBridge"
+                    )
+
+                    addJavascriptInterface(
+                        FootnoteJsBridge { html ->
+                            this.post { onFootnoteRequested(html) }
+                        }, "FootnoteBridge"
                     )
 
                     webViewClient = object : WebViewClient() {
@@ -722,7 +744,7 @@ fun ChapterWebView(
                             }
 
                             view?.evaluateJavascript(
-                                "javascript:window.updateReaderStyles($currentFontSize, $currentLineHeight, '$fontNameForJs', '${currentTextAlign.cssValue}');",
+                                "javascript:window.updateReaderStyles($currentFontSize, $currentLineHeight, '$fontNameForJs', '${currentTextAlign.cssValue}', $currentParagraphGap);",
                                 null
                             )
 
@@ -739,13 +761,13 @@ fun ChapterWebView(
 
                             if (!initialCfi.isNullOrBlank()) {
                                 val cfiJsCommand = "javascript:window.scrollToCfi('$initialCfi');"
-                                Timber.tag("POS_DIAG").d("WebView onPageFinished: Triggering scroll to initialCfi: $initialCfi")
+                                Timber.tag("NavDiag").d("WebView onPageFinished: Triggering scroll to initialCfi: $initialCfi")
                                 view?.evaluateJavascript(cfiJsCommand) {
                                     onChapterInitiallyScrolled()
                                     scrollActionTaken = true
                                 }
                             } else if (!initialFragmentId.isNullOrBlank()) {
-                                Timber.d("WebView onPageFinished: Scrolling to Element ID: $initialFragmentId")
+                                Timber.tag("NavDiag").d("WebView onPageFinished: Scrolling to Element ID: $initialFragmentId")
                                 view?.evaluateJavascript(
                                     "javascript:var el = document.getElementById('$initialFragmentId'); if(el) { el.scrollIntoView(); } else { console.log('Element not found: $initialFragmentId'); }",
                                     null
@@ -757,9 +779,7 @@ fun ChapterWebView(
                                     ChapterScrollPosition.END -> "javascript:window.scrollToChapterEnd();"
                                     else -> "javascript:window.scrollToChapterStart();"
                                 }
-                                Timber.d(
-                                    "WebView onPageFinished: Executing initial scroll to target: $initialScrollTarget"
-                                )
+                                Timber.tag("NavDiag").d("WebView onPageFinished: Executing initial scroll to target: $initialScrollTarget")
                                 view?.evaluateJavascript(scrollJsCommand) {
                                     onChapterInitiallyScrolled()
                                     scrollActionTaken = true
@@ -767,17 +787,13 @@ fun ChapterWebView(
                             } else if (initialPageScrollY != null && initialPageScrollY > 0) {
                                 val scrollJsCommand =
                                     "javascript:window.scrollToSpecificY($initialPageScrollY);"
-                                Timber.d(
-                                    "WebView onPageFinished: Executing initial scroll to Y: $initialPageScrollY"
-                                )
+                                Timber.tag("NavDiag").d("WebView onPageFinished: Executing initial scroll to Y: $initialPageScrollY")
                                 view?.evaluateJavascript(scrollJsCommand) {
                                     onChapterInitiallyScrolled()
                                     scrollActionTaken = true
                                 }
                             } else {
-                                Timber.d(
-                                    "WebView onPageFinished: No specific scroll, defaulting to start."
-                                )
+                                Timber.tag("NavDiag").d("WebView onPageFinished: No specific scroll, defaulting to start.")
                                 view?.evaluateJavascript("javascript:window.scrollToChapterStart();") {
                                     onChapterInitiallyScrolled()
                                     scrollActionTaken = true
@@ -843,10 +859,16 @@ fun ChapterWebView(
                 )
 
                 webView.evaluateJavascript(
-                    "javascript:window.updateReaderStyles($currentFontSize, $currentLineHeight, '$fontNameForJs', '${currentTextAlign.cssValue}');",
+                    "javascript:window.updateReaderStyles($currentFontSize, $currentLineHeight, '$fontNameForJs', '${currentTextAlign.cssValue}', $currentParagraphGap);",
                     null
                 )
-            }, modifier = Modifier.fillMaxSize()
+
+                val escapedHighlights = escapeJsString(highlightsJson)
+                webView.evaluateJavascript(
+                    "javascript:window.CURRENT_HIGHLIGHTS = '${escapedHighlights}'; window.HighlightBridgeHelper.restoreHighlights(window.CURRENT_HIGHLIGHTS);",
+                    null
+                )
+                }, modifier = Modifier.fillMaxSize()
             )
         }
 
@@ -989,7 +1011,19 @@ fun ChapterWebView(
                                     }
                                     customMenuState = null
                                 },
-                                onHighlight = null, // Highlight handles itself above in the Colors Row
+                                onNote = {
+                                    if (state.isExistingHighlight && state.cfi != null) {
+                                        onNoteRequested(state.cfi)
+                                    } else {
+                                        onNoteRequested(null)
+                                        localWebViewRef?.evaluateJavascript(
+                                            "javascript:window.HighlightBridgeHelper.createUserHighlight('${HighlightColor.YELLOW.cssClass}', '${HighlightColor.YELLOW.id}');", null
+                                        )
+                                    }
+                                    state.finishActionModeCallback()
+                                    customMenuState = null
+                                },
+                                onHighlight = null,
                                 onTts = {
                                     localWebViewRef?.evaluateJavascript(
                                         "javascript:window.TtsBridgeHelper.extractAndRelayTextFromSelection();",
@@ -1006,21 +1040,13 @@ fun ChapterWebView(
                                 onDelete = if (state.isExistingHighlight && state.cfi != null) {
                                     {
                                         val highlightToDelete = userHighlights.find { h ->
-                                            h.cfi == state.cfi || h.cfi.split("|")
-                                                .contains(state.cfi)
+                                            h.cfi == state.cfi || h.cfi.split("|").contains(state.cfi)
                                         }
                                         if (highlightToDelete != null) {
                                             val cssClassToDelete = highlightToDelete.color.cssClass
-                                            val allCfiParts = highlightToDelete.cfi.split("|")
-                                            allCfiParts.forEach { partCfi ->
-                                                localWebViewRef?.evaluateJavascript(
-                                                    "javascript:window.HighlightBridgeHelper.removeHighlightByCfi('${
-                                                        escapeJsString(
-                                                            partCfi
-                                                        )
-                                                    }', '$cssClassToDelete');", null
-                                                )
-                                            }
+                                            localWebViewRef?.evaluateJavascript(
+                                                "javascript:window.HighlightBridgeHelper.removeHighlightByCfi('${escapeJsString(highlightToDelete.cfi)}', '$cssClassToDelete');", null
+                                            )
                                             onHighlightDeleted(highlightToDelete.cfi)
                                         }
                                         state.finishActionModeCallback()
@@ -1028,7 +1054,10 @@ fun ChapterWebView(
                                     }
                                 } else null,
                                 isProUser = isProUser,
-                                isOss = isOss)
+                                isOss = isOss,
+                                existingNote = state.note,
+                                selectedColor = state.selectedColor
+                            )
                         }
                     }
                 }

@@ -28,10 +28,12 @@ import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
 import android.database.Cursor
+import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Build
 import android.provider.DocumentsContract
 import android.provider.OpenableColumns
+import androidx.compose.ui.graphics.toArgb
 import androidx.core.content.edit
 import androidx.core.net.toUri
 import androidx.credentials.exceptions.GetCredentialCancellationException
@@ -113,6 +115,10 @@ import java.util.UUID
 import java.util.concurrent.CancellationException
 import java.util.concurrent.TimeUnit
 import androidx.core.graphics.createBitmap
+import io.legere.pdfiumandroid.PdfiumCore
+import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.flow.distinctUntilChanged
+import java.util.concurrent.Executors.newSingleThreadExecutor
 
 private const val KEY_RENDER_MODE = "render_mode"
 private const val KEY_FOLDER_SYNC_ENABLED = "folder_sync_enabled"
@@ -135,8 +141,26 @@ enum class AddBooksSource(val displayName: String) {
     UNSHELVED("Unshelved"), ALL_BOOKS("All Books")
 }
 
+enum class AppThemeMode(val displayName: String) {
+    SYSTEM("System"),
+    LIGHT("Light"),
+    DARK("Dark")
+}
+
+enum class AppContrastOption(val displayName: String, val value: Double) {
+    STANDARD("Standard", 0.0),
+    MEDIUM("Medium", 0.5),
+    HIGH("High", 1.0)
+}
+
+data class CustomAppTheme(
+    val id: String,
+    val name: String,
+    val seedColor: androidx.compose.ui.graphics.Color
+)
+
 enum class FileType {
-    PDF, EPUB, MOBI, MD, TXT, HTML, FB2, CBZ, CBR, CB7, DOCX
+    PDF, EPUB, MOBI, MD, TXT, HTML, FB2, CBZ, CBR, CB7, DOCX, ODT, FODT
 }
 
 enum class RenderMode {
@@ -214,6 +238,7 @@ data class ReaderScreenState(
     val currentUser: UserData? = null,
     val isAuthMenuExpanded: Boolean = false,
     val isProUser: Boolean = false,
+    val credits: Int = 0,
     val isSyncEnabled: Boolean = false,
     val isFolderSyncEnabled: Boolean = false,
     val bannerMessage: BannerMessage? = null,
@@ -236,20 +261,39 @@ data class ReaderScreenState(
     val pinnedLibraryBookIds: Set<String> = emptySet(),
     val libraryFilters: LibraryFilters = LibraryFilters(),
     val recentFilesLimit: Int = 0,
+    val isTabsEnabled: Boolean = false,
+    val openTabIds: List<String> = emptyList(),
+    val openTabs: List<RecentFileItem> = emptyList(),
+    val activeTabBookId: String? = null,
+    val showExternalFileSavePromptFor: String? = null,
+    val externalFileBehavior: String = "ASK",
+    val useStrictFileFilter: Boolean = false,
+    val appThemeMode: AppThemeMode = AppThemeMode.SYSTEM,
+    val appContrastOption: AppContrastOption = AppContrastOption.STANDARD,
+    val appTextDimFactor: Float = 1.0f,
+    val appSeedColor: androidx.compose.ui.graphics.Color? = null,
+    val customAppThemes: List<CustomAppTheme> = emptyList()
 )
 
 open class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val appContext: Context = application.applicationContext
     private val authRepository = AuthRepository(appContext)
     private val recentFilesRepository = RecentFilesRepository(appContext)
-    private val pdfTextRepository = PdfTextRepository(appContext)
 
-    private val bookCacheDao = BookCacheDatabase.getDatabase(application).bookCacheDao()
-    private val epubParser = EpubParser(appContext)
-    private val mobiParser = MobiParser(appContext)
-    private val fb2Parser = com.aryan.reader.epub.Fb2Parser(appContext)
-    private val singleFileImporter = SingleFileImporter(appContext)
-    private val bookImporter = BookImporter(appContext)
+    private val pdfTextRepository by lazy { PdfTextRepository(appContext) }
+    private val bookCacheDao by lazy { BookCacheDatabase.getDatabase(application).bookCacheDao() }
+    private val epubParser by lazy { EpubParser(appContext) }
+    private val mobiParser by lazy { MobiParser(appContext) }
+    private val fb2Parser by lazy { com.aryan.reader.epub.Fb2Parser(appContext) }
+    private val odtParser by lazy { com.aryan.reader.epub.OdtParser(appContext) }
+    private val singleFileImporter by lazy { SingleFileImporter(appContext) }
+    private val bookImporter by lazy { BookImporter(appContext) }
+    private val pageLayoutRepository by lazy { PageLayoutRepository(appContext) }
+    private val pdfRichTextRepository by lazy { com.aryan.reader.pdf.PdfRichTextRepository(appContext) }
+    private val pdfTextBoxRepository by lazy { PdfTextBoxRepository(appContext) }
+    private val pdfHighlightRepository by lazy { PdfHighlightRepository(appContext) }
+    private val pdfAnnotationRepository by lazy { PdfAnnotationRepository(appContext) }
+
     private val prefs: SharedPreferences =
         application.getSharedPreferences("reader_user_prefs", Context.MODE_PRIVATE)
     private val firestoreRepository = FirestoreRepository()
@@ -261,20 +305,37 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
     private val cloudflareRepository = CloudflareRepository()
     private val remoteConfigRepository = RemoteConfigRepository()
     private var userProfileListener: Any? = null
-    private val migrationAttempted = MutableStateFlow(false)
     private val _prefsUpdateFlow = MutableStateFlow(0L)
     private val prefsListener: SharedPreferences.OnSharedPreferenceChangeListener
     private val feedbackRepository = FeedbackRepository(appContext)
     private var feedbackListener: Any? = null
     private val importMutex = Mutex()
-    private val pageLayoutRepository = PageLayoutRepository(appContext)
-    private val pdfRichTextRepository = com.aryan.reader.pdf.PdfRichTextRepository(appContext)
-    private val pdfTextBoxRepository = PdfTextBoxRepository(appContext)
-    private val pdfHighlightRepository = PdfHighlightRepository(appContext)
     private val _navigationEvent = Channel<NavigationEvent>(Channel.BUFFERED)
     @Suppress("unused")
     val navigationEvent = _navigationEvent.receiveAsFlow()
     private var pendingSwitchDeferred: CompletableDeferred<Boolean>? = null
+    private var externalOpenedBookId: String? = null
+
+    private var panelDetector: com.aryan.reader.ml.IPanelDetector? = null
+
+    private val mlDispatcher = newSingleThreadExecutor().asCoroutineDispatcher()
+
+    private fun getOrInitDetector(context: Context): com.aryan.reader.ml.IPanelDetector? {
+        if (panelDetector == null && BuildConfig.DEBUG) {
+            val modelFile = File(context.getExternalFilesDir(null), "best_float16.tflite")
+            if (modelFile.exists()) {
+                try {
+                    val clazz = Class.forName("com.aryan.reader.ml.ComicPanelDetector")
+                    panelDetector = clazz.getConstructor(File::class.java).newInstance(modelFile) as com.aryan.reader.ml.IPanelDetector
+                } catch (e: Exception) {
+                    Timber.e(e, "Failed to instantiate ComicPanelDetector via reflection")
+                }
+            } else {
+                Timber.e("Model file best_float16.tflite not found in external files dir")
+            }
+        }
+        return panelDetector
+    }
 
     data class PageModificationResult(
         val layout: List<VirtualPage>,
@@ -335,7 +396,26 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
             else null,
             pinnedHomeBookIds = prefs.getStringSet(KEY_PINNED_HOME, emptySet()) ?: emptySet(),
             pinnedLibraryBookIds = prefs.getStringSet(KEY_PINNED_LIBRARY, emptySet()) ?: emptySet(),
-            recentFilesLimit = prefs.getInt(KEY_RECENT_FILES_LIMIT, 0)
+            recentFilesLimit = prefs.getInt(KEY_RECENT_FILES_LIMIT, 0),
+            isTabsEnabled = prefs.getBoolean(KEY_TABS_ENABLED, false),
+            openTabIds = prefs.getString(KEY_OPEN_TAB_IDS, null)?.let {
+                try {
+                    val arr = JSONArray(it)
+                    List(arr.length()) { i -> arr.getString(i) }
+                } catch(_: Exception) { emptyList() }
+            } ?: emptyList(),
+            activeTabBookId = prefs.getString(KEY_ACTIVE_TAB, null),
+            externalFileBehavior = prefs.getString(KEY_EXTERNAL_FILE_BEHAVIOR, "ASK") ?: "ASK",
+            useStrictFileFilter = prefs.getBoolean(KEY_USE_STRICT_FILE_FILTER, false),
+            appThemeMode = try {
+                AppThemeMode.valueOf(prefs.getString(KEY_APP_THEME_MODE, AppThemeMode.SYSTEM.name) ?: AppThemeMode.SYSTEM.name)
+            } catch (_: Exception) { AppThemeMode.SYSTEM },
+            appContrastOption = try {
+                AppContrastOption.valueOf(prefs.getString(KEY_APP_CONTRAST_OPTION, AppContrastOption.STANDARD.name) ?: AppContrastOption.STANDARD.name)
+            } catch (_: Exception) { AppContrastOption.STANDARD },
+            appTextDimFactor = prefs.getFloat(KEY_APP_TEXT_DIM_FACTOR, 1.0f),
+            appSeedColor = if (prefs.contains(KEY_APP_SEED_COLOR)) androidx.compose.ui.graphics.Color(prefs.getInt(KEY_APP_SEED_COLOR, 0)) else null,
+            customAppThemes = loadCustomAppThemes(prefs)
         )
     )
 
@@ -358,7 +438,11 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
         val filters = internalState.libraryFilters
         val libraryFiltered = baseVisibleFiles.filter { item ->
             val matchType = if (filters.fileTypes.isNotEmpty()) item.type in filters.fileTypes else true
-            val matchFolder = if (filters.sourceFolders.isNotEmpty()) item.sourceFolderUri in filters.sourceFolders else true
+            val matchFolder = if (filters.sourceFolders.isNotEmpty()) {
+                val matchesInApp = filters.sourceFolders.contains("IN_APP_STORAGE") && item.sourceFolderUri == null && item.uriString?.startsWith("opds-pse") != true
+                val matchesSynced = item.sourceFolderUri in filters.sourceFolders
+                matchesInApp || matchesSynced
+            } else true
             val progress = item.progressPercentage ?: 0f
             val matchStatus = when (filters.readStatus) {
                 ReadStatusFilter.ALL -> true
@@ -392,6 +476,11 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
             val unpinned = list.filter { it.bookId !in internalState.pinnedHomeBookIds }
             val combined = pinned + unpinned
             if (internalState.recentFilesLimit > 0) combined.take(internalState.recentFilesLimit) else combined
+        }
+
+        val allBaseFiles = recentFilesFromDb.filterNot { it.bookId.endsWith("_reflow") }
+        val openTabsList = internalState.openTabIds.mapNotNull { tabId ->
+            allBaseFiles.find { it.bookId == tabId }
         }
 
         val validContextualItems = internalState.contextualActionItems.filter { contextItem ->
@@ -433,13 +522,111 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
             rawLibraryFiles = baseVisibleFiles,
             contextualActionItems = validContextualItems,
             shelves = allShelves,
+            openTabs = openTabsList,
             booksAvailableForAdding = booksAvailableForAdding
         )
     }.stateIn(
         scope = viewModelScope,
         started = SharingStarted.WhileSubscribed(5000),
-        initialValue = ReaderScreenState()
+        initialValue = _internalState.value
     )
+
+    fun setTabsEnabled(enabled: Boolean) {
+        prefs.edit { putBoolean(KEY_TABS_ENABLED, enabled) }
+        _internalState.update { it.copy(isTabsEnabled = enabled) }
+        if (!enabled) {
+            val active = _internalState.value.activeTabBookId
+            val newTabs = if (active != null) listOf(active) else emptyList()
+            prefs.edit { putString(KEY_OPEN_TAB_IDS, JSONArray(newTabs).toString()) }
+            _internalState.update { it.copy(openTabIds = newTabs) }
+        }
+    }
+
+    fun switchTab(bookId: String) {
+        Timber.tag("PdfTabSync").i("ViewModel: switchTab called for bookId: $bookId")
+        val item = uiState.value.rawLibraryFiles.find { it.bookId == bookId } ?: run {
+            Timber.tag("PdfTabSync").e("ViewModel: switchTab FAILED - BookId $bookId not found in library")
+            return
+        }
+
+        val currentTabs = _internalState.value.openTabIds.toMutableList()
+        if (!currentTabs.contains(bookId)) {
+            if (currentTabs.size >= 20) {
+                viewModelScope.launch(Dispatchers.Main) {
+                    showBanner("Maximum of 20 tabs allowed. Please close a tab first.", isError = true)
+                }
+                return
+            }
+            currentTabs.add(bookId)
+        }
+
+        prefs.edit {
+            putString(KEY_ACTIVE_TAB, bookId)
+            putString(KEY_OPEN_TAB_IDS, JSONArray(currentTabs).toString())
+        }
+
+        val uri = item.getUri()
+        Timber.tag("PdfTabSync").d("ViewModel: ActiveTab updated to $bookId. URI found: ${uri != null}")
+
+        uri?.let {
+            Timber.tag("PdfTabSync").d("ViewModel: Setting new URI directly: $it")
+            _internalState.update { state ->
+                state.copy(
+                    openTabIds = currentTabs,
+                    activeTabBookId = bookId,
+                    selectedPdfUri = it,
+                    selectedBookId = bookId,
+                    selectedFileType = item.type,
+                    initialPageInBook = item.lastPage,
+                    initialBookmarksJson = item.bookmarksJson,
+                    isLoading = false,
+                    errorMessage = null
+                )
+            }
+
+            viewModelScope.launch {
+                addFileToRecent(
+                    it,
+                    item.type,
+                    bookId,
+                    customDisplayName = item.displayName,
+                    isRecent = true,
+                    sourceFolderUri = item.sourceFolderUri
+                )
+            }
+        } ?: run {
+            _internalState.update { it.copy(openTabIds = currentTabs, activeTabBookId = bookId) }
+        }
+    }
+
+    fun closeTab(bookId: String) {
+        Timber.tag("PdfTabSync").i("ViewModel: closeTab called for $bookId")
+        val currentTabs = _internalState.value.openTabIds.toMutableList()
+        currentTabs.remove(bookId)
+
+        if (currentTabs.isEmpty()) {
+            prefs.edit {
+                remove(KEY_OPEN_TAB_IDS)
+                remove(KEY_ACTIVE_TAB)
+            }
+            _internalState.update { it.copy(openTabIds = emptyList(), activeTabBookId = null) }
+            clearSelectedFile()
+        } else {
+            val activeTab = _internalState.value.activeTabBookId
+            if (activeTab == bookId) {
+                val nextTabId = currentTabs.last()
+                prefs.edit {
+                    putString(KEY_OPEN_TAB_IDS, JSONArray(currentTabs).toString())
+                    putString(KEY_ACTIVE_TAB, nextTabId)
+                }
+                _internalState.update { it.copy(openTabIds = currentTabs, activeTabBookId = nextTabId) }
+                switchTab(nextTabId)
+            } else {
+                prefs.edit { putString(KEY_OPEN_TAB_IDS, JSONArray(currentTabs).toString()) }
+                _internalState.update { it.copy(openTabIds = currentTabs) }
+            }
+        }
+    }
 
     fun onSearchQueryChange(newQuery: String) {
         _internalState.update {
@@ -494,7 +681,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                 }
                 recentFilesRepository.deleteFilePermanently(ids)
                 withContext(Dispatchers.Main) {
-                    showBanner("Removed ${filesToDelete.size} streaming books.")
+                    showBanner(appContext.getString(R.string.banner_removed_streaming_books, filesToDelete.size))
                 }
             }
         }
@@ -635,7 +822,9 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
 
     init {
         Timber.d("ViewModel instance created.")
-        PDFBoxResourceLoader.init(getApplication())
+        viewModelScope.launch(Dispatchers.IO) {
+            PDFBoxResourceLoader.init(getApplication())
+        }
         val currentOpenCount = prefs.getInt(KEY_APP_OPEN_COUNT, 0)
         prefs.edit { putInt(KEY_APP_OPEN_COUNT, currentOpenCount + 1) }
 
@@ -650,7 +839,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
         remoteConfigRepository.init()
 
         if (_internalState.value.syncedFolders.isNotEmpty()) {
-            syncFolderMetadata()
+            triggerFolderSyncWorker(metadataOnly = false, showFeedback = false)
         }
 
         sweepOrphanedCache()
@@ -674,9 +863,8 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                             _internalState.update { it.copy(hasUnreadFeedback = hasUnread) }
                         }
 
-                    userProfileListener =
-                        firestoreRepository.listenToUserProfile(newUserData.uid) { isProFromBackend ->
-                            _internalState.update { it.copy(isProUser = isProFromBackend) }
+                    userProfileListener = firestoreRepository.listenToUserProfile(newUserData.uid) { isProFromBackend, creditsFromBackend ->
+                        _internalState.update { it.copy(isProUser = isProFromBackend, credits = creditsFromBackend) }
 
                             if (isProFromBackend) {
                                 verifyDeviceForProUser()
@@ -697,12 +885,26 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                                     }
                                 }
                             }
-                            triggerLegacyPurchaseMigration()
                         }
                 } else {
-                    _internalState.update { it.copy(isProUser = false, hasUnreadFeedback = false) }
+                    _internalState.update { it.copy(isProUser = false, credits = 0, isSyncEnabled = false, hasUnreadFeedback = false) }
                 }
             }
+        }
+        viewModelScope.launch {
+            combine(
+                billingClientWrapper.proUpgradeState.map { it.activePurchases },
+                _internalState.map { it.currentUser?.uid }
+            ) { purchases, uid ->
+                Pair(purchases, uid)
+            }
+                .distinctUntilChanged()
+                .collect { (purchases, uid) ->
+                    if (uid != null && purchases.isNotEmpty()) {
+                        Timber.d("Active purchases or User changed, triggering migration check")
+                        triggerLegacyPurchaseMigration()
+                    }
+                }
         }
     }
 
@@ -806,7 +1008,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                     uploadNewFont(font)
                 }
             }.onFailure {
-                showBanner("Failed to import font: ${it.message}", isError = true)
+                showBanner(appContext.getString(R.string.error_import_font, it.message), isError = true)
             }
             _internalState.update { it.copy(isLoading = false) }
         }
@@ -848,7 +1050,6 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
 
             withContext(Dispatchers.Main) {
                 onDeleted()
-                showBanner("Text view deleted.")
             }
         }
     }
@@ -878,50 +1079,52 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
             it.copy(isRequestingDrivePermission = false, isSyncEnabled = false)
         }
         prefs.edit { putBoolean(KEY_SYNC_ENABLED, false) }
-        showBanner("Sync requires Google Drive permission.", isError = true)
+        showBanner(appContext.getString(R.string.error_sync_drive_permission), isError = true)
     }
 
     private fun verifyPurchaseWithBackend(
         purchase: PurchaseEntity, isSilentMigrationCheck: Boolean = false
     ) {
         viewModelScope.launch {
-            if (!purchase.products.contains(BillingClientWrapper.PRO_LIFETIME_PRODUCT_ID)) {
+            val productId = purchase.products.firstOrNull()
+
+            if (productId == null || (!productId.startsWith("credits_") && productId != BillingClientWrapper.PRO_LIFETIME_PRODUCT_ID)) {
                 Timber.e("Purchase verification failed: Incorrect product ID.")
                 if (!isSilentMigrationCheck) {
-                    _internalState.update {
-                        it.copy(
-                            bannerMessage = BannerMessage(
-                                "An error occurred with the purchase.", isError = true
-                            )
-                        )
-                    }
+                    _internalState.update { it.copy(bannerMessage = BannerMessage(appContext.getString(R.string.error_purchase_general), isError = true)) }
                 }
                 billingClientWrapper.clearVerificationState()
                 return@launch
             }
 
-            val result = cloudflareRepository.verifyPurchase(purchase.purchaseToken)
+            val result = cloudflareRepository.verifyPurchase(purchase.purchaseToken, productId)
 
             if (result.isSuccess) {
                 Timber.i("Backend verification successful. Firestore will update the app.")
-                _internalState.update {
-                    it.copy(bannerMessage = BannerMessage("Upgrade successful! Welcome to Pro."))
+
+                if (productId.startsWith("credits_")) {
+                    billingClientWrapper.consumePurchase(purchase.purchaseToken)
+                    if (!isSilentMigrationCheck) {
+                        _internalState.update { it.copy(bannerMessage = BannerMessage("Credits successfully added!")) }
+                    }
+                } else {
+                    if (!isSilentMigrationCheck) {
+                        _internalState.update { it.copy(bannerMessage = BannerMessage(appContext.getString(R.string.banner_upgrade_success))) }
+                    }
+                    verifyDeviceForProUser()
                 }
-                verifyDeviceForProUser()
             } else {
                 val exception = result.exceptionOrNull()
                 if (exception?.message?.contains("already claimed") == true) {
-                    Timber.i(
-                        "Migration check: Purchase token is already claimed by another account. Silently ignoring."
-                    )
+                    Timber.i("Migration/Refresh check: Purchase token is already claimed. Silently ignoring.")
+                    if (productId.startsWith("credits_")) {
+                        billingClientWrapper.consumePurchase(purchase.purchaseToken)
+                    }
                 } else {
-                    val errorMessage =
-                        "Purchase verification failed. Please contact support if you were charged."
+                    val errorMessage = appContext.getString(R.string.error_purchase_verification)
                     Timber.e(exception, "Backend verification failed")
                     if (!isSilentMigrationCheck) {
-                        _internalState.update {
-                            it.copy(bannerMessage = BannerMessage(errorMessage, isError = true))
-                        }
+                        _internalState.update { it.copy(bannerMessage = BannerMessage(errorMessage, isError = true)) }
                     }
                 }
             }
@@ -950,7 +1153,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                     Timber.w("Device has been revoked. Signing out.")
                     firestoreRepository.deleteDevice(currentUser.uid, deviceId) // Clean up
                     signOut()
-                    showBanner("This device was removed from your account.")
+                    showBanner(appContext.getString(R.string.banner_device_removed))
                 }
 
                 is com.aryan.reader.data.DeviceStatus.NotFound -> {
@@ -962,7 +1165,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                     Timber.e(deviceStatus.exception, "Error checking device status.")
                     _internalState.update {
                         it.copy(
-                            errorMessage = "Could not verify this device. Please check your connection."
+                            errorMessage = appContext.getString(R.string.error_verify_device)
                         )
                     }
                 }
@@ -998,15 +1201,13 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                 Timber.e("Failed to replace device.")
                 _internalState.update {
                     it.copy(
-                        errorMessage = "Failed to update devices. Please try again.",
+                        errorMessage = appContext.getString(R.string.error_update_devices),
                         isReplacingDevice = false
                     )
                 }
             }
         }
     }
-
-    private val pdfAnnotationRepository = PdfAnnotationRepository(appContext)
 
     private fun getFastFileId(context: Context, uri: Uri): String {
         var result = uri.toString()
@@ -1044,7 +1245,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
     ) {
         viewModelScope.launch {
             _internalState.update {
-                it.copy(isLoading = true, bannerMessage = BannerMessage("Saving PDF..."))
+                it.copy(isLoading = true, bannerMessage = BannerMessage(appContext.getString(R.string.banner_saving_pdf)))
             }
             try {
                 val virtualPages = pageLayoutRepository.getLayoutOrNull(bookId)
@@ -1060,13 +1261,13 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                         textBoxes = textBoxes,
                         highlights = highlights
                     )
-                    showBanner("PDF saved successfully.")
+                    showBanner(appContext.getString(R.string.banner_pdf_saved))
                 } else {
-                    showBanner("Failed to open file for saving.", isError = true)
+                    showBanner(appContext.getString(R.string.error_open_file_saving), isError = true)
                 }
             } catch (e: Exception) {
                 Timber.e(e, "Failed to save annotated PDF")
-                showBanner("Error saving PDF: ${e.localizedMessage}", isError = true)
+                showBanner(appContext.getString(R.string.error_saving_pdf, e.localizedMessage), isError = true)
             } finally {
                 _internalState.update { it.copy(isLoading = false) }
             }
@@ -1076,7 +1277,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
     fun saveOriginalPdf(sourceUri: Uri, destUri: Uri) {
         viewModelScope.launch {
             _internalState.update {
-                it.copy(isLoading = true, bannerMessage = BannerMessage("Saving original PDF..."))
+                it.copy(isLoading = true, bannerMessage = BannerMessage(appContext.getString(R.string.banner_saving_original_pdf)))
             }
             try {
                 val contentResolver = appContext.contentResolver
@@ -1085,10 +1286,10 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                         input.copyTo(output)
                     }
                 }
-                showBanner("Original PDF saved successfully.")
+                showBanner(appContext.getString(R.string.banner_original_pdf_saved))
             } catch (e: Exception) {
                 Timber.e(e, "Failed to save original PDF")
-                showBanner("Error saving PDF: ${e.localizedMessage}", isError = true)
+                showBanner(appContext.getString(R.string.error_saving_pdf, e.localizedMessage), isError = true)
             } finally {
                 _internalState.update { it.copy(isLoading = false) }
             }
@@ -1190,14 +1391,14 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                     putExtra(Intent.EXTRA_STREAM, contentUri)
 
                     putExtra(Intent.EXTRA_TITLE, filename)
-                    putExtra(Intent.EXTRA_SUBJECT, "Sharing: $filename")
+                    putExtra(Intent.EXTRA_SUBJECT, appContext.getString(R.string.share_subject, filename))
 
                     clipData = ClipData.newRawUri(filename, contentUri)
 
                     addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                 }
 
-                val chooser = Intent.createChooser(shareIntent, "Share PDF")
+                val chooser = Intent.createChooser(shareIntent, appContext.getString(R.string.share_chooser_title))
 
                 if (activityContext !is android.app.Activity) {
                     chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
@@ -1206,7 +1407,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                 withContext(Dispatchers.Main) { activityContext.startActivity(chooser) }
             } catch (e: Exception) {
                 Timber.e(e, "Share failed")
-                showBanner("Share failed: ${e.localizedMessage}", isError = true)
+                showBanner(appContext.getString(R.string.error_share_failed, e.localizedMessage), isError = true)
             }
         }
     }
@@ -1375,6 +1576,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
             }
         }
 
+        val closingBookId = _internalState.value.selectedBookId
         val uriString = _internalState.value.selectedPdfUri?.toString()
             ?: _internalState.value.selectedEpubUri?.toString()
 
@@ -1390,6 +1592,16 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                 initialLocator = null,
                 initialPageInBook = null
             )
+        }
+
+        if (closingBookId != null && closingBookId == externalOpenedBookId) {
+            val behavior = prefs.getString(KEY_EXTERNAL_FILE_BEHAVIOR, "ASK") ?: "ASK"
+            if (behavior == "ASK") {
+                _internalState.update { it.copy(showExternalFileSavePromptFor = closingBookId) }
+            } else if (behavior == "DELETE") {
+                deleteBookPermanently(closingBookId)
+            }
+            externalOpenedBookId = null
         }
 
         if (uriString != null) {
@@ -1507,12 +1719,12 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
         val currentFolders = _internalState.value.syncedFolders
 
         if (currentFolders.size >= MAX_FOLDER_LIMIT) {
-            showBanner("Limit reached: Maximum $MAX_FOLDER_LIMIT folders allowed.", isError = true)
+            showBanner(appContext.getString(R.string.error_folder_limit_reached, MAX_FOLDER_LIMIT), isError = true)
             return
         }
 
         if (currentFolders.any { it.uriString == folderUri.toString() }) {
-            showBanner("This folder is already synced.", isError = true)
+            showBanner(appContext.getString(R.string.error_folder_already_synced), isError = true)
             return
         }
 
@@ -1547,11 +1759,11 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                     FolderSyncWorker.WORK_NAME, ExistingPeriodicWorkPolicy.UPDATE, syncRequest
                 )
 
-                showBanner("Folder added: $name")
+                showBanner(appContext.getString(R.string.banner_folder_added, name))
 
             } catch (e: SecurityException) {
                 Timber.e(e, "Failed to take permissions for $folderUri")
-                showBanner("Failed to access folder permissions.", isError = true)
+                showBanner(appContext.getString(R.string.error_access_folder_permissions), isError = true)
             }
         }
     }
@@ -1581,7 +1793,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                 WorkManager.getInstance(appContext).cancelUniqueWork(FolderSyncWorker.WORK_NAME)
             }
 
-            showBanner("Folder removed.")
+            showBanner(appContext.getString(R.string.banner_folder_removed))
         }
     }
 
@@ -1616,8 +1828,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                     when (workInfo.state) {
                         WorkInfo.State.RUNNING, WorkInfo.State.ENQUEUED -> {
                             if (showFeedback) {
-                                val msg =
-                                    if (metadataOnly) "Folder Sync: Updating metadata..." else "Scanning folder for new books..."
+                                val msg = if (metadataOnly) appContext.getString(R.string.banner_folder_sync_updating) else appContext.getString(R.string.banner_folder_sync_scanning)
                                 _internalState.update {
                                     it.copy(
                                         isLoading = false,
@@ -1633,7 +1844,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                                 it.copy(
                                     isLoading = false,
                                     isRefreshing = false,
-                                    bannerMessage = if (showFeedback) BannerMessage("Folder Sync: Scan complete.") else it.bannerMessage,
+                                    bannerMessage = if (showFeedback) BannerMessage(appContext.getString(R.string.banner_folder_sync_complete)) else it.bannerMessage,
                                     lastFolderScanTime = System.currentTimeMillis(),
                                     syncedFolders = loadSyncedFoldersFromPrefs()
                                 )
@@ -1645,7 +1856,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                                 it.copy(
                                     isLoading = false,
                                     isRefreshing = false,
-                                    errorMessage = if (showFeedback) "Sync failed." else it.errorMessage,
+                                    errorMessage = if (showFeedback) appContext.getString(R.string.error_sync_failed) else it.errorMessage,
                                     bannerMessage = null
                                 )
                             }
@@ -1748,7 +1959,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
 
     private fun downloadBook(item: RecentFileItem, openWhenComplete: Boolean = false): Job {
         if (!uiState.value.isSyncEnabled) {
-            _internalState.update { it.copy(errorMessage = "Enable sync to download files.") }
+            _internalState.update { it.copy(errorMessage = appContext.getString(R.string.error_enable_sync_download)) }
             return viewModelScope.launch {}
         }
         if (uiState.value.downloadingBookIds.contains(item.bookId)) {
@@ -1800,7 +2011,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
             } catch (e: Exception) {
                 Timber.e(e, "Failed to download book ${item.bookId}")
                 _internalState.update {
-                    it.copy(errorMessage = "Failed to download ${item.displayName}.")
+                    it.copy(errorMessage = appContext.getString(R.string.error_download_failed, item.displayName))
                 }
             } finally {
                 _internalState.update { state ->
@@ -1812,13 +2023,13 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun deleteAllCloudAndLocalData() {
         if (!uiState.value.isSyncEnabled) {
-            _internalState.update { it.copy(errorMessage = "Enable sync to clear cloud data.") }
+            _internalState.update { it.copy(errorMessage = appContext.getString(R.string.error_enable_sync_clear_cloud)) }
             return
         }
 
         if (!googleDriveRepository.isUserSignedInToDrive(appContext)) {
             _internalState.update {
-                it.copy(errorMessage = "Not signed in, cannot clear cloud data.")
+                it.copy(errorMessage = appContext.getString(R.string.error_not_signed_in_clear_cloud))
             }
             return
         }
@@ -1826,7 +2037,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
         _internalState.update {
             it.copy(
                 isLoading = true,
-                bannerMessage = BannerMessage("Clearing all cloud and local data...")
+                bannerMessage = BannerMessage(appContext.getString(R.string.banner_clearing_cloud_local_data))
             )
         }
 
@@ -1855,9 +2066,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                 if (success) {
                     _internalState.update {
                         it.copy(
-                            isLoading = false, bannerMessage = BannerMessage(
-                                "All cloud and local data cleared successfully."
-                            )
+                            isLoading = false, bannerMessage = BannerMessage(appContext.getString(R.string.banner_cloud_local_data_cleared))
                         )
                     }
                 } else {
@@ -1866,7 +2075,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
             } catch (e: Exception) {
                 Timber.e(e, "Failed to delete all cloud and local user data.")
                 _internalState.update {
-                    it.copy(isLoading = false, errorMessage = "Error: Failed to clear all data.")
+                    it.copy(isLoading = false, errorMessage = appContext.getString(R.string.error_clear_all_data))
                 }
             }
         }
@@ -1874,27 +2083,14 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
 
     private fun triggerLegacyPurchaseMigration() {
         val user = _internalState.value.currentUser
-        val isProOnBackend = _internalState.value.isProUser
         val localPurchases = billingClientWrapper.proUpgradeState.value.activePurchases
 
-        val checkedUids = prefs.getStringSet(KEY_MIGRATION_CHECKED_UIDS, emptySet()) ?: emptySet()
-        if (user != null && user.uid in checkedUids) {
-            Timber.d(
-                "Migration check for user ${user.uid} already performed on this device. Skipping."
-            )
-            return // Already checked, do nothing.
-        }
+        if (user != null && localPurchases.isNotEmpty()) {
+            Timber.i("Checking for unconsumed purchases or legacy pro statuses...")
 
-        if (user != null && !isProOnBackend && localPurchases.isNotEmpty() && !migrationAttempted.value) {
-            migrationAttempted.value = true
-            Timber.i(
-                "MIGRATION: Found legacy user with local purchase. Verifying with backend silently..."
-            )
-            val purchaseToVerify = localPurchases.first()
-
-            verifyPurchaseWithBackend(purchaseToVerify, isSilentMigrationCheck = true)
-
-            prefs.edit { putStringSet(KEY_MIGRATION_CHECKED_UIDS, checkedUids + user.uid) }
+            localPurchases.forEach { purchase ->
+                verifyPurchaseWithBackend(purchase, isSilentMigrationCheck = true)
+            }
         }
     }
 
@@ -1913,13 +2109,13 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
 
                 _internalState.update {
                     it.copy(
-                        isLoading = false, bannerMessage = BannerMessage("All local data cleared.")
+                        isLoading = false, bannerMessage = BannerMessage(appContext.getString(R.string.banner_local_data_cleared))
                     )
                 }
             } catch (e: Exception) {
                 Timber.e(e, "Failed to delete all user data.")
                 _internalState.update {
-                    it.copy(isLoading = false, errorMessage = "Error: Failed to clear all data.")
+                    it.copy(isLoading = false, errorMessage = appContext.getString(R.string.error_clear_all_data))
                 }
             }
         }
@@ -1933,9 +2129,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                 if (user == null) {
                     _internalState.update {
                         it.copy(
-                            bannerMessage = BannerMessage(
-                                "Sign in failed. Please try again.", isError = true
-                            ), isLoading = false
+                            bannerMessage = BannerMessage(appContext.getString(R.string.error_sign_in_failed), isError = true), isLoading = false
                         )
                     }
                 } else {
@@ -1950,9 +2144,9 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
             } catch (e: Exception) {
                 Timber.e(e, "An unexpected error occurred during sign-in.")
                 val errorMessage = if (e is NoCredentialException) {
-                    "Could not find a Google account. This can happen on a fresh install, please try again in a moment."
+                    appContext.getString(R.string.error_no_google_account)
                 } else {
-                    "An error occurred during sign in. Please check your internet connection."
+                    appContext.getString(R.string.error_sign_in_internet)
                 }
                 _internalState.update {
                     it.copy(
@@ -2003,14 +2197,14 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                     )
                 }
             } ?: run {
-                showBanner("Please sign in to test device management.", isError = true)
+                showBanner(appContext.getString(R.string.error_sign_in_device_management), isError = true)
             }
         }
     }
 
-    fun launchPurchaseFlow(activity: android.app.Activity) {
-        Timber.d("Attempting to launch purchase flow. Pro state is: ${proUpgradeState.value}")
-        billingClientWrapper.launchPurchaseFlow(activity)
+    fun launchPurchaseFlow(activity: android.app.Activity, productId: String = BillingClientWrapper.PRO_LIFETIME_PRODUCT_ID) {
+        Timber.d("Attempting to launch purchase flow for $productId. Pro state is: ${proUpgradeState.value}")
+        billingClientWrapper.launchPurchaseFlow(activity, productId)
     }
 
     fun clearBillingError() {
@@ -2020,7 +2214,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
     fun setSyncEnabled(enabled: Boolean) {
         if (!uiState.value.isProUser) {
             Timber.d("Sync toggle blocked for free user.")
-            _internalState.update { it.copy(errorMessage = "Sync is an Episteme Pro feature.") }
+            _internalState.update { it.copy(errorMessage = appContext.getString(R.string.error_sync_pro_feature)) }
             return
         }
 
@@ -2054,14 +2248,14 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
 
         if (!hasPermissions || currentUser == null) {
             if (showBanner) _internalState.update {
-                it.copy(errorMessage = "Not signed in, cannot sync.")
+                it.copy(errorMessage = appContext.getString(R.string.error_not_signed_in_sync))
             }
             return@launch
         }
 
         if (showBanner) {
             _internalState.update {
-                it.copy(bannerMessage = BannerMessage("Cloud Sync: Checking for updates..."))
+                it.copy(bannerMessage = BannerMessage(appContext.getString(R.string.banner_cloud_sync_checking)))
             }
         }
 
@@ -2281,7 +2475,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
             if (showBanner) {
                 _internalState.update {
                     it.copy(
-                        isLoading = false, bannerMessage = BannerMessage("Cloud Sync: Complete.")
+                        isLoading = false, bannerMessage = BannerMessage(appContext.getString(R.string.banner_cloud_sync_complete))
                     )
                 }
             }
@@ -2289,7 +2483,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
             Timber.tag("AnnotationSync").e(e, "Error during cloud sync")
             if (showBanner) {
                 _internalState.update {
-                    it.copy(isLoading = false, errorMessage = "Failed to sync library.")
+                    it.copy(isLoading = false, errorMessage = appContext.getString(R.string.error_sync_library_failed))
                 }
             }
         }
@@ -2411,7 +2605,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
         var author: String? = null
         var bookForMetadata = epubBook
 
-        if (bookForMetadata == null && (type == FileType.EPUB || type == FileType.MOBI || type == FileType.FB2 || type == FileType.MD || type == FileType.TXT || type == FileType.HTML || type == FileType.DOCX)) {
+        if (bookForMetadata == null && (type == FileType.EPUB || type == FileType.MOBI || type == FileType.FB2 || type == FileType.MD || type == FileType.TXT || type == FileType.HTML || type == FileType.DOCX || type == FileType.ODT || type == FileType.FODT)) {
             Timber.d("Parsing downloaded book for cover/metadata: $displayName")
             Timber.tag("FileOpenPerf")
                 .d("[$bookId] addFileToRecent: Starting metadata parsing (no book provided)")
@@ -2445,6 +2639,15 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                                         parseContent = false
                                     )
                                 }
+                                FileType.ODT, FileType.FODT -> {
+                                    odtParser.createOdtBook(
+                                        inputStream = inputStream,
+                                        bookId = bookId,
+                                        originalBookNameHint = displayName,
+                                        isFlat = type == FileType.FODT,
+                                        parseContent = false
+                                    )
+                                }
                                 else -> {
                                     singleFileImporter.importSingleFile(
                                         inputStream,
@@ -2473,7 +2676,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
 
         val finalBookMetadata = bookForMetadata
 
-        if ((type == FileType.EPUB || type == FileType.MOBI || type == FileType.FB2 || type == FileType.MD || type == FileType.TXT || type == FileType.HTML || type == FileType.DOCX) && finalBookMetadata != null) {
+        if ((type == FileType.EPUB || type == FileType.MOBI || type == FileType.FB2 || type == FileType.MD || type == FileType.TXT || type == FileType.HTML || type == FileType.DOCX || type == FileType.ODT || type == FileType.FODT) && finalBookMetadata != null) {
             title =
                 finalBookMetadata.title.takeIf { it.isNotBlank() && it != "content" } ?: displayName
 
@@ -2488,6 +2691,28 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
             title = displayName
 
             if (type == FileType.PDF) {
+                try {
+                    val pdfiumCore = PdfiumCore(appContext)
+                    appContext.contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
+                        val pdfDocument = pdfiumCore.newDocument(pfd)
+                        val meta = pdfiumCore.getDocumentMeta(pdfDocument)
+
+                        val extractedTitle = meta.title
+                        if (!extractedTitle.isNullOrBlank()) {
+                            title = extractedTitle
+                        }
+
+                        val extractedAuthor = meta.author
+                        if (!extractedAuthor.isNullOrBlank()) {
+                            author = extractedAuthor
+                        }
+
+                        pdfiumCore.closeDocument(pdfDocument)
+                    }
+                } catch (e: Exception) {
+                    Timber.e(e, "Failed to extract PDF title using PdfiumCore")
+                }
+
                 val pdfCoverGenerator = PdfCoverGenerator(appContext)
                 val coverBitmap = pdfCoverGenerator.generateCover(uri)
                 if (coverBitmap != null) {
@@ -2651,26 +2876,85 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
         return fileName ?: uri.lastPathSegment
     }
 
-    fun onFileSelected(uri: Uri, isFromRecent: Boolean = false) {
+    fun onFilesSelected(uris: List<Uri>) {
+        if (uris.isEmpty()) return
+
+        if (uris.size == 1) {
+            onFileSelected(uris.first(), isFromRecent = false)
+            return
+        }
+
+        viewModelScope.launch {
+            _internalState.update {
+                it.copy(
+                    bannerMessage = BannerMessage(
+                        message = appContext.getString(R.string.banner_importing_multiple, uris.size),
+                        isPersistent = true
+                    ),
+                    contextualActionItems = emptySet()
+                )
+            }
+
+            var importedCount = 0
+
+            withContext(Dispatchers.IO) {
+                for (externalUri in uris) {
+                    val importResult = prepareBookForImport(externalUri)
+                    if (importResult != null) {
+                        val (internalUri, bookId, type) = importResult
+                        val displayName = getFileNameFromUri(externalUri, appContext) ?: "Unknown File"
+
+                        addFileToRecent(
+                            uri = internalUri,
+                            type = type,
+                            bookId = bookId,
+                            customDisplayName = displayName,
+                            isRecent = false,
+                            sourceFolderUri = null
+                        )
+                        importedCount++
+                    } else {
+                        val hash = FileHasher.calculateSha256 {
+                            appContext.contentResolver.openInputStream(externalUri)
+                        }
+                        if (hash != null && recentFilesRepository.getFileByBookId(hash) != null) {
+                            importedCount++
+                        }
+                    }
+                }
+            }
+
+            _internalState.update {
+                it.copy(
+                    bannerMessage = BannerMessage(
+                        message = "Imported $importedCount books. You can find them in the Library tab.",
+                        isPersistent = false
+                    )
+                )
+            }
+
+            Timber.tag("BulkImport").i("Bulk import complete. $importedCount files processed.")
+        }
+    }
+
+    fun onFileSelected(uri: Uri, isFromRecent: Boolean = false, isExternalIntent: Boolean = false) {
         if (isFromRecent) {
             Timber.i("Opening recent file: $uri")
-            // This path is now handled by onRecentFileClicked to preserve the bookId
-            // We find the book by URI to open it.
             viewModelScope.launch {
                 val item = recentFilesRepository.getFileByUri(uri.toString())
                 if (item != null) {
                     openBook(uri, item.bookId, item.type, item.displayName)
                 } else {
-                    _internalState.update { it.copy(errorMessage = "Could not find recent item.") }
+                    _internalState.update { it.copy(errorMessage = appContext.getString(R.string.error_recent_item_not_found)) }
                 }
             }
         } else {
             Timber.i("Importing new file: $uri")
-            importExternalFile(uri)
+            importExternalFile(uri, isExternalIntent)
         }
     }
 
-    private fun importExternalFile(externalUri: Uri) {
+    private fun importExternalFile(externalUri: Uri, isExternalIntent: Boolean = false) {
         _internalState.update {
             it.copy(isLoading = true, errorMessage = null, contextualActionItems = emptySet())
         }
@@ -2680,6 +2964,9 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
 
             if (importResult != null) {
                 val (internalUri, bookId, type) = importResult
+                if (isExternalIntent) {
+                    externalOpenedBookId = bookId
+                }
                 val displayName = getFileNameFromUri(externalUri, appContext) ?: "Unknown File"
                 openBook(
                     internalUri, bookId = bookId, type = type, originalDisplayName = displayName
@@ -2698,7 +2985,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                     }
                 }
                 _internalState.update {
-                    it.copy(isLoading = false, errorMessage = "Failed to import file.")
+                    it.copy(isLoading = false, errorMessage = appContext.getString(R.string.error_import_file_failed))
                 }
             }
         }
@@ -2736,7 +3023,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
             val uri = item.getUri() ?: run {
                 _internalState.update {
                     it.copy(
-                        isLoading = false, errorMessage = "Could not find file location."
+                        isLoading = false, errorMessage = appContext.getString(R.string.error_file_location_not_found)
                     )
                 }
                 stateUpdateDeferred.complete(false)
@@ -2822,7 +3109,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                     _internalState.update {
                         it.copy(
                             isLoading = false,
-                            errorMessage = "Failed to load generated text view.",
+                            errorMessage = appContext.getString(R.string.error_load_generated_text_view),
                             selectedFileType = null
                         )
                     }
@@ -2884,10 +3171,10 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                             if (newItem != null) {
                                 switchToFileSeamlessly(newItem, autoOpenPage)
                             } else {
-                                showBanner("Failed to load generated text view.", true)
+                                showBanner(appContext.getString(R.string.error_load_generated_text_view), true)
                             }
                         } else {
-                            showBanner("Text view generation failed.", true)
+                            showBanner(appContext.getString(R.string.error_text_view_generation_failed), true)
                         }
                     }
                 }
@@ -2914,11 +3201,29 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     private fun openBook(
-        uri: Uri, bookId: String, type: FileType, originalDisplayName: String? = null
+        uri: Uri, bookId: String, type: FileType, originalDisplayName: String? = null, suppressNavigation: Boolean = false
     ) {
         val openBookStartTime = System.currentTimeMillis()
         Timber.tag("FileOpenPerf")
             .d("[$bookId] openBook START | type=$type | displayName=$originalDisplayName")
+
+        if (_internalState.value.isTabsEnabled && type == FileType.PDF) {
+            val currentTabs = _internalState.value.openTabIds.toMutableList()
+            if (!currentTabs.contains(bookId)) {
+                if (currentTabs.size >= 20) {
+                    viewModelScope.launch(Dispatchers.Main) {
+                        showBanner("Maximum of 20 tabs allowed. Please close a tab first.", isError = true)
+                    }
+                    return
+                }
+                currentTabs.add(bookId)
+            }
+            prefs.edit {
+                putString(KEY_OPEN_TAB_IDS, JSONArray(currentTabs).toString())
+                putString(KEY_ACTIVE_TAB, bookId)
+            }
+            _internalState.update { it.copy(openTabIds = currentTabs, activeTabBookId = bookId) }
+        }
 
         if (uri.scheme != "opds-pse") {
             try {
@@ -2990,8 +3295,15 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                         isRecent = true,
                         sourceFolderUri = null
                     )
+
+                    if (!suppressNavigation) {
+                        Timber.tag("FileSwitch").d("PDF state updated, emitting navigation event")
+                        _navigationEvent.send(NavigationEvent("pdf_viewer", bookId, uri))
+                    } else {
+                        Timber.tag("FileSwitch").d("PDF state updated, suppressing navigation event for smooth transition")
+                    }
                 }
-            } else if (type == FileType.EPUB || type == FileType.MOBI || type == FileType.FB2 || type == FileType.MD || type == FileType.TXT || type == FileType.HTML || type == FileType.DOCX) {
+            } else if (type == FileType.EPUB || type == FileType.MOBI || type == FileType.FB2 || type == FileType.MD || type == FileType.TXT || type == FileType.HTML || type == FileType.DOCX || type == FileType.ODT || type == FileType.FODT) {
                 viewModelScope.launch {
                     val recentItem = recentFilesRepository.getFileByBookId(bookId)
                     if (recentItem?.sourceFolderUri != null) {
@@ -3022,6 +3334,11 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                         )
                     }
 
+                    if (!suppressNavigation) {
+                        Timber.tag("FileSwitch").d("EPUB state updated, emitting navigation event")
+                        _navigationEvent.send(NavigationEvent("epub_reader", bookId, uri))
+                    }
+
                     when (type) {
                         FileType.EPUB -> {
                             loadEpub(uri, bookId, customDisplayName = originalDisplayName)
@@ -3034,7 +3351,9 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                         FileType.FB2 -> {
                             loadFb2(uri, bookId, customDisplayName = originalDisplayName)
                         }
-
+                        FileType.ODT, FileType.FODT -> {
+                            loadOdt(uri, bookId, type == FileType.FODT, customDisplayName = originalDisplayName)
+                        }
                         else -> {
                             loadSingleFile(
                                 uri, bookId, type, customDisplayName = originalDisplayName
@@ -3076,7 +3395,44 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
             } catch (e: Exception) {
                 Timber.e(e, "Error parsing FB2 for URI: $uri")
                 _internalState.update {
-                    it.copy(errorMessage = "Failed to load FB2: ${e.message}", isLoading = false)
+                    it.copy(errorMessage = appContext.getString(R.string.error_load_fb2, e.message), isLoading = false)
+                }
+            }
+        }
+    }
+
+    private fun loadOdt(uri: Uri, bookId: String, isFlat: Boolean, customDisplayName: String? = null) {
+        val loadStart = System.currentTimeMillis()
+        Timber.tag("FileOpenPerf").d("[$bookId] loadOdt START | isFlat=$isFlat")
+        viewModelScope.launch {
+            if (!_internalState.value.isLoading) {
+                _internalState.update { it.copy(isLoading = true, errorMessage = null) }
+            }
+            Timber.d("Starting ODT parsing for URI: $uri")
+            try {
+                val odtBook = withContext(Dispatchers.IO) {
+                    appContext.contentResolver.openInputStream(uri).use { inputStream ->
+                        if (inputStream == null) throw Exception("Could not open input stream")
+                        odtParser.createOdtBook(
+                            inputStream = inputStream,
+                            bookId = bookId,
+                            originalBookNameHint = customDisplayName ?: getFileNameFromUri(uri, appContext) ?: if (isFlat) "unknown.fodt" else "unknown.odt",
+                            isFlat = isFlat
+                        )
+                    }
+                }
+                Timber.i("ODT parsing successful. Title: ${odtBook.title}")
+                Timber.tag("FileOpenPerf").d("[$bookId] loadOdt completed | chapters=${odtBook.chapters.size} | elapsed=${System.currentTimeMillis() - loadStart}ms")
+
+                addFileToRecent(
+                    uri, if (isFlat) FileType.FODT else FileType.ODT, bookId, odtBook, customDisplayName, isRecent = true, sourceFolderUri = null
+                )
+
+                _internalState.update { it.copy(selectedEpubBook = odtBook, isLoading = false) }
+            } catch (e: Exception) {
+                Timber.e(e, "Error parsing ODT for URI: $uri")
+                _internalState.update {
+                    it.copy(errorMessage = appContext.getString(R.string.error_load_file, e.message), isLoading = false)
                 }
             }
         }
@@ -3131,7 +3487,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
             } catch (e: Exception) {
                 Timber.e(e, "Error parsing file ($type) for URI: $uri")
                 _internalState.update {
-                    it.copy(errorMessage = "Failed to load file: ${e.message}", isLoading = false)
+                    it.copy(errorMessage = appContext.getString(R.string.error_load_file, e.message), isLoading = false)
                 }
             }
         }
@@ -3149,6 +3505,8 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
         Timber.d("Determining type for: $uri | Mime: $mimeType | Name: $fileName")
 
         return when (mimeType) {
+            "application/vnd.oasis.opendocument.text" -> FileType.ODT
+            "application/x-vnd.oasis.opendocument.text-flat-xml" -> FileType.FODT
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document" -> FileType.DOCX
             "application/zip", "application/vnd.comicbook+zip", "application/x-cbz" -> {
                 if (fileName?.endsWith(".cbz", ignoreCase = true) == true) FileType.CBZ else null
@@ -3165,13 +3523,26 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
             "application/x-mobipocket-ebook", "application/vnd.amazon.ebook", "application/vnd.amazon.mobi8-ebook" -> FileType.MOBI
             "text/markdown", "text/x-markdown" -> FileType.MD
             "text/html", "application/xhtml+xml" -> FileType.HTML
+
+            "text/csv", "text/comma-separated-values", "text/tab-separated-values",
+            "application/json", "application/xml", "text/xml",
+            "text/x-java-source", "text/x-python", "text/x-kotlin",
+            "text/javascript", "application/javascript",
+            "text/x-c", "text/x-c++", "text/x-csharp", "text/x-ruby", "text/x-go", "text/x-log" -> FileType.HTML
+
             "text/plain" -> {
-                if (fileName?.endsWith(
-                        ".md",
-                        ignoreCase = true
-                    ) == true || fileName?.endsWith(".markdown", ignoreCase = true) == true
-                ) {
+                if (fileName?.endsWith(".md", ignoreCase = true) == true || fileName?.endsWith(".markdown", ignoreCase = true) == true) {
                     FileType.MD
+                } else if (fileName?.let {
+                        it.endsWith(".csv", ignoreCase = true) || it.endsWith(".tsv", ignoreCase = true) ||
+                                it.endsWith(".json", ignoreCase = true) || it.endsWith(".xml", ignoreCase = true) ||
+                                it.endsWith(".log", ignoreCase = true) || it.endsWith(".java", ignoreCase = true) ||
+                                it.endsWith(".kt", ignoreCase = true) || it.endsWith(".py", ignoreCase = true) ||
+                                it.endsWith(".js", ignoreCase = true) || it.endsWith(".cpp", ignoreCase = true) ||
+                                it.endsWith(".c", ignoreCase = true) || it.endsWith(".cs", ignoreCase = true) ||
+                                it.endsWith(".rb", ignoreCase = true) || it.endsWith(".go", ignoreCase = true)
+                    } == true) {
+                    FileType.HTML
                 } else {
                     FileType.TXT
                 }
@@ -3222,6 +3593,22 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                         ignoreCase = true
                     ) == true -> FileType.HTML
                     fileName?.endsWith(".docx", ignoreCase = true) == true -> FileType.DOCX
+                    fileName?.endsWith(".odt", ignoreCase = true) == true -> FileType.ODT
+                    fileName?.endsWith(".fodt", ignoreCase = true) == true -> FileType.FODT
+                    fileName?.endsWith(".csv", ignoreCase = true) == true ||
+                    fileName?.endsWith(".tsv", ignoreCase = true) == true ||
+                    fileName?.endsWith(".json", ignoreCase = true) == true ||
+                    fileName?.endsWith(".xml", ignoreCase = true) == true ||
+                    fileName?.endsWith(".log", ignoreCase = true) == true ||
+                    fileName?.endsWith(".java", ignoreCase = true) == true ||
+                    fileName?.endsWith(".kt", ignoreCase = true) == true ||
+                    fileName?.endsWith(".py", ignoreCase = true) == true ||
+                    fileName?.endsWith(".js", ignoreCase = true) == true ||
+                    fileName?.endsWith(".cpp", ignoreCase = true) == true ||
+                    fileName?.endsWith(".c", ignoreCase = true) == true ||
+                    fileName?.endsWith(".cs", ignoreCase = true) == true ||
+                    fileName?.endsWith(".rb", ignoreCase = true) == true ||
+                    fileName?.endsWith(".go", ignoreCase = true) == true -> FileType.HTML
 
                     else -> null
                 }
@@ -3271,7 +3658,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
             } catch (e: Exception) {
                 Timber.e(e, "Error parsing MOBI for URI: $uri")
                 _internalState.update {
-                    it.copy(errorMessage = "Failed to load MOBI: ${e.message}", isLoading = false)
+                    it.copy(errorMessage = appContext.getString(R.string.error_load_mobi, e.message), isLoading = false)
                 }
             }
         }
@@ -3318,7 +3705,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
             } catch (e: Exception) {
                 Timber.e(e, "Error parsing EPUB for URI: $uri")
                 _internalState.update {
-                    it.copy(errorMessage = "Failed to load EPUB: ${e.message}", isLoading = false)
+                    it.copy(errorMessage = appContext.getString(R.string.error_load_epub, e.message), isLoading = false)
                 }
             }
         }
@@ -3454,7 +3841,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                         Timber.tag("FolderSync")
                             .i("LazyCleanup: File ${item.displayName} missing. Removing.")
                         recentFilesRepository.deleteFilePermanently(listOf(item.bookId))
-                        showBanner("File deleted from folder. Removed from library.")
+                        showBanner(appContext.getString(R.string.banner_file_deleted_from_folder))
                         return@launch
                     }
 
@@ -3463,7 +3850,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                         item.getUri()?.let { uri ->
                             openBook(uri, item.bookId, item.type, item.displayName)
                         } ?: run {
-                            _internalState.update { it.copy(errorMessage = "Could not find file location.") }
+                            _internalState.update { it.copy(errorMessage = appContext.getString(R.string.error_file_location_not_found)) }
                         }
                     } else {
                         downloadBook(item, openWhenComplete = true)
@@ -3477,7 +3864,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                 item.getUri()?.let { uri ->
                     openBook(uri, item.bookId, item.type, item.displayName)
                 } ?: run {
-                    _internalState.update { it.copy(errorMessage = "Could not find file location.") }
+                    _internalState.update { it.copy(errorMessage = appContext.getString(R.string.error_file_location_not_found)) }
                     return
                 }
             } else {
@@ -3538,12 +3925,25 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun selectAllRecentFiles() {
-        val recentFilesForHome = uiState.value.recentFiles.filter { it.isRecent }
-        _internalState.update { it.copy(contextualActionItems = recentFilesForHome.toSet()) }
+        val currentVisible = uiState.value.recentFiles.filter { it.isRecent }.toSet()
+        _internalState.update { state ->
+            if (state.contextualActionItems.containsAll(currentVisible) && currentVisible.isNotEmpty()) {
+                state.copy(contextualActionItems = emptySet())
+            } else {
+                state.copy(contextualActionItems = currentVisible)
+            }
+        }
     }
 
     fun selectAllLibraryFiles() {
-        _internalState.update { it.copy(contextualActionItems = uiState.value.recentFiles.toSet()) }
+        val currentVisible = uiState.value.allRecentFiles.toSet()
+        _internalState.update { state ->
+            if (state.contextualActionItems.containsAll(currentVisible) && currentVisible.isNotEmpty()) {
+                state.copy(contextualActionItems = emptySet())
+            } else {
+                state.copy(contextualActionItems = currentVisible)
+            }
+        }
     }
 
     fun clearContextualAction() {
@@ -3555,6 +3955,21 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun showCreateShelfDialog() {
         _internalState.update { it.copy(showCreateShelfDialog = true) }
+    }
+
+    fun handleExternalFilePrompt(bookId: String, keep: Boolean, dontAskAgain: Boolean) {
+        if (dontAskAgain) {
+            val newBehavior = if (keep) "KEEP" else "DELETE"
+            setExternalFileBehavior(newBehavior)
+        }
+        if (!keep) {
+            deleteBookPermanently(bookId)
+        }
+        _internalState.update { it.copy(showExternalFileSavePromptFor = null) }
+    }
+    fun setExternalFileBehavior(behavior: String) {
+        prefs.edit { putString(KEY_EXTERNAL_FILE_BEHAVIOR, behavior) }
+        _internalState.update { it.copy(externalFileBehavior = behavior) }
     }
 
     fun dismissCreateShelfDialog() {
@@ -3618,7 +4033,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
         if (newName in currentShelves) {
             Timber.w("Cannot rename shelf. A shelf with the name '$newName' already exists.")
             _internalState.update {
-                it.copy(errorMessage = "A shelf with that name already exists.")
+                it.copy(errorMessage = appContext.getString(R.string.error_shelf_exists))
             }
             dismissRenameShelfDialog()
             return
@@ -3938,7 +4353,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                             _internalState.update {
                                 it.copy(
                                     isLoading = true,
-                                    bannerMessage = BannerMessage("Deleting from all devices...")
+                                    bannerMessage = BannerMessage(appContext.getString(R.string.banner_deleting_all_devices))
                                 )
                             }
                             try {
@@ -3974,7 +4389,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                                 _internalState.update {
                                     it.copy(
                                         isLoading = false,
-                                        bannerMessage = BannerMessage("Deletion complete.")
+                                        bannerMessage = BannerMessage(appContext.getString(R.string.banner_deletion_complete))
                                     )
                                 }
                             } catch (e: Exception) {
@@ -3986,7 +4401,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                                 _internalState.update {
                                     it.copy(
                                         isLoading = false,
-                                        errorMessage = "Cloud sync failed, deleted locally."
+                                        errorMessage = appContext.getString(R.string.error_cloud_sync_failed_deleted_locally)
                                     )
                                 }
                             }
@@ -4003,7 +4418,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
                 _internalState.update {
                     it.copy(
                         isLoading = false,
-                        bannerMessage = BannerMessage("$totalRemoved book(s) removed from library.")
+                        bannerMessage = BannerMessage(appContext.resources.getQuantityString(R.plurals.banner_books_removed_library, totalRemoved, totalRemoved))
                     )
                 }
             }
@@ -4021,6 +4436,8 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
         super.onCleared()
         prefs.unregisterOnSharedPreferenceChangeListener(prefsListener)
         firestoreRepository.removeListener(feedbackListener)
+        panelDetector?.close()
+        panelDetector = null
         Timber.d("ViewModel instance cleared (onCleared).")
     }
 
@@ -4118,7 +4535,7 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
             }
 
             withContext(Dispatchers.Main) {
-                showBanner("Reflow cache & generated text views cleared.")
+                showBanner(appContext.getString(R.string.banner_reflow_cache_cleared))
             }
         }
     }
@@ -4143,6 +4560,199 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    fun closeAllTabs() {
+        Timber.tag("PdfTabSync").i("ViewModel: closeAllTabs called")
+        prefs.edit {
+            remove(KEY_OPEN_TAB_IDS)
+            remove(KEY_ACTIVE_TAB)
+        }
+        _internalState.update { it.copy(openTabIds = emptyList(), activeTabBookId = null) }
+        clearSelectedFile()
+    }
+
+    fun setStrictFileFilter(enabled: Boolean) {
+        prefs.edit { putBoolean(KEY_USE_STRICT_FILE_FILTER, enabled) }
+        _internalState.update { it.copy(useStrictFileFilter = enabled) }
+    }
+
+    private fun loadCustomAppThemes(prefs: SharedPreferences): List<CustomAppTheme> {
+        val jsonString = prefs.getString(KEY_CUSTOM_APP_THEMES, "[]") ?: "[]"
+        val themes = mutableListOf<CustomAppTheme>()
+        try {
+            val jsonArray = JSONArray(jsonString)
+            for (i in 0 until jsonArray.length()) {
+                val obj = jsonArray.getJSONObject(i)
+                themes.add(
+                    CustomAppTheme(
+                        id = obj.getString("id"),
+                        name = obj.getString("name"),
+                        seedColor = androidx.compose.ui.graphics.Color(obj.getInt("seedColor"))
+                    )
+                )
+            }
+        } catch (e: Exception) {
+            Timber.e(e, "Failed to parse custom app themes")
+        }
+        return themes
+    }
+
+    fun setAppThemeMode(mode: AppThemeMode) {
+        _internalState.update { it.copy(appThemeMode = mode) }
+        prefs.edit { putString(KEY_APP_THEME_MODE, mode.name) }
+    }
+
+    fun setAppContrastOption(option: AppContrastOption) {
+        _internalState.update { it.copy(appContrastOption = option) }
+        prefs.edit { putString(KEY_APP_CONTRAST_OPTION, option.name) }
+    }
+
+    fun setAppTextDimFactor(factor: Float) {
+        _internalState.update { it.copy(appTextDimFactor = factor) }
+        prefs.edit { putFloat(KEY_APP_TEXT_DIM_FACTOR, factor) }
+    }
+
+    fun setAppSeedColor(color: androidx.compose.ui.graphics.Color?) {
+        _internalState.update { it.copy(appSeedColor = color) }
+        prefs.edit {
+            if (color == null) {
+                remove(KEY_APP_SEED_COLOR)
+            } else {
+                putInt(KEY_APP_SEED_COLOR, (color).toArgb())
+            }
+        }
+    }
+
+    fun addCustomAppTheme(theme: CustomAppTheme) {
+        val current = _internalState.value.customAppThemes.filter { it.id != theme.id } + theme
+        _internalState.update { it.copy(customAppThemes = current) }
+        saveCustomAppThemes(current)
+        setAppSeedColor(theme.seedColor)
+    }
+
+    fun deleteCustomAppTheme(themeId: String) {
+        val current = _internalState.value.customAppThemes.filter { it.id != themeId }
+        _internalState.update { it.copy(customAppThemes = current) }
+        saveCustomAppThemes(current)
+        if (_internalState.value.appSeedColor != null && !current.any { it.seedColor == _internalState.value.appSeedColor }) {
+            setAppSeedColor(null)
+        }
+    }
+
+    private fun saveCustomAppThemes(themes: List<CustomAppTheme>) {
+        val jsonArray = JSONArray()
+        themes.forEach { theme ->
+            val obj = JSONObject().apply {
+                put("id", theme.id)
+                put("name", theme.name)
+                put("seedColor", (theme.seedColor).toArgb())
+            }
+            jsonArray.put(obj)
+        }
+        prefs.edit { putString(KEY_CUSTOM_APP_THEMES, jsonArray.toString()) }
+    }
+
+    suspend fun getAuthToken(): String? {
+        return authRepository.getIdToken()
+    }
+
+    fun testPanelDetection(context: Context) {
+        viewModelScope.launch(mlDispatcher) {
+            try {
+                val modelFile = File(context.getExternalFilesDir(null), "best_float16.tflite")
+                if (!modelFile.exists()) {
+                    withContext(Dispatchers.Main) { showBanner("Model not found", isError = true) }
+                    return@launch
+                }
+
+                val cbzItem = uiState.value.contextualActionItems.firstOrNull { it.type == FileType.CBZ }
+                    ?: uiState.value.allRecentFiles.firstOrNull { it.type == FileType.CBZ }
+
+                if (cbzItem == null) {
+                    withContext(Dispatchers.Main) { showBanner("No CBZ found in Library.", isError = true) }
+                    return@launch
+                }
+
+                val uri = cbzItem.getUri() ?: return@launch
+                Timber.d("BATCH TEST START: ${cbzItem.displayName}")
+
+                var cacheFile: File? = null
+                try {
+                    val detector = getOrInitDetector(context) ?: run {
+                        withContext(Dispatchers.Main) { showBanner("Model could not be loaded", isError = true) }
+                        return@launch
+                    }
+                    cacheFile = File(context.cacheDir, "temp_test_batch.cbz")
+                    context.contentResolver.openInputStream(uri)?.use { input ->
+                        cacheFile.outputStream().use { output -> input.copyTo(output) }
+                    }
+
+                    // 1. Initialize Model Once
+                    val initStartTime = System.currentTimeMillis()
+                    val initDuration = System.currentTimeMillis() - initStartTime
+                    Timber.d(">>> [BATCH] Model Initialization: ${initDuration}ms")
+
+                    val archiveDoc = com.aryan.reader.pdf.ArchiveDocumentWrapper(cacheFile)
+                    val totalPages = archiveDoc.getPageCount()
+
+                    val startIndex = 3
+                    val numPagesToTest = 10
+                    val endIndex = minOf(startIndex + numPagesToTest - 1, totalPages - 1)
+
+                    val resultsLog = StringBuilder()
+                    resultsLog.append("Batch Results:\n")
+
+                    // 2. Loop through pages
+                    for (i in startIndex..endIndex) {
+                        val page = archiveDoc.openPage(i)
+                        if (page != null) {
+                            val w = page.getPageWidthPoint()
+                            val h = page.getPageHeightPoint()
+                            if (w > 0 && h > 0) {
+                                val bitmap = androidx.core.graphics.createBitmap(w, h)
+                                page.renderPageBitmap(bitmap, 0, 0, w, h, false)
+
+                                // Measure precise inference time
+                                val pageStartTime = System.currentTimeMillis()
+                                val panels = detector.detectPanels(bitmap)
+                                val pageDuration = System.currentTimeMillis() - pageStartTime
+
+                                val logLine = "Page $i: ${pageDuration}ms (Found ${panels.size} panels)"
+                                Timber.d(">>>[BATCH] $logLine")
+                                resultsLog.append("$logLine\n")
+                                bitmap.recycle()
+                                delay(20)
+                            }
+                            page.close()
+                        }
+                    }
+                    archiveDoc.close()
+
+                    withContext(Dispatchers.Main) {
+                        Timber.i(resultsLog.toString())
+                        showBanner("Batch test complete! Check logs for page-by-page timings.")
+                    }
+
+                } finally {
+                    cacheFile?.delete()
+                }
+            } catch (e: Exception) {
+                Timber.e(e, "Batch test failed")
+            }
+        }
+    }
+
+    suspend fun detectComicPanels(bitmap: Bitmap, context: Context): List<android.graphics.RectF> {
+        return withContext(mlDispatcher) {
+            try {
+                val detector = getOrInitDetector(context)
+                detector?.detectPanels(bitmap) ?: emptyList()
+            } catch (e: Exception) {
+                Timber.e(e, "Error during panel detection")
+                emptyList()
+            }
+        }
+    }
+
     companion object {
         private const val KEY_SORT_ORDER = "sort_order"
         internal const val KEY_SHELVES = "shelf_names"
@@ -4152,15 +4762,39 @@ open class MainViewModel(application: Application) : AndroidViewModel(applicatio
         private const val KEY_ADD_BOOKS_SOURCE = "add_books_source"
         private const val KEY_SYNC_ENABLED = "sync_enabled"
         private const val KEY_LAST_SYNC_TIMESTAMP = "last_sync_timestamp"
-        private const val KEY_MIGRATION_CHECKED_UIDS = "migration_checked_uids"
         private const val KEY_INSTALLATION_ID = "installation_id"
         private const val KEY_APP_OPEN_COUNT = "app_open_count"
         internal const val KEY_SYNCED_FOLDER_URI = "synced_folder_uri"
         internal const val KEY_LAST_FOLDER_SCAN_TIME = "last_folder_scan_time"
         private const val KEY_SYNCED_FOLDERS_JSON = "synced_folders_list_json"
-        private const val MAX_FOLDER_LIMIT = 3
+        private const val MAX_FOLDER_LIMIT = 10
         internal const val KEY_PINNED_HOME = "pinned_home_books"
         internal const val KEY_PINNED_LIBRARY = "pinned_library_books"
         private const val KEY_RECENT_FILES_LIMIT = "recent_files_limit"
+        private const val KEY_TABS_ENABLED = "tabs_enabled"
+        private const val KEY_OPEN_TAB_IDS = "open_tab_ids"
+        private const val KEY_ACTIVE_TAB = "active_tab_book_id"
+        private const val KEY_EXTERNAL_FILE_BEHAVIOR = "external_file_behavior"
+        private const val KEY_USE_STRICT_FILE_FILTER = "use_strict_file_filter"
+        private const val KEY_APP_THEME_MODE = "app_theme_mode"
+        private const val KEY_APP_CONTRAST_OPTION = "app_contrast_option"
+        private const val KEY_APP_SEED_COLOR = "app_seed_color"
+        private const val KEY_APP_TEXT_DIM_FACTOR = "app_text_dim_factor"
+        private const val KEY_CUSTOM_APP_THEMES = "custom_app_themes"
+
+        val SUPPORTED_MIME_TYPES = arrayOf(
+            "application/pdf", "application/epub+zip", "application/x-mobipocket-ebook",
+            "application/vnd.amazon.ebook", "application/vnd.amazon.mobi8-ebook", "text/markdown",
+            "text/x-markdown", "text/plain", "text/html", "application/xhtml+xml",
+            "application/x-fictionbook+xml", "application/x-zip-compressed-fb2", "application/zip",
+            "application/vnd.comicbook+zip", "application/x-cbz", "application/vnd.comicbook-rar",
+            "application/x-cbr", "application/x-rar-compressed", "application/x-cb7",
+            "application/x-7z-compressed", "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "application/vnd.oasis.opendocument.text", "application/x-vnd.oasis.opendocument.text-flat-xml",
+            "text/csv", "text/comma-separated-values", "text/tab-separated-values", "application/json",
+            "application/xml", "text/xml", "text/x-java-source", "text/x-python", "text/x-kotlin",
+            "text/javascript", "application/javascript", "text/x-c", "text/x-c++",
+            "text/x-csharp", "text/x-ruby", "text/x-go", "text/x-log"
+        )
     }
 }

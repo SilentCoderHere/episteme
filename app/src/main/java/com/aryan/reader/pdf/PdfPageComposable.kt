@@ -93,6 +93,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalViewConfiguration
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -120,10 +121,13 @@ import com.aryan.reader.pdf.data.VirtualPage
 import com.aryan.reader.pdf.ocr.OcrElement
 import com.aryan.reader.pdf.ocr.OcrResult
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.conflate
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -169,7 +173,7 @@ data class EmbeddedAnnotation(
 
 data class PdfPoint(val x: Float, val y: Float, val timestamp: Long = 0L)
 
-data class PdfTile(val bitmap: Bitmap, val renderRect: Rect, val tileId: Int)
+data class PdfTile(val bitmap: Bitmap, val renderRect: Rect, val tileId: Int, val renderScale: Float = 1f)
 
 enum class LinkSource {
     ANNOTATION, TEXT_CONTENT
@@ -343,7 +347,9 @@ data class PageStaticData(
     val targetWidth: Int,
     val targetHeight: Int,
     val colorFilter: StableHolder<ColorFilter?>,
-    val isDarkMode: Boolean
+    val isDarkMode: Boolean,
+    val excludeImages: Boolean,
+    val imageRects: StableHolder<List<android.graphics.Rect>>
 )
 
 @Stable
@@ -368,8 +374,10 @@ data class PageSelectionData(
     val selectionHighlightColor: Color,
     val pageIndex: Int,
     val userHighlightScreenRects: StableHolder<List<Pair<PdfUserHighlight, List<Rect>>>>,
+    val customHighlightColors: StableHolder<Map<PdfHighlightColor, Color>>
 )
 
+@OptIn(FlowPreview::class)
 @Suppress("unused")
 @Composable
 internal fun PdfPageComposable(
@@ -410,6 +418,7 @@ internal fun PdfPageComposable(
     onTtsHighlightCenterCalculated: ((Float) -> Unit)? = null,
     onSearchHighlightCenterCalculated: ((Float) -> Unit)? = null,
     activeTheme: com.aryan.reader.ReaderTheme = com.aryan.reader.ReaderTheme("no_theme", "No Theme", Color.Unspecified, Color.Unspecified, false),
+    excludeImages: Boolean = false,
     onDoubleTap: ((Offset) -> Unit)? = null,
     isEditMode: Boolean = false,
     drawingState: PdfDrawingState? = null,
@@ -431,14 +440,23 @@ internal fun PdfPageComposable(
     draggingBoxId: String? = null,
     isScrollLocked: Boolean = false,
     isVisible: Boolean = true,
+    isActivePage: Boolean = true,
     isStylusOnlyMode: Boolean = false,
+    isAutoScrollPlaying: Boolean = false,
     isHighlighterSnapEnabled: Boolean = false,
     userHighlights: List<PdfUserHighlight> = emptyList(),
     onHighlightAdd: (Int, Pair<Int, Int>, String, PdfHighlightColor) -> Unit = { _,_,_,_ -> },
     onHighlightUpdate: (String, PdfHighlightColor) -> Unit = { _,_ -> },
     onHighlightDelete: (String) -> Unit = {},
+    onNoteRequested: (String?) -> Unit = {},
     onTts: (Int, Int) -> Unit = { _, _ -> },
-    activeToolThickness: Float = 0f
+    activeToolThickness: Float = 0f,
+    customHighlightColors: Map<PdfHighlightColor, Color> = emptyMap(),
+    onPaletteClick: (() -> Unit)? = null,
+    lockedState: Triple<Float, Float, Float>? = null,
+    onZoomAndPanChanged: ((Float, Offset) -> Unit)? = null,
+    onDetectPanels: suspend (Bitmap) -> List<android.graphics.RectF> = { emptyList() },
+    onShowPanelPopup: (Bitmap) -> Unit = {}
 ) {
     val pdfDocumentItem = pdfDocument.item
     var bitmapState by remember { mutableStateOf(PdfThumbnailCache.get(pageIndex)) }
@@ -469,6 +487,10 @@ internal fun PdfPageComposable(
     var isTransforming by remember { mutableStateOf(false) }
     var scale by remember { mutableFloatStateOf(1f) }
     var offset by remember { mutableStateOf(Offset.Zero) }
+
+    LaunchedEffect(scale, offset) {
+        onZoomAndPanChanged?.invoke(scale, offset)
+    }
 
     val currentOnSingleTap by rememberUpdatedState(onSingleTap)
     val currentOnDoubleTap by rememberUpdatedState(onDoubleTap)
@@ -716,12 +738,6 @@ internal fun PdfPageComposable(
         }
     }
 
-    LaunchedEffect(pageIndex) {
-        scale = 1f
-        offset = Offset.Zero
-        onScaleChanged(1f)
-    }
-
     LaunchedEffect(isPerformingOcrForSelection) { onOcrStateChange(isPerformingOcrForSelection) }
 
     LaunchedEffect(
@@ -841,11 +857,13 @@ internal fun PdfPageComposable(
 
     @Suppress("VariableNeverRead") var embeddedAnnotations by remember { mutableStateOf<List<EmbeddedAnnotation>>(emptyList()) }
     var standardAnnotScreenRects by remember { mutableStateOf<List<Pair<EmbeddedAnnotation, Rect>>>(emptyList()) }
+    var imageScreenRects by remember { mutableStateOf<List<android.graphics.Rect>>(emptyList()) }
 
     LaunchedEffect(pageIndex, pdfDocumentItem, actualBitmapWidthPx, actualBitmapHeightPx, virtualPage) {
         if (!isPdfPage || actualBitmapWidthPx == 0 || actualBitmapHeightPx == 0) {
             if (pageLinks.isNotEmpty()) pageLinks = emptyList()
             if (standardAnnotScreenRects.isNotEmpty()) standardAnnotScreenRects = emptyList()
+            if (imageScreenRects.isNotEmpty()) imageScreenRects = emptyList()
             return@LaunchedEffect
         }
 
@@ -853,6 +871,7 @@ internal fun PdfPageComposable(
             val allLinks = mutableListOf<PageLink>()
             var finalDisplayList = emptyList<EmbeddedAnnotation>()
             var mappedAnnots = emptyList<Pair<EmbeddedAnnotation, Rect>>()
+            var mappedImageRects = emptyList<android.graphics.Rect>()
             val annotLink = 2
 
             try {
@@ -918,6 +937,39 @@ internal fun PdfPageComposable(
                         }
                     } catch (e: Exception) {
                         Timber.e(e, "Error fetching web links")
+                    }
+
+                    // --- Extract Image Bounds ---
+                    try {
+                        val pagePtr = pageWrapper.getNativePointer()
+                        if (pagePtr != 0L) {
+                            val objCount = NativePdfiumBridge.getPageObjectCount(pagePtr)
+                            val imgRects = mutableListOf<android.graphics.Rect>()
+                            val outRect = FloatArray(4)
+
+                            for (i in 0 until objCount) {
+                                if (NativePdfiumBridge.getPageObjectType(pagePtr, i) == 3) { // 3 = FPDF_PAGEOBJ_IMAGE
+                                    if (NativePdfiumBridge.getPageObjectBoundingBox(pagePtr, i, outRect)) {
+                                        val pdfRectF = android.graphics.RectF(
+                                            min(outRect[0], outRect[2]),
+                                            max(outRect[1], outRect[3]),
+                                            max(outRect[0], outRect[2]),
+                                            min(outRect[1], outRect[3])
+                                        )
+                                        val deviceRect = pageWrapper.mapRectToDevice(
+                                            0, 0, actualBitmapWidthPx, actualBitmapHeightPx,
+                                            currentPageRotation, pdfRectF
+                                        )
+                                        if (deviceRect.width() > 0 && deviceRect.height() > 0) {
+                                            imgRects.add(android.graphics.Rect(deviceRect.left, deviceRect.top, deviceRect.right, deviceRect.bottom))
+                                        }
+                                    }
+                                }
+                            }
+                            mappedImageRects = imgRects
+                        }
+                    } catch (e: Exception) {
+                        Timber.tag("PdfImageDebug").e(e, "Error extracting image rects")
                     }
 
                     // 3. Extract Embedded Annotations
@@ -1024,6 +1076,7 @@ internal fun PdfPageComposable(
                 pageLinks = allLinks
                 embeddedAnnotations = finalDisplayList
                 standardAnnotScreenRects = mappedAnnots
+                imageScreenRects = mappedImageRects
             }
         }
     }
@@ -1063,9 +1116,11 @@ internal fun PdfPageComposable(
         canvasHeightPx.floatValue,
         isVerticalScroll,
         isScrolling,
-        virtualPage
+        isAutoScrollPlaying,
+        virtualPage,
+        isActivePage
     ) {
-        val needsTiling = effectiveScale > 1f || actualBitmapWidthPx > 3000 || actualBitmapHeightPx > 3000
+        val needsTiling = (effectiveScale > 1f || actualBitmapWidthPx > 3000 || actualBitmapHeightPx > 3000) && (isVerticalScroll || isActivePage)
         if (!needsTiling) {
             if (tiles.isNotEmpty()) {
                 val oldTiles = tiles
@@ -1098,13 +1153,28 @@ internal fun PdfPageComposable(
         try {
             page = withContext(Dispatchers.IO) { pdfDocumentItem.openPage(pdfPageIndex) }
 
-            snapshotFlow { visibleScreenRect() }.collectLatest { currentVisibleRect ->
+            snapshotFlow {
+                val rect = visibleScreenRect()
+                if (rect == null) null
+                else {
+                    val qTop = rect.top / (tileSizePx / 2)
+                    val qLeft = rect.left / (tileSizePx / 2)
+                    val qBottom = rect.bottom / (tileSizePx / 2)
+                    val qRight = rect.right / (tileSizePx / 2)
+                    listOf(qTop, qLeft, qBottom, qRight)
+                }
+            }.conflate().collectLatest { _ ->
+
+                delay(150)
+
                 val tileCalcStart = System.nanoTime()
                 if (!isActive) return@collectLatest
 
                 if (isScrolling && effectiveScale > 1f) {
                     return@collectLatest
                 }
+
+                val currentVisibleRect = visibleScreenRect()
 
                 val pxTl: Float
                 val pxBr: Float
@@ -1131,14 +1201,10 @@ internal fun PdfPageComposable(
                     val pivotX = screenWidth / 2f
                     val pivotY = screenHeight / 2f
 
-                    pxTl =
-                        (((0 - effectiveOffset.x) - pivotX) / effectiveScale + pivotX) - centeringOffsetX
-                    pyTl =
-                        (((0 - effectiveOffset.y) - pivotY) / effectiveScale + pivotY) - centeringOffsetY
-                    pxBr =
-                        (((screenWidth - effectiveOffset.x) - pivotX) / effectiveScale + pivotX) - centeringOffsetX
-                    pyBr =
-                        (((screenHeight - effectiveOffset.y) - pivotY) / effectiveScale + pivotY) - centeringOffsetY
+                    pxTl = (((0 - effectiveOffset.x) - pivotX) / effectiveScale + pivotX) - centeringOffsetX
+                    pyTl = (((0 - effectiveOffset.y) - pivotY) / effectiveScale + pivotY) - centeringOffsetY
+                    pxBr = (((screenWidth - effectiveOffset.x) - pivotX) / effectiveScale + pivotX) - centeringOffsetX
+                    pyBr = (((screenHeight - effectiveOffset.y) - pivotY) / effectiveScale + pivotY) - centeringOffsetY
                 }
 
                 val visibleBitmapRect = Rect(pxTl.toInt(), pyTl.toInt(), pxBr.toInt(), pyBr.toInt())
@@ -1148,13 +1214,11 @@ internal fun PdfPageComposable(
                 val requiredTileIds = mutableSetOf<Int>()
                 val cols = (actualBitmapWidthPx + tileSizePx - 1) / tileSizePx
                 val startCol = (visibleBitmapRect.left / tileSizePx).coerceAtLeast(0)
-                val endCol =
-                    ((visibleBitmapRect.right + tileSizePx - 1) / tileSizePx).coerceAtMost(cols)
+                val endCol = ((visibleBitmapRect.right + tileSizePx - 1) / tileSizePx).coerceAtMost(cols)
                 val startRow = (visibleBitmapRect.top / tileSizePx).coerceAtLeast(0)
-                val endRow =
-                    ((visibleBitmapRect.bottom + tileSizePx - 1) / tileSizePx).coerceAtMost(
-                        (actualBitmapHeightPx + tileSizePx - 1) / tileSizePx
-                    )
+                val endRow = ((visibleBitmapRect.bottom + tileSizePx - 1) / tileSizePx).coerceAtMost(
+                    (actualBitmapHeightPx + tileSizePx - 1) / tileSizePx
+                )
 
                 for (row in startRow until endRow) {
                     for (col in startCol until endCol) {
@@ -1164,6 +1228,9 @@ internal fun PdfPageComposable(
 
                 val currentTileIds = tiles.map { it.tileId }.toSet()
 
+                val scaleTolerance = 0.05f
+                val validCurrentTileIds = tiles.filter { abs(it.renderScale - effectiveScale) <= scaleTolerance }.map { it.tileId }.toSet()
+
                 val duration = (System.nanoTime() - tileCalcStart) / 1_000_000f
                 if (duration > 2f) {
                     Timber.tag("PdfPerformance").d(
@@ -1171,9 +1238,9 @@ internal fun PdfPageComposable(
                     )
                 }
 
-                if (requiredTileIds != currentTileIds) {
+                if (requiredTileIds != validCurrentTileIds) {
 
-                    val tilesToRenderIds = requiredTileIds - currentTileIds
+                    val tilesToRenderIds = requiredTileIds - validCurrentTileIds
                     val tilesToRecycleIds = currentTileIds - requiredTileIds
 
                     if (tilesToRecycleIds.isNotEmpty()) {
@@ -1199,15 +1266,12 @@ internal fun PdfPageComposable(
                                     (col + 1) * tileSizePx,
                                     (row + 1) * tileSizePx
                                 )
-                                val tileRenderSize =
-                                    (tileSizePx * effectiveScale).toInt().coerceAtLeast(1)
+                                val tileRenderSize = (tileSizePx * effectiveScale).toInt().coerceAtLeast(1)
 
                                 val tileBitmap = PdfBitmapPool.get(tileRenderSize)
 
-                                val fullPageRenderWidth =
-                                    (actualBitmapWidthPx * effectiveScale).toInt()
-                                val fullPageRenderHeight =
-                                    (actualBitmapHeightPx * effectiveScale).toInt()
+                                val fullPageRenderWidth = (actualBitmapWidthPx * effectiveScale).toInt()
+                                val fullPageRenderHeight = (actualBitmapHeightPx * effectiveScale).toInt()
                                 val tileRenderX = (col * tileSizePx * effectiveScale).toInt()
                                 val tileRenderY = (row * tileSizePx * effectiveScale).toInt()
 
@@ -1220,12 +1284,19 @@ internal fun PdfPageComposable(
                                     renderAnnot = true
                                 )
 
-                                val newTile = PdfTile(tileBitmap, tileRect, tileId)
+                                val newTile = PdfTile(tileBitmap, tileRect, tileId, effectiveScale)
                                 var handedOver = false
                                 try {
                                     withContext(Dispatchers.Main) {
-                                        tiles = tiles + newTile
+                                        val oldTile = tiles.find { it.tileId == tileId }
+                                        tiles = tiles.filter { it.tileId != tileId } + newTile
                                         handedOver = true
+
+                                        oldTile?.let {
+                                            coroutineScope.launch(Dispatchers.IO) {
+                                                PdfBitmapPool.recycle(it.bitmap)
+                                            }
+                                        }
                                     }
                                 } finally {
                                     if (!handedOver) {
@@ -1574,6 +1645,10 @@ internal fun PdfPageComposable(
             }
         }
     }
+
+    val errorSelection = stringResource(R.string.error_selection)
+    val errorOcrSelection = stringResource(R.string.error_ocr_selection)
+    val errorProcessingPage = stringResource(R.string.error_processing_page)
 
     BoxWithConstraints(
         modifier = modifier
@@ -2345,8 +2420,7 @@ internal fun PdfPageComposable(
                                             Timber.e(
                                                 e, "Long press: Error during OCR text selection"
                                             )
-                                            pageErrorMessage =
-                                                "OCR selection error: ${e.localizedMessage}"
+                                            pageErrorMessage = errorOcrSelection
                                         } finally {
                                             isPerformingOcrForSelection = false
                                             ocrRipplePosition = null
@@ -2367,7 +2441,7 @@ internal fun PdfPageComposable(
                                         e,
                                         "Error during long press text selection on page $pageIndex"
                                     )
-                                    pageErrorMessage = "Selection error: ${e.localizedMessage}"
+                                    pageErrorMessage = errorSelection
                                     customMenuState = null
                                     selectionCharRange.value = null
                                     selectedWordScreenRects = emptyList()
@@ -2427,14 +2501,14 @@ internal fun PdfPageComposable(
                     val tapYInBitmap = tapInContentCoords.y
 
                     coroutineScope.launch {
-                        val wasHandled = withContext(Dispatchers.IO) {
+                        val nativeResult = withContext(Dispatchers.IO) {
                             try {
                                 pdfDocumentItem.openPage(pdfPageIndex)?.use { page ->
                                     val pagePtr = page.getNativePointer()
 
                                     if (pagePtr == 0L) {
                                         Timber.tag("PdfInteraction").e("Could not find native pointer for page $pdfPageIndex")
-                                        return@withContext false
+                                        return@withContext 0
                                     }
 
                                     val pdfCoords = page.mapDeviceCoordsToPage(
@@ -2442,134 +2516,141 @@ internal fun PdfPageComposable(
                                         currentPageRotation, tapInContentCoords.x.toInt(), tapInContentCoords.y.toInt()
                                     )
 
-                                    NativePdfiumBridge.performClick(pagePtr, pdfCoords.x.toDouble(), pdfCoords.y.toDouble())
-                                } ?: false
+                                    val docPtr = try {
+                                        val pdfDocKt = (pdfDocumentItem as? PdfDocumentWrapper)?.pdfDocument
+                                        if (pdfDocKt != null) {
+                                            val documentField = pdfDocKt.javaClass.getDeclaredField("document").apply { isAccessible = true }
+                                            val docUInstance = documentField.get(pdfDocKt)
+                                            if (docUInstance != null) {
+                                                val ptrField = docUInstance.javaClass.getDeclaredField("mNativeDocPtr").apply { isAccessible = true }
+                                                ptrField.get(docUInstance) as Long
+                                            } else 0L
+                                        } else 0L
+                                    } catch (e: Exception) { 0L }
+
+                                    Timber.tag("PdfLinkDiagnostic").i("Extracted docPtr: $docPtr | pagePtr: $pagePtr")
+
+                                    val linkInfo = NativePdfiumBridge.getLinkInfoAtPoint(
+                                        docPtr, pagePtr, pdfCoords.x.toDouble(), pdfCoords.y.toDouble()
+                                    )
+
+                                    if (linkInfo != null) {
+                                        Timber.tag("PdfLinkDiagnostic").i(">>> Native Link Info Extracted: $linkInfo")
+                                        if (linkInfo.startsWith("URI:")) {
+                                            val url = linkInfo.substringAfter("URI:")
+                                            withContext(Dispatchers.Main) { onLinkClicked(url) }
+                                            return@withContext 1
+                                        } else if (linkInfo.startsWith("PAGE:")) {
+                                            val targetPage = linkInfo.substringAfter("PAGE:").toIntOrNull()
+                                            if (targetPage != null && targetPage >= 0) {
+                                                withContext(Dispatchers.Main) { onInternalLinkClicked(targetPage) }
+                                                return@withContext 1
+                                            }
+                                        }
+                                    }
+
+                                    val clickHandled = NativePdfiumBridge.performClick(pagePtr, pdfCoords.x.toDouble(), pdfCoords.y.toDouble())
+                                    if (clickHandled) {
+                                        return@withContext 2
+                                    }
+                                    return@withContext 0
+                                } ?: 0
                             } catch (e: Exception) {
                                 Timber.tag("PdfInteraction").e(e, "Interaction error")
-                                false
+                                0
                             }
                         }
 
-                        if (wasHandled) {
+                        if (nativeResult == 2) {
                             Timber.tag("PdfInteraction").i("Action detected. Refreshing page.")
                             tiles = emptyList()
                             bitmapState = null
                             isLoadingPage = true
                             currentRenderedPageId = "ACTION_${System.currentTimeMillis()}"
+                            return@launch
+                        } else if (nativeResult == 1) {
+                            return@launch
                         }
-                    }
 
-                    val annotHitTolerance = with(density) { 24.dp.toPx() } / inputScale
-                    val hitTolerance = with(density) { 16.dp.toPx() } / inputScale
+                        val annotHitTolerance = with(density) { 24.dp.toPx() } / inputScale
+                        val hitTolerance = with(density) { 16.dp.toPx() } / inputScale
 
-                    Timber.d(
-                        "detectTapGestures: Tap at bitmap coords (${tapXInBitmap.toInt()}, ${tapYInBitmap.toInt()})"
-                    )
+                        Timber.d("detectTapGestures: Tap at bitmap coords (${tapXInBitmap.toInt()}, ${tapYInBitmap.toInt()})")
 
-                    var tappedRect: Rect? = null
-                    val hitHighlightPair = userHighlightScreenRects.findLast { pair ->
-                        val hit = pair.second.find { r ->
-                            val hitLeft = r.left - hitTolerance
-                            val hitTop = r.top - hitTolerance
-                            val hitRight = r.right + hitTolerance
-                            val hitBottom = r.bottom + hitTolerance
+                        var tappedRect: Rect? = null
+                        val hitHighlightPair = userHighlightScreenRects.findLast { pair ->
+                            val hit = pair.second.find { r ->
+                                val hitLeft = r.left - hitTolerance
+                                val hitTop = r.top - hitTolerance
+                                val hitRight = r.right + hitTolerance
+                                val hitBottom = r.bottom + hitTolerance
 
-                            tapXInBitmap in hitLeft..hitRight &&
-                                    tapYInBitmap >= hitTop && tapYInBitmap <= hitBottom
+                                tapXInBitmap in hitLeft..hitRight && tapYInBitmap >= hitTop && tapYInBitmap <= hitBottom
+                            }
+                            if (hit != null) {
+                                tappedRect = hit
+                                true
+                            } else false
                         }
-                        if (hit != null) {
-                            tappedRect = hit
-                            true
-                        } else false
-                    }
 
-                    val standardHit = standardAnnotScreenRects.findLast { (annot, screenRect) ->
-                        if (annot.subtype == 2) return@findLast false
+                        val standardHit = standardAnnotScreenRects.findLast { (annot, screenRect) ->
+                            if (annot.subtype == 2) return@findLast false
 
-                        val left = min(screenRect.left, screenRect.right)
-                        val right = max(screenRect.left, screenRect.right)
-                        val top = min(screenRect.top, screenRect.bottom)
-                        val bottom = max(screenRect.top, screenRect.bottom)
+                            val left = min(screenRect.left, screenRect.right)
+                            val right = max(screenRect.left, screenRect.right)
+                            val top = min(screenRect.top, screenRect.bottom)
+                            val bottom = max(screenRect.top, screenRect.bottom)
 
-                        val inflatedHitBox = Rect(
-                            (left - annotHitTolerance).toInt(),
-                            (top - annotHitTolerance).toInt(),
-                            (right + annotHitTolerance).toInt(),
-                            (bottom + annotHitTolerance).toInt()
-                        )
+                            val inflatedHitBox = Rect(
+                                (left - annotHitTolerance).toInt(),
+                                (top - annotHitTolerance).toInt(),
+                                (right + annotHitTolerance).toInt(),
+                                (bottom + annotHitTolerance).toInt()
+                            )
 
-                        val isHit = inflatedHitBox.contains(tapInContentCoords.x.toInt(), tapInContentCoords.y.toInt())
-
-                        isHit
-                    }
-
-                    if (standardHit != null) {
-                        val (annot, screenRect) = standardHit
-                        customMenuState = CustomPdfMenuState(
-                            selectedText = annot.contents ?: "No comment",
-                            anchorRect = screenRect,
-                            charRange = Pair(-1, -1),
-                            isComment = true,
-                            author = annot.author,
-                            annotation = annot
-                        )
-                        return@detectTapGestures
-                    }
-
-                    if (hitHighlightPair != null && tappedRect != null) {
-                        val hitHighlight = hitHighlightPair.first
-
-                        val combinedRect = Rect(hitHighlightPair.second.first())
-                        hitHighlightPair.second.forEach { combinedRect.union(it) }
-
-                        customMenuState = CustomPdfMenuState(
-                            selectedText = hitHighlight.text,
-                            anchorRect = combinedRect,
-                            charRange = hitHighlight.range,
-                            isExistingHighlight = true,
-                            highlightId = hitHighlight.id
-                        )
-                        return@detectTapGestures
-                    }
-
-                    Timber.d(
-                        "detectTapGestures: Tap at bitmap coords (${tapXInBitmap.toInt()}, ${tapYInBitmap.toInt()})"
-                    )
-
-                    val clickedLink = pageLinks.firstOrNull { link ->
-                        link.tapBounds.contains(
-                            tapXInBitmap.toInt(), tapYInBitmap.toInt()
-                        )
-                    }
-
-                    if (clickedLink != null) {
-                        Timber.d(
-                            "PdfPageComposable: Link clicked. Ignoring selection logic."
-                        )
-                        if (clickedLink.destPageIdx != null && clickedLink.destPageIdx >= 0) {
-                            onInternalLinkClicked(clickedLink.destPageIdx)
-                        } else if (clickedLink.url != null) {
-                            onLinkClicked(clickedLink.url)
+                            inflatedHitBox.contains(tapInContentCoords.x.toInt(), tapInContentCoords.y.toInt())
                         }
-                        return@detectTapGestures
-                    }
 
-                    val wasMenuVisible = customMenuState != null
-                    val wasSelectionVisible =
-                        selectionCharRange.value != null || ocrSelectionSymbolIndices != null
+                        if (standardHit != null) {
+                            val (annot, screenRect) = standardHit
+                            customMenuState = CustomPdfMenuState(
+                                selectedText = annot.contents ?: "No comment",
+                                anchorRect = screenRect,
+                                charRange = Pair(-1, -1),
+                                isComment = true,
+                                author = annot.author,
+                                annotation = annot
+                            )
+                            return@launch
+                        }
 
-                    Timber.d(
-                        "PdfPageComposable: State check - MenuVisible=$wasMenuVisible, SelectionVisible=$wasSelectionVisible"
-                    )
+                        if (hitHighlightPair != null && tappedRect != null) {
+                            val hitHighlight = hitHighlightPair.first
+                            onNoteRequested(hitHighlight.id)
+                            return@launch
+                        }
 
-                    if (wasMenuVisible || wasSelectionVisible) {
-                        Timber.d(
-                            "PdfPageComposable: Clearing selection/menu."
-                        )
-                        customMenuState = null
-                        selectionCharRange.value = null
-                        ocrSelectionSymbolIndices = null
-                        coroutineScope.launch {
+                        val clickedLink = pageLinks.firstOrNull { link ->
+                            link.tapBounds.contains(tapXInBitmap.toInt(), tapYInBitmap.toInt())
+                        }
+
+                        if (clickedLink != null) {
+                            Timber.d("PdfPageComposable: Fallback pageLinks intercepted click.")
+                            if (clickedLink.destPageIdx != null && clickedLink.destPageIdx >= 0) {
+                                onInternalLinkClicked(clickedLink.destPageIdx)
+                            } else if (clickedLink.url != null) {
+                                onLinkClicked(clickedLink.url)
+                            }
+                            return@launch
+                        }
+
+                        val wasMenuVisible = customMenuState != null
+                        val wasSelectionVisible = selectionCharRange.value != null || ocrSelectionSymbolIndices != null
+
+                        if (wasMenuVisible || wasSelectionVisible) {
+                            customMenuState = null
+                            selectionCharRange.value = null
+                            ocrSelectionSymbolIndices = null
                             updateSelectionVisuals(
                                 pdfDocumentItem,
                                 pdfPageIndex,
@@ -2578,20 +2659,48 @@ internal fun PdfPageComposable(
                                 actualBitmapHeightPx,
                                 currentPageRotation,
                             )
+                        } else {
+                            currentOnSingleTap()
                         }
-                    } else {
-                        Timber.d(
-                            "PdfPageComposable: No selection active. Calling onSingleTap()."
-                        )
-                        currentOnSingleTap()
                     }
                 }, onDoubleTap = { tapOffset ->
-                    if (isZoomEnabled && !isVerticalScroll) {
+                    if (isZoomEnabled && !isVerticalScroll && !isScrollLocked) {
                         if (actualBitmapWidthPx == 0) return@detectTapGestures
                         coroutineScope.launch {
                             val startScale = scale
                             val targetScale = if (startScale > 1.1f) 1f else 2.5f
-                            Timber.tag("PdfZoomDebug").i("DoubleTap Triggered: CurrentScale=$startScale, Target=$targetScale")
+
+                            if (com.aryan.reader.BuildConfig.DEBUG && startScale <= 1.1f && bitmapState != null) {
+                                val tapInContentCoords = screenToContentCoordinates(tapOffset)
+
+                                val ratioX = bitmapState!!.width.toFloat() / actualBitmapWidthPx.toFloat()
+                                val ratioY = bitmapState!!.height.toFloat() / actualBitmapHeightPx.toFloat()
+                                val tapXInBitmap = tapInContentCoords.x * ratioX
+                                val tapYInBitmap = tapInContentCoords.y * ratioY
+
+                                val panels = onDetectPanels(bitmapState!!)
+
+                                val tappedPanel = panels.firstOrNull {
+                                    it.contains(tapXInBitmap, tapYInBitmap)
+                                }
+
+                                if (tappedPanel != null) {
+                                    Timber.d("Popup: Cropping panel $tappedPanel")
+                                    val left = tappedPanel.left.coerceAtLeast(0f).toInt()
+                                    val top = tappedPanel.top.coerceAtLeast(0f).toInt()
+                                    val right = tappedPanel.right.coerceAtMost(bitmapState!!.width.toFloat()).toInt()
+                                    val bottom = tappedPanel.bottom.coerceAtMost(bitmapState!!.height.toFloat()).toInt()
+                                    val width = right - left
+                                    val height = bottom - top
+
+                                    if (width > 0 && height > 0) {
+                                        val cropped = android.graphics.Bitmap.createBitmap(bitmapState!!, left, top, width, height)
+                                        onShowPanelPopup(cropped)
+                                        return@launch
+                                    }
+                                }
+                            }
+
                             val startOffset = offset
                             val targetOffsetUnbounded = if (targetScale <= 1.1f) {
                                 Offset.Zero
@@ -2622,10 +2731,10 @@ internal fun PdfPageComposable(
                                 )
                             ) {
                                 val progress = value
-                                scale = lerp(
+                                scale = androidx.compose.ui.util.lerp(
                                     startScale, targetScale, progress
                                 )
-                                offset = lerp(
+                                offset = androidx.compose.ui.geometry.lerp(
                                     startOffset, targetOffset, progress
                                 )
                                 onScaleChanged(scale)
@@ -2681,7 +2790,11 @@ internal fun PdfPageComposable(
 
                         if (!canceled) {
                             val rawPanChange = event.calculatePan()
-                            val panChange = if (isScrollLocked) Offset(0f, rawPanChange.y) else rawPanChange
+                            val panChange = if (isScrollLocked && pointerCount == 1) {
+                                if (isVerticalScroll) Offset(0f, rawPanChange.y) else Offset.Zero
+                            } else {
+                                rawPanChange
+                            }
                             val zoomChange = event.calculateZoom()
 
                             if (scale > 1f) {
@@ -2732,6 +2845,7 @@ internal fun PdfPageComposable(
                                 } else if (mode == 2 && pointerCount > 1) {
                                     val oldScale = scale
                                     val newScale = (scale * zoomChange).coerceIn(1f, 4f)
+                                    Timber.tag("PdfZoomIssue").v("Gesture Scaling: old=$oldScale, new=$newScale, zoomChange=$zoomChange")
 
                                     val previousCentroid = event.calculateCentroid(useCurrent = false)
                                     if (previousCentroid != Offset.Unspecified) {
@@ -3104,14 +3218,21 @@ internal fun PdfPageComposable(
         }
 
         LaunchedEffect(
-            this@BoxWithConstraints.maxWidth, this@BoxWithConstraints.maxHeight
+            pageIndex, this@BoxWithConstraints.maxWidth, this@BoxWithConstraints.maxHeight,
+            isScrollLocked, lockedState
         ) {
-            scale = 1f
-            offset = Offset.Zero
-            onScaleChanged(1f)
+            if (isScrollLocked && !isVerticalScroll && lockedState != null) {
+                scale = lockedState.first
+                offset = Offset(lockedState.second, lockedState.third)
+                onScaleChanged(scale)
+            } else if (!isScrollLocked && !isVerticalScroll) {
+                scale = 1f
+                offset = Offset.Zero
+                onScaleChanged(1f)
+            }
 
             Timber.d(
-                "PdfPageComposable Page $pageIndex | Constraints: maxWidth=${this@BoxWithConstraints.maxWidth}, maxHeight=${this@BoxWithConstraints.maxHeight}"
+                "PdfPageComposable Page $pageIndex initialized/resized/locked. scale=$scale, offset=$offset"
             )
         }
 
@@ -3307,8 +3428,12 @@ internal fun PdfPageComposable(
                     currentPageRotation = 0
 
                     val MAX_BASE_DIMEN = 3000
-                    var baseW = scaledWidth
-                    var baseH = scaledHeight
+
+                    val baseRenderScale = 1.5f
+
+                    var baseW = (scaledWidth * baseRenderScale).toInt()
+                    var baseH = (scaledHeight * baseRenderScale).toInt()
+
                     if (baseW > MAX_BASE_DIMEN || baseH > MAX_BASE_DIMEN) {
                         val downScale = MAX_BASE_DIMEN.toFloat() / maxOf(baseW, baseH)
                         baseW = (baseW * downScale).toInt().coerceAtLeast(1)
@@ -3373,8 +3498,12 @@ internal fun PdfPageComposable(
                             }
 
                             val MAX_BASE_DIMEN = 3000
-                            var baseW = scaledWidth
-                            var baseH = scaledHeight
+
+                            val baseRenderScale = 1.5f
+
+                            var baseW = (scaledWidth * baseRenderScale).toInt()
+                            var baseH = (scaledHeight * baseRenderScale).toInt()
+
                             if (baseW > MAX_BASE_DIMEN || baseH > MAX_BASE_DIMEN) {
                                 val downScale = MAX_BASE_DIMEN.toFloat() / maxOf(baseW, baseH)
                                 baseW = (baseW * downScale).toInt().coerceAtLeast(1)
@@ -3429,7 +3558,7 @@ internal fun PdfPageComposable(
                         }
                     } catch (e: Exception) {
                         if (e is CancellationException) throw e
-                        pageErrorMessage = "Error processing page: ${e.localizedMessage}"
+                        pageErrorMessage = errorProcessingPage
                     } finally {
                         isLoadingPage = false
                         localBitmap?.recycle()
@@ -3499,6 +3628,7 @@ internal fun PdfPageComposable(
                     val stableBitmapState = remember(bitmapState) { StableHolder(bitmapState) }
                     val stableTiles = remember(tiles) { StableHolder(tiles) }
                     val stableColorFilter = remember(colorFilter) { StableHolder(colorFilter) }
+                    val stableImageRects = remember(imageScreenRects) { StableHolder(imageScreenRects) }
 
                     val staticData = remember(
                         stableBitmapState,
@@ -3511,7 +3641,9 @@ internal fun PdfPageComposable(
                         actualBitmapWidthPx,
                         actualBitmapHeightPx,
                         stableColorFilter,
-                        isDarkMode
+                        isDarkMode,
+                        excludeImages,
+                        stableImageRects
                     ) {
                         Timber.tag("PdfDrawPerf").v(
                             "STATIC DATA GENERATED: Scale=$effectiveScale, Tiles=${stableTiles.item.size}"
@@ -3527,7 +3659,9 @@ internal fun PdfPageComposable(
                             targetWidth = actualBitmapWidthPx,
                             targetHeight = actualBitmapHeightPx,
                             colorFilter = stableColorFilter,
-                            isDarkMode = isDarkMode
+                            isDarkMode = isDarkMode,
+                            excludeImages = excludeImages,
+                            imageRects = stableImageRects
                         )
                     }
 
@@ -3555,7 +3689,8 @@ internal fun PdfPageComposable(
                         searchHighlightMode,
                         searchFocusedColor,
                         searchAllColor,
-                        userHighlightScreenRects
+                        userHighlightScreenRects,
+                        customHighlightColors
                     ) {
                         PageSelectionData(
                             pageLinks = StableHolder(pageLinks),
@@ -3580,6 +3715,7 @@ internal fun PdfPageComposable(
                             mergedSearchAllRects = StableHolder(mergedSearchAllRects),
                             searchHighlightMode = searchHighlightMode,
                             userHighlightScreenRects = StableHolder(userHighlightScreenRects),
+                            customHighlightColors = StableHolder(customHighlightColors)
                         )
                     }
 
@@ -3601,6 +3737,7 @@ internal fun PdfPageComposable(
                             }
                         },
                         scale = scale,
+                        uiScale = effectiveScale,
                         offset = offset,
                         startHandlePos = startHandleContentPosition.value,
                         endHandlePos = endHandleContentPosition.value,
@@ -3609,6 +3746,7 @@ internal fun PdfPageComposable(
                         onHighlightUpdate = onHighlightUpdate,
                         onHighlightDelete = onHighlightDelete,
                         onTts = onTts,
+                        onNote = onNoteRequested,
                         teardropHeightPx = teardropHeightPxState.value,
                         activeDraggingHandle = activeDraggingHandle,
                         showMagnifier = showMagnifier,
@@ -3820,13 +3958,15 @@ internal fun PdfPageComposable(
                         onTextBoxDrag = onTextBoxDrag,
                         onTextBoxDragEnd = onTextBoxDragEnd,
                         onDragPageTurn = onDragPageTurn,
-                        draggingBoxId = draggingBoxId
+                        draggingBoxId = draggingBoxId,
+                        customHighlightColors = customHighlightColors,
+                        onPaletteClick = onPaletteClick
                     )
                 }
 
                 else -> {
                     Text(
-                        text = "Unable to display page ${pageIndex + 1}.",
+                        text = stringResource(R.string.error_unable_to_display_page),
                         modifier = Modifier
                             .padding(16.dp)
                             .align(Alignment.Center)
@@ -3875,11 +4015,11 @@ private fun PdfBitmapLayer(
     targetWidth: Int,
     targetHeight: Int,
     colorFilter: ColorFilter? = null,
-    isDarkMode: Boolean = false
+    isDarkMode: Boolean = false,
+    excludeImages: Boolean = false,
+    imageRects: List<android.graphics.Rect> = emptyList()
 ) {
-    Canvas(modifier = Modifier
-        .fillMaxSize()
-        .graphicsLayer()) {
+    Canvas(modifier = Modifier.fillMaxSize().graphicsLayer()) {
         translate(left = centeringOffsetX, top = centeringOffsetY) {
             clipRect(left = 0f, top = 0f, right = targetWidth.toFloat(), bottom = targetHeight.toFloat()) {
                 if (bitmapState != null && !bitmapState.isRecycled) {
@@ -3898,6 +4038,32 @@ private fun PdfBitmapLayer(
                         filterQuality = androidx.compose.ui.graphics.FilterQuality.High
                     )
 
+                    if (excludeImages && colorFilter != null && imageRects.isNotEmpty()) {
+                        imageRects.forEach { rect ->
+                            val scaleX = bitmapState.width.toFloat() / dstW.toFloat()
+                            val scaleY = bitmapState.height.toFloat() / dstH.toFloat()
+
+                            val srcRectLeft = (rect.left * scaleX).roundToInt().coerceAtLeast(0)
+                            val srcRectTop = (rect.top * scaleY).roundToInt().coerceAtLeast(0)
+                            val srcRectRight = (rect.right * scaleX).roundToInt().coerceAtMost(bitmapState.width)
+                            val srcRectBottom = (rect.bottom * scaleY).roundToInt().coerceAtMost(bitmapState.height)
+
+                            val w = srcRectRight - srcRectLeft
+                            val h = srcRectBottom - srcRectTop
+                            if (w > 0 && h > 0) {
+                                drawImage(
+                                    image = bitmapState.asImageBitmap(),
+                                    srcOffset = IntOffset(srcRectLeft, srcRectTop),
+                                    srcSize = IntSize(w, h),
+                                    dstOffset = IntOffset(rect.left, rect.top),
+                                    dstSize = IntSize(rect.width(), rect.height()),
+                                    colorFilter = null,
+                                    filterQuality = androidx.compose.ui.graphics.FilterQuality.High
+                                )
+                            }
+                        }
+                    }
+
                     val needsTiling = effectiveScale > 1f || targetWidth > 3000 || targetHeight > 3000
                     if (needsTiling) {
                         tiles.forEach { tile ->
@@ -3907,12 +4073,52 @@ private fun PdfBitmapLayer(
                                     srcOffset = IntOffset.Zero,
                                     srcSize = IntSize(tile.bitmap.width, tile.bitmap.height),
                                     dstOffset = IntOffset(tile.renderRect.left, tile.renderRect.top),
-                                    dstSize = IntSize(
-                                        tile.renderRect.width(), tile.renderRect.height()
-                                    ),
+                                    dstSize = IntSize(tile.renderRect.width(), tile.renderRect.height()),
                                     colorFilter = colorFilter,
                                     filterQuality = androidx.compose.ui.graphics.FilterQuality.High
                                 )
+
+                                if (excludeImages && colorFilter != null && imageRects.isNotEmpty()) {
+                                    imageRects.forEach { imgRect ->
+                                        val scaledImgRectLeft = (imgRect.left * effectiveScale).roundToInt()
+                                        val scaledImgRectTop = (imgRect.top * effectiveScale).roundToInt()
+                                        val scaledImgRectRight = (imgRect.right * effectiveScale).roundToInt()
+                                        val scaledImgRectBottom = (imgRect.bottom * effectiveScale).roundToInt()
+
+                                        val intersectLeft = max(scaledImgRectLeft, tile.renderRect.left)
+                                        val intersectTop = max(scaledImgRectTop, tile.renderRect.top)
+                                        val intersectRight = min(scaledImgRectRight, tile.renderRect.right)
+                                        val intersectBottom = min(scaledImgRectBottom, tile.renderRect.bottom)
+
+                                        val iw = intersectRight - intersectLeft
+                                        val ih = intersectBottom - intersectTop
+
+                                        if (iw > 0 && ih > 0) {
+                                            val scaleXBmp = tile.bitmap.width.toFloat() / tile.renderRect.width()
+                                            val scaleYBmp = tile.bitmap.height.toFloat() / tile.renderRect.height()
+
+                                            val srcLeft = ((intersectLeft - tile.renderRect.left) * scaleXBmp).roundToInt()
+                                            val srcTop = ((intersectTop - tile.renderRect.top) * scaleYBmp).roundToInt()
+                                            val srcRight = ((intersectRight - tile.renderRect.left) * scaleXBmp).roundToInt()
+                                            val srcBottom = ((intersectBottom - tile.renderRect.top) * scaleYBmp).roundToInt()
+
+                                            val srcW = srcRight - srcLeft
+                                            val srcH = srcBottom - srcTop
+
+                                            if (srcW > 0 && srcH > 0) {
+                                                drawImage(
+                                                    image = tile.bitmap.asImageBitmap(),
+                                                    srcOffset = IntOffset(srcLeft, srcTop),
+                                                    srcSize = IntSize(srcW, srcH),
+                                                    dstOffset = IntOffset(intersectLeft, intersectTop),
+                                                    dstSize = IntSize(iw, ih),
+                                                    colorFilter = null,
+                                                    filterQuality = androidx.compose.ui.graphics.FilterQuality.High
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -3942,7 +4148,8 @@ private fun PdfHighlightsLayer(
     scrimColorForTextHighlight: Color,
     allTextPageHighlightColor: Color,
     ttsHighlightColor: Color,
-    selectionHighlightColor: Color
+    selectionHighlightColor: Color,
+    customHighlightColors: Map<PdfHighlightColor, Color> = emptyMap()
 ) {
     Timber.d("PdfHighlightsLayer Recompose")
     Canvas(modifier = Modifier
@@ -4085,10 +4292,11 @@ private fun PdfHighlightsLayer(
 
             // 9. Persistent User Highlights
             userHighlightScreenRects.forEach { (highlight, screenRects) ->
+                val displayColor = customHighlightColors[highlight.color] ?: highlight.color.color
                 screenRects.forEach { r ->
                     if (isVisible(r)) {
                         drawRect(
-                            color = highlight.color.color.copy(alpha = 0.4f),
+                            color = displayColor.copy(alpha = 0.4f),
                             topLeft = Offset(r.left.toFloat(), r.top.toFloat()),
                             size = Size(r.width().toFloat(), r.height().toFloat())
                         )
@@ -4434,7 +4642,9 @@ private fun PdfPageStaticLayer(data: PageStaticData) {
         targetWidth = data.targetWidth,
         targetHeight = data.targetHeight,
         colorFilter = data.colorFilter.item,
-        isDarkMode = data.isDarkMode
+        isDarkMode = data.isDarkMode,
+        excludeImages = data.excludeImages,
+        imageRects = data.imageRects.item
     )
 }
 
@@ -4458,7 +4668,8 @@ private fun PdfPageSelectionsLayer(
     scrimColorForTextHighlight: Color,
     allTextPageHighlightColor: Color,
     ttsHighlightColor: Color,
-    selectionHighlightColor: Color
+    selectionHighlightColor: Color,
+    customHighlightColors: Map<PdfHighlightColor, Color> = emptyMap()
 ) {
     SideEffect {
         Timber.tag("PdfDrawPerf").v("SELECTIONS LAYER: Recomposing")
@@ -4485,7 +4696,8 @@ private fun PdfPageSelectionsLayer(
         scrimColorForTextHighlight = scrimColorForTextHighlight,
         allTextPageHighlightColor = allTextPageHighlightColor,
         ttsHighlightColor = ttsHighlightColor,
-        selectionHighlightColor = selectionHighlightColor
+        selectionHighlightColor = selectionHighlightColor,
+        customHighlightColors = customHighlightColors
     )
 
     val highlightTime = (System.nanoTime() - highlightStart) / 1_000_000f
@@ -4506,6 +4718,7 @@ private fun PdfPageRenderer(
     drawingState: PdfDrawingState?,
     onCanvasSizeChanged: (Float, Float) -> Unit,
     scale: Float,
+    uiScale: Float,
     offset: Offset,
     startHandlePos: Offset?,
     endHandlePos: Offset?,
@@ -4548,12 +4761,14 @@ private fun PdfPageRenderer(
     onTextBoxDragEnd: () -> Unit,
     onDragPageTurn: (Int) -> Unit,
     draggingBoxId: String? = null,
+    customHighlightColors: Map<PdfHighlightColor, Color> = emptyMap(),
+    onPaletteClick: (() -> Unit)? = null,
     onHighlightAdd: (Int, Pair<Int, Int>, String, PdfHighlightColor) -> Unit,
     onHighlightUpdate: (String, PdfHighlightColor) -> Unit,
     onHighlightDelete: (String) -> Unit,
     onTts: (Int, Int) -> Unit,
-    activeToolThickness: Float
-
+    activeToolThickness: Float,
+    onNote: (String?) -> Unit,
 ) {
     Box(modifier = Modifier.fillMaxSize()) {
         Box(
@@ -4591,7 +4806,8 @@ private fun PdfPageRenderer(
                 scrimColorForTextHighlight = selectionData.scrimColorForTextHighlight,
                 allTextPageHighlightColor = selectionData.allTextPageHighlightColor,
                 ttsHighlightColor = selectionData.ttsHighlightColor,
-                selectionHighlightColor = selectionData.selectionHighlightColor
+                selectionHighlightColor = selectionData.selectionHighlightColor,
+                customHighlightColors = selectionData.customHighlightColors.item
             )
 
             // Layer 3: Annotations & Text
@@ -4629,6 +4845,12 @@ private fun PdfPageRenderer(
                     }
                 }
 
+                if (textBoxes.isNotEmpty()) {
+                    androidx.compose.runtime.SideEffect {
+                        Timber.tag("PdfTextBoxDebug").d("PdfPageRenderer parent graphicsLayer applied | scale=$scale | offset=$offset | Centering: X=${staticData.centeringOffsetX}, Y=${staticData.centeringOffsetY}")
+                    }
+                }
+
                 textBoxes.forEach { box ->
                     val isDraggingThisBox = (box.id == draggingBoxId)
                     val boxAlpha = if (isDraggingThisBox) 0f else 1f
@@ -4639,17 +4861,27 @@ private fun PdfPageRenderer(
                             isSelected = (box.id == selectedTextBoxId),
                             isEditMode = isEditMode,
                             isDarkMode = staticData.isDarkMode,
+                            scale = uiScale,
                             pageWidthPx = staticData.targetWidth.toFloat(),
                             pageHeightPx = staticData.targetHeight.toFloat(),
                             handlePosition = HandlePosition.AUTO,
                             onBoundsChanged = { newBounds ->
-                                onTextBoxChange(box.copy(relativeBounds = newBounds))
+                                Timber.tag("PdfTextBoxDebug").v("PdfPageRenderer onBoundsChanged [ID: ${box.id}] bounds=$newBounds draggingBoxId=$draggingBoxId")
+                                if (draggingBoxId != box.id) {
+                                    onTextBoxChange(box.copy(relativeBounds = newBounds))
+                                } else {
+                                    Timber.tag("PdfTextBoxDebug").d("PdfPageRenderer onBoundsChanged IGNORED because box[ID: ${box.id}] is being dragged globally")
+                                }
                             },
                             onTextChanged = { newText ->
                                 onTextBoxChange(box.copy(text = newText))
                             },
-                            onSelect = { onTextBoxSelect(box.id) },
+                            onSelect = {
+                                Timber.tag("PdfTextBoxDebug").d("PdfPageRenderer onSelect propagated[ID: ${box.id}]")
+                                onTextBoxSelect(box.id)
+                            },
                             onDragStart = { touchOffset ->
+                                Timber.tag("PdfTextBoxDebug").d("PdfPageRenderer onDragStart[ID: ${box.id}] isVerticalScroll=$isVerticalScroll | offset=$touchOffset")
                                 if (isVerticalScroll) {
                                     val topLeft = Offset(
                                         box.relativeBounds.left * staticData.targetWidth,
@@ -4661,10 +4893,12 @@ private fun PdfPageRenderer(
                                 }
                             },
                             onDrag = { delta, currentBounds ->
+                                Timber.tag("PdfTextBoxDebug").v("PdfPageRenderer onDrag [ID: ${box.id}] delta=$delta currentBounds=$currentBounds scale=$scale")
                                 if (isVerticalScroll) {
                                     onTextBoxDrag(delta)
                                 } else {
-                                    onTextBoxDrag(delta)
+                                    val scaledDelta = delta * scale
+                                    onTextBoxDrag(scaledDelta)
 
                                     val width = staticData.targetWidth
                                     val edgeThreshold = 60f
@@ -4678,9 +4912,11 @@ private fun PdfPageRenderer(
                                 }
                             },
                             onDragEnd = {
+                                Timber.tag("PdfTextBoxDebug").d("PdfPageRenderer onDragEnd[ID: ${box.id}]")
                                 onTextBoxDragEnd()
                             },
                             onDragCancel = {
+                                Timber.tag("PdfTextBoxDebug").d("PdfPageRenderer onDragCancel [ID: ${box.id}]")
                                 onTextBoxDragEnd()
                             },
                             modifier = Modifier
@@ -4937,7 +5173,21 @@ private fun PdfPageRenderer(
                     onTts = {
                         onTts(selectionData.pageIndex, menuState.charRange.first)
                         onMenuDismiss()
-                    }
+                    },
+                    onNote = {
+                        if (menuState.isExistingHighlight && menuState.highlightId != null) {
+                            onNote(menuState.highlightId)
+                        } else {
+                            onNote(null)
+                            onHighlightAdd(
+                                selectionData.pageIndex, menuState.charRange, menuState.selectedText,
+                                PdfHighlightColor.YELLOW
+                            )
+                        }
+                        onMenuDismiss()
+                    },
+                    customHighlightColors = selectionData.customHighlightColors.item,
+                    onPaletteClick = onPaletteClick
                 )
             }
         }

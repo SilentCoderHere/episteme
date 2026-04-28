@@ -23,7 +23,7 @@ import android.content.Intent
 import android.os.Build
 import android.os.Bundle
 import android.webkit.WebView
-import androidx.activity.ComponentActivity
+import androidx.appcompat.app.AppCompatActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
@@ -37,12 +37,16 @@ import androidx.compose.material3.windowsizeclass.calculateWindowSizeClass
 import androidx.compose.ui.Modifier
 import androidx.lifecycle.lifecycleScope
 import androidx.navigation.compose.rememberNavController
-import com.aryan.reader.data.PlatformFeaturesRepository // Import the new repo
+import com.aryan.reader.data.PlatformFeaturesRepository
 import com.aryan.reader.ui.theme.AppTheme
 import kotlinx.coroutines.launch
 import timber.log.Timber
+import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.runtime.getValue
+import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 
-class MainActivity : ComponentActivity() {
+class MainActivity : AppCompatActivity() {
 
     private val viewModel: MainViewModel by viewModels()
     private lateinit var platformFeaturesRepository: PlatformFeaturesRepository
@@ -58,6 +62,7 @@ class MainActivity : ComponentActivity() {
     @RequiresApi(Build.VERSION_CODES.VANILLA_ICE_CREAM)
     @OptIn(ExperimentalMaterial3WindowSizeClassApi::class)
     override fun onCreate(savedInstanceState: Bundle?) {
+        installSplashScreen()
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
 
@@ -78,7 +83,21 @@ class MainActivity : ComponentActivity() {
         }
 
         setContent {
-            AppTheme {
+            val uiState by viewModel.uiState.collectAsStateWithLifecycle()
+
+            val darkTheme = when (uiState.appThemeMode) {
+                AppThemeMode.LIGHT -> false
+                AppThemeMode.DARK -> true
+                AppThemeMode.SYSTEM -> isSystemInDarkTheme()
+            }
+
+            AppTheme(
+                darkTheme = darkTheme,
+                dynamicColor = uiState.appSeedColor == null,
+                seedColor = uiState.appSeedColor,
+                contrastLevel = uiState.appContrastOption.value,
+                textDimFactor = uiState.appTextDimFactor
+            ) {
                 Surface(
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background
@@ -105,7 +124,7 @@ class MainActivity : ComponentActivity() {
         if (intent?.action == Intent.ACTION_VIEW && intent.data != null) {
             Timber.d("Received VIEW intent with URI: ${intent.data}")
             val uri = intent.data!!
-            viewModel.onFileSelected(uri)
+            viewModel.onFileSelected(uri, isFromRecent = false, isExternalIntent = true)
         }
     }
 }

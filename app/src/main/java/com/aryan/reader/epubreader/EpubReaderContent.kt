@@ -19,6 +19,8 @@
  */
 package com.aryan.reader.epubreader
 
+import android.content.Context
+import com.aryan.reader.R
 import timber.log.Timber
 import com.aryan.reader.epub.EpubBook
 import com.aryan.reader.paginatedreader.LocatorConverter
@@ -40,6 +42,7 @@ data class ChapterLoadingResult(
  * the initial chunk to display based on navigation state (CFI, overrides, etc.).
  */
 suspend fun loadChapterContent(
+    context: Context,
     epubBook: EpubBook,
     chapterIndex: Int,
     chunkTargetOverride: Int?,
@@ -59,17 +62,18 @@ suspend fun loadChapterContent(
         val (headContent, chunks) = if (htmlFile.exists()) {
             val doc = Jsoup.parse(htmlFile, "UTF-8")
             val head = doc.head().html()
-            val bodyChildren = doc.body().children().toList()
-            val chunkedList = bodyChildren.chunked(20).map { chunkOfElements ->
-                chunkOfElements.joinToString(separator = "\n") { it.outerHtml() }
+            doc.select("script").remove()
+            val bodyNodes = doc.body().childNodes().toList()
+            val chunkedList = bodyNodes.chunked(20).map { chunkOfNodes ->
+                chunkOfNodes.joinToString(separator = "\n") { it.outerHtml() }
             }
             if (chunkedList.isEmpty()) {
-                head to listOf("<body><p>This chapter is empty.</p></body>")
+                head to listOf("<body><p>${context.getString(R.string.chapter_empty)}</p></body>")
             } else {
                 head to chunkedList
             }
         } else {
-            "" to listOf("<h1>Chapter not found</h1>")
+            "" to listOf("<h1>${context.getString(R.string.chapter_not_found)}</h1>")
         }
 
         var targetChunk = 0
@@ -104,7 +108,7 @@ suspend fun loadChapterContent(
         Timber.e(e, "Failed to parse chapter")
         ChapterLoadingResult(
             head = "",
-            chunks = listOf("<h1>Error loading chapter</h1><p>${e.message}</p>"),
+            chunks = listOf("<h1>${context.getString(R.string.error_loading_chapter)}</h1><p>${e.message}</p>"),
             startChunkIndex = 0,
             isSuccess = false,
             errorMessage = e.message

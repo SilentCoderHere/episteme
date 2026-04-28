@@ -40,6 +40,7 @@ import timber.log.Timber
 import java.io.File
 import java.io.FileOutputStream
 import java.io.InputStream
+import java.util.UUID
 
 class SingleFileImporter(private val context: Context) {
 
@@ -52,12 +53,94 @@ class SingleFileImporter(private val context: Context) {
         bookId: String,
         parseContent: Boolean = true
     ): EpubBook {
+
+        val lowerHint = originalBookNameHint.lowercase()
+        val isCsv = lowerHint.endsWith(".csv") || lowerHint.endsWith(".tsv")
+        val isCodeOrData = listOf(".json", ".xml", ".log", ".java", ".kt", ".py", ".js", ".cpp", ".c", ".cs", ".rb", ".go").any { lowerHint.endsWith(it) }
+
+        if (type == FileType.HTML && (isCsv || isCodeOrData)) {
+            return parseDynamicContentToHtml(inputStream, originalBookNameHint, bookId, parseContent, isCsv)
+        }
+
         return when (type) {
             FileType.MD -> parseMarkdown(inputStream, originalBookNameHint, bookId, parseContent)
             FileType.TXT -> parsePlainText(inputStream, originalBookNameHint, bookId, parseContent)
             FileType.HTML -> parseHtml(inputStream, originalBookNameHint, bookId, parseContent)
             FileType.DOCX -> parseDocx(inputStream, originalBookNameHint, bookId, parseContent)
             else -> parsePlainText(inputStream, originalBookNameHint, bookId, parseContent)
+        }
+    }
+
+    private suspend fun parseDynamicContentToHtml(
+        inputStream: InputStream,
+        originalBookNameHint: String,
+        bookId: String,
+        parseContent: Boolean,
+        isCsv: Boolean
+    ): EpubBook = withContext(Dispatchers.IO) {
+
+        val tempFile = File(context.cacheDir, "temp_conv_${UUID.randomUUID()}.html")
+
+        try {
+            FileOutputStream(tempFile).bufferedWriter().use { writer ->
+                writer.write("<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"UTF-8\">\n<title>${originalBookNameHint}</title>\n")
+
+                if (isCsv) {
+                    writer.write("<style>\ntable { border-collapse: collapse; width: 100%; font-family: sans-serif; }\nth, td { border: 1px solid currentColor; padding: 8px; }\n</style>\n")
+                    writer.write("</head>\n<body>\n<div style='overflow-x:auto;'>\n<table>\n")
+                } else {
+                    writer.write("<style>\npre { padding: 10px; overflow-x: auto; font-family: monospace; white-space: pre-wrap; word-wrap: break-word; }\n</style>\n")
+                    writer.write("</head>\n<body>\n<pre><code>\n")
+                }
+
+                val delimiter = if (originalBookNameHint.lowercase().endsWith(".tsv")) '\t' else ','
+
+                inputStream.bufferedReader().use { reader ->
+                    var line = reader.readLine()
+                    while (line != null) {
+                        if (isCsv) {
+                            writer.write("<tr>")
+                            val current = StringBuilder()
+                            var inQuotes = false
+
+                            for (char in line) {
+                                if (char == '\"') {
+                                    inQuotes = !inQuotes
+                                } else if (char == delimiter && !inQuotes) {
+                                    val escaped = current.toString().replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                                    writer.write("<td>$escaped</td>")
+                                    current.clear()
+                                } else {
+                                    current.append(char)
+                                }
+                            }
+                            val escapedFinal = current.toString().replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                            writer.write("<td>$escapedFinal</td></tr>\n")
+
+                        } else {
+                            // Plain code/log text escaping
+                            val escaped = line.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                            writer.write("$escaped\n")
+                        }
+                        line = reader.readLine()
+                    }
+                }
+
+                if (isCsv) {
+                    writer.write("</table>\n</div>\n</body>\n</html>")
+                } else {
+                    writer.write("</code></pre>\n</body>\n</html>")
+                }
+            }
+
+            tempFile.inputStream().use { tempStream ->
+                return@withContext parseHtml(tempStream, originalBookNameHint, bookId, parseContent)
+            }
+
+        } finally {
+            if (tempFile.exists()) {
+                tempFile.delete()
+            }
         }
     }
 
@@ -82,6 +165,9 @@ class SingleFileImporter(private val context: Context) {
                 css = emptyMap()
             )
         }
+
+        File(context.cacheDir, "imported_file_$bookId").deleteRecursively()
+
         val extractionDir = File(context.cacheDir, "imported_file_$bookId").apply {
             if (!exists()) mkdirs()
         }
@@ -153,18 +239,7 @@ class SingleFileImporter(private val context: Context) {
                 val fileName = "page_$pageNum.html"
                 val file = File(extractionDir, fileName)
 
-                val fullHtml = """
-                    <!DOCTYPE html>
-                    <html>
-                    <head>
-                        <title>$chapterTitle</title>
-                        <style>$style</style>
-                    </head>
-                    <body>
-                    $htmlBody
-                    </body>
-                    </html>
-                """.trimIndent()
+                val fullHtml = "<!DOCTYPE html>\n<html>\n<head>\n<title>$chapterTitle</title>\n<style>$style</style>\n</head>\n<body>\n$htmlBody\n</body>\n</html>"
 
                 file.writeText(fullHtml)
 
@@ -228,6 +303,9 @@ class SingleFileImporter(private val context: Context) {
                 css = emptyMap()
             )
         }
+
+        File(context.cacheDir, "imported_file_$bookId").deleteRecursively()
+
         val extractionDir = File(context.cacheDir, "imported_file_$bookId").apply {
             if (!exists()) mkdirs()
         }
@@ -266,18 +344,7 @@ class SingleFileImporter(private val context: Context) {
             val file = File(extractionDir, fileName)
             val chapterTitle = "Part $chapterCounter"
 
-            val fullHtml = """
-                <!DOCTYPE html>
-                <html>
-                <head>
-                    <title>$chapterTitle</title>
-                    <style>$cssStyle</style>
-                </head>
-                <body>
-                $currentChapterContent
-                </body>
-                </html>
-            """.trimIndent()
+            val fullHtml = "<!DOCTYPE html>\n<html>\n<head>\n<title>$chapterTitle</title>\n<style>$cssStyle</style>\n</head>\n<body>\n$currentChapterContent\n</body>\n</html>"
 
             FileOutputStream(file).use { it.write(fullHtml.toByteArray()) }
 
@@ -306,41 +373,42 @@ class SingleFileImporter(private val context: Context) {
                 .replace(">", "&gt;")
         }
 
-        val reader = inputStream.bufferedReader()
         var inParagraph = false
 
-        while (true) {
-            val line = reader.readLine()
-            if (line == null) {
-                if (inParagraph) {
-                    currentChapterContent.append("</p>\n")
-                }
-                break
-            }
-
-            val trimmed = line.trim()
-            if (trimmed.isEmpty()) {
-                if (inParagraph) {
-                    currentChapterContent.append("</p>\n")
-                    inParagraph = false
+        inputStream.bufferedReader().use { reader ->
+            while (true) {
+                val line = reader.readLine()
+                if (line == null) {
+                    if (inParagraph) {
+                        currentChapterContent.append("</p>\n")
+                    }
+                    break
                 }
 
-                if (currentChapterContent.length >= chapterTargetSize) {
-                    flushChapter()
-                }
-            } else {
-                if (!inParagraph) {
-                    currentChapterContent.append("<p>")
-                    inParagraph = true
+                val trimmed = line.trim()
+                if (trimmed.isEmpty()) {
+                    if (inParagraph) {
+                        currentChapterContent.append("</p>\n")
+                        inParagraph = false
+                    }
+
+                    if (currentChapterContent.length >= chapterTargetSize) {
+                        flushChapter()
+                    }
                 } else {
-                    currentChapterContent.append(" ")
-                }
-                currentChapterContent.append(escapeHtml(trimmed))
+                    if (!inParagraph) {
+                        currentChapterContent.append("<p>")
+                        inParagraph = true
+                    } else {
+                        currentChapterContent.append(" ")
+                    }
+                    currentChapterContent.append(escapeHtml(trimmed))
 
-                if (currentChapterContent.length >= chapterTargetSize * 2) {
-                    currentChapterContent.append("</p>\n")
-                    flushChapter()
-                    inParagraph = false
+                    if (currentChapterContent.length >= chapterTargetSize * 2) {
+                        currentChapterContent.append("</p>\n")
+                        flushChapter()
+                        inParagraph = false
+                    }
                 }
             }
         }
@@ -400,6 +468,9 @@ class SingleFileImporter(private val context: Context) {
                 css = emptyMap()
             )
         }
+
+        File(context.cacheDir, "imported_file_$bookId").deleteRecursively()
+
         val extractionDir = File(context.cacheDir, "imported_file_$bookId").apply {
             if (!exists()) mkdirs()
         }
@@ -572,6 +643,8 @@ class SingleFileImporter(private val context: Context) {
             )
         }
 
+        File(context.cacheDir, "imported_file_$bookId").deleteRecursively()
+
         val extractionDir = File(context.cacheDir, "imported_file_$bookId").apply {
             if (!exists()) mkdirs()
         }
@@ -590,26 +663,30 @@ class SingleFileImporter(private val context: Context) {
         val parseStart = System.currentTimeMillis()
         Timber.tag("FileOpenPerf").d("[DOCX] parseDocx START | file=$originalBookNameHint")
 
-        val converter = DocumentConverter()
-        val result = converter.convertToHtml(inputStream)
-        val htmlContent = result.value ?: ""
+        val htmlContent = inputStream.use { stream ->
+            val converter = DocumentConverter()
+            converter.convertToHtml(stream).value ?: ""
+        }
 
         Timber.tag("FileOpenPerf").d("[DOCX] parseDocx: mammoth conversion done | elapsed=${System.currentTimeMillis() - parseStart}ms")
 
-        val fullHtml = """
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <title>${originalBookNameHint.substringBeforeLast(".")}</title>
-            </head>
-            <body>
-            $htmlContent
-            </body>
-            </html>
-        """.trimIndent()
+        val tempFile = File(context.cacheDir, "temp_docx_${UUID.randomUUID()}.html")
+        try {
+            FileOutputStream(tempFile).bufferedWriter().use { writer ->
+                val title = originalBookNameHint.substringBeforeLast(".")
+                writer.write("<!DOCTYPE html>\n<html>\n<head>\n<title>$title</title>\n</head>\n<body>\n")
+                writer.write(htmlContent)
+                writer.write("\n</body>\n</html>")
+            }
 
-        // 4. Delegate to the already built HTML caching and chunking mechanisms!
-        return@withContext parseHtml(fullHtml.byteInputStream(), originalBookNameHint, bookId, parseContent)
+            tempFile.inputStream().use { tempStream ->
+                return@withContext parseHtml(tempStream, originalBookNameHint, bookId, parseContent)
+            }
+        } finally {
+            if (tempFile.exists()) {
+                tempFile.delete()
+            }
+        }
     }
 
     private fun writeHtmlChapter(
@@ -624,18 +701,7 @@ class SingleFileImporter(private val context: Context) {
         val fileName = "page_$pageNum.html"
         val file = File(extractionDir, fileName)
 
-        val fullHtml = """
-            <!DOCTYPE html>
-            <html xmlns="http://www.w3.org/1999/xhtml">
-            <head>
-                <title>${title.replace("\"", "&quot;")}</title>
-                <style>${cssStyle}</style>
-            </head>
-            <body>
-                ${bodyContent.trim()}
-            </body>
-            </html>
-        """.trimIndent()
+        val fullHtml = "<!DOCTYPE html>\n<html xmlns=\"http://www.w3.org/1999/xhtml\">\n<head>\n<title>${title.replace("\"", "&quot;")}</title>\n<style>${cssStyle}</style>\n</head>\n<body>\n${bodyContent.trim()}\n</body>\n</html>"
 
         file.writeText(fullHtml)
 

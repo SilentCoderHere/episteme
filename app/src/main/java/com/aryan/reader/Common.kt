@@ -1,5 +1,5 @@
 // Common.kt
-@file:kotlin.OptIn(ExperimentalMaterial3Api::class)
+@file:OptIn(ExperimentalMaterial3Api::class) @file:Suppress("KotlinConstantConditions")
 
 package com.aryan.reader
 
@@ -35,8 +35,8 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -55,15 +55,15 @@ import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
-import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.PlayCircle
 import androidx.compose.material.icons.filled.Smartphone
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
@@ -73,16 +73,19 @@ import androidx.compose.material3.ListItem
 import androidx.compose.material3.ListItemDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.PlainTooltip
 import androidx.compose.material3.RichTooltip
-import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Tab
+import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextField
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.material3.TooltipBox
 import androidx.compose.material3.TooltipDefaults
+import androidx.compose.material3.TooltipState
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.material3.rememberTooltipState
 import androidx.compose.runtime.Composable
@@ -105,6 +108,7 @@ import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
@@ -120,7 +124,6 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
-import androidx.compose.ui.platform.LocalResources
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.imageResource
@@ -140,6 +143,8 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupProperties
 import androidx.core.content.edit
@@ -148,9 +153,12 @@ import androidx.media3.common.util.UnstableApi
 import com.aryan.reader.epubreader.PREF_CUSTOM_THEMES
 import com.aryan.reader.epubreader.PREF_READER_THEME
 import com.aryan.reader.paginatedreader.TtsChunk
-import com.aryan.reader.tts.GOOGLE_TTS_SPEAKERS
+import com.aryan.reader.pdf.PdfHighlightColor
+import com.aryan.reader.tts.GEMINI_TTS_SPEAKERS
 import com.aryan.reader.tts.SpeakerSamplePlayer
+import com.aryan.reader.tts.TtsCacheManager
 import com.aryan.reader.tts.TtsPlaybackManager
+import com.aryan.reader.tts.formatBytes
 import com.aryan.reader.tts.loadTtsMode
 import com.aryan.reader.tts.rememberTtsController
 import com.aryan.reader.tts.splitTextIntoChunks
@@ -207,8 +215,93 @@ data class AiDefinitionResult(
 
 data class SummarizationResult(
     val summary: String? = null,
-    val error: String? = null
+    val error: String? = null,
+    val cost: Double? = null,
+    val freeRemaining: Int? = null,
+    val isCacheHit: Boolean = false
 )
+
+data class CachedSummaryItem(
+    val chapterIndex: Int,
+    val chapterTitle: String,
+    val summary: String,
+    val file: File
+)
+
+class SummaryCacheManager(context: Context) {
+    private val cacheDir = File(context.cacheDir, "chapter_summaries")
+
+    init {
+        if (!cacheDir.exists()) {
+            cacheDir.mkdirs()
+        }
+    }
+
+    private fun getFileName(bookTitle: String, chapterIndex: Int): String {
+        val safeTitle = bookTitle.replace(Regex("[^a-zA-Z0-9.-]"), "_")
+        return "summary_${safeTitle}_$chapterIndex.txt"
+    }
+
+    fun saveSummary(bookTitle: String, chapterIndex: Int, chapterTitle: String, summary: String) {
+        try {
+            val file = File(cacheDir, getFileName(bookTitle, chapterIndex))
+            val contentToSave = "$chapterTitle\n$summary"
+            file.writeText(contentToSave)
+            Timber.d("Saved summary with title for $bookTitle Ch $chapterIndex")
+        } catch (e: Exception) {
+            Timber.e(e, "Failed to save summary")
+        }
+    }
+
+    fun getSummary(bookTitle: String, chapterIndex: Int): String? {
+        return try {
+            val file = File(cacheDir, getFileName(bookTitle, chapterIndex))
+            if (file.exists()) file.readText() else null
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    fun hasSummary(bookTitle: String, chapterIndex: Int): Boolean {
+        val file = File(cacheDir, getFileName(bookTitle, chapterIndex))
+        return file.exists()
+    }
+
+    fun getAllSummaries(bookTitle: String): List<CachedSummaryItem> {
+        val safeTitle = bookTitle.replace(Regex("[^a-zA-Z0-9.-]"), "_")
+        val prefix = "summary_${safeTitle}_"
+        val files = cacheDir.listFiles()?.filter { it.name.startsWith(prefix) && it.name.endsWith(".txt") } ?: emptyList()
+
+        return files.mapNotNull { file ->
+            try {
+                val indexStr = file.name.removePrefix(prefix).removeSuffix(".txt")
+                val index = indexStr.toInt()
+
+                val fullText = file.readText()
+                val lines = fullText.lines()
+
+                val title = lines.firstOrNull()?.trim() ?: "Chapter ${index + 1}"
+                val summaryText = if (lines.size > 1) lines.drop(1).joinToString("\n") else ""
+
+                Timber.d("Cache Load: Ch $index, Title: $title")
+
+                CachedSummaryItem(index, title, summaryText, file)
+            } catch (e: Exception) {
+                Timber.e(e, "Error parsing cache file: ${file.name}")
+                null
+            }
+        }.sortedBy { it.chapterIndex }
+    }
+
+    fun deleteSummary(bookTitle: String, chapterIndex: Int) {
+        val file = File(cacheDir, getFileName(bookTitle, chapterIndex))
+        if (file.exists()) file.delete()
+    }
+
+    fun clearBookCache(bookTitle: String) {
+        getAllSummaries(bookTitle).forEach { it.file.delete() }
+    }
+}
 
 @Stable
 class SearchState(
@@ -274,7 +367,7 @@ fun rememberSearchState(
     }
 }
 
-private val activeTooltipState = mutableStateOf<androidx.compose.material3.TooltipState?>(null)
+private val activeTooltipState = mutableStateOf<TooltipState?>(null)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -287,7 +380,7 @@ fun TooltipIconButton(
     content: @Composable () -> Unit
 ) {
     val tooltipState = rememberTooltipState(isPersistent = true)
-    val scope = rememberCoroutineScope()
+    rememberCoroutineScope()
 
     LaunchedEffect(tooltipState.isVisible) {
         if (tooltipState.isVisible) {
@@ -389,14 +482,14 @@ fun SearchTopBar(
             ) {
                 Icon(
                     imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                    contentDescription = "Close Search"
+                    contentDescription = stringResource(R.string.tooltip_close_search)
                 )
             }
 
             TextField(
                 value = searchState.searchQuery,
                 onValueChange = { searchState.onQueryChange(it) },
-                placeholder = { Text("Search in book...") },
+                placeholder = { Text(stringResource(R.string.search_in_book)) },
                 modifier = Modifier
                     .weight(1f)
                     .focusRequester(focusRequester)
@@ -425,7 +518,7 @@ fun SearchTopBar(
                 ) {
                     Icon(
                         Icons.Default.Close,
-                        contentDescription = "Clear Search"
+                        contentDescription = stringResource(R.string.tooltip_clear_search)
                     )
                 }
             }
@@ -446,7 +539,10 @@ fun SearchTopBar(
             ) {
                 Icon(
                     imageVector = if (searchState.showSearchResultsPanel) Icons.Default.ArrowDropUp else Icons.Default.ArrowDropDown,
-                    contentDescription = if (searchState.showSearchResultsPanel) "Hide Results" else "Show Results"
+                    contentDescription = stringResource(
+                        if (searchState.showSearchResultsPanel) R.string.tooltip_hide_results
+                        else R.string.tooltip_show_results
+                    )
                 )
             }
         }
@@ -474,7 +570,7 @@ fun SearchNavigationControls(
                 onClick = { onNavigate(searchState.currentSearchResultIndex - 1) },
                 enabled = searchState.currentSearchResultIndex > 0
             ) {
-                Icon(Icons.Default.ArrowDropUp, contentDescription = "Previous Search Result")
+                Icon(Icons.Default.ArrowDropUp, contentDescription = stringResource(R.string.tooltip_prev_result))
             }
 
             Text(
@@ -489,176 +585,7 @@ fun SearchNavigationControls(
                 onClick = { onNavigate(searchState.currentSearchResultIndex + 1) },
                 enabled = searchState.currentSearchResultIndex < searchState.searchResultsCount - 1
             ) {
-                Icon(Icons.Default.ArrowDropDown, contentDescription = "Next Search Result")
-            }
-        }
-    }
-}
-
-@androidx.annotation.OptIn(UnstableApi::class)
-@Composable
-fun SummarizationPopup(
-    title: String,
-    result: SummarizationResult?,
-    isLoading: Boolean,
-    onDismiss: () -> Unit,
-    isMainTtsActive: Boolean = false,
-) {
-    val ttsController = rememberTtsController()
-    val ttsState by ttsController.ttsState.collectAsState()
-    val context = LocalContext.current
-    LocalContext.current
-    @Suppress("DEPRECATION") val clipboardManager = LocalClipboardManager.current
-    val scope = rememberCoroutineScope()
-
-    DisposableEffect(Unit) {
-        onDispose {
-            if (ttsState.playbackSource == "POPUP" && (ttsState.isPlaying || ttsState.isLoading)) {
-                ttsController.stop()
-            }
-        }
-    }
-
-    Popup(
-        alignment = Alignment.Center,
-        onDismissRequest = onDismiss,
-        properties = PopupProperties(focusable = true)
-    ) {
-        Card(
-            modifier = Modifier
-                .fillMaxWidth(0.9f)
-                .padding(horizontal = 16.dp, vertical = 5.dp)
-                .heightIn(min = 150.dp, max = 500.dp),
-            elevation = CardDefaults.cardElevation(defaultElevation = 8.dp),
-            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh)
-        ) {
-            Column(modifier = Modifier.padding(all = 20.dp)) {
-                Text(
-                    text = title,
-                    style = MaterialTheme.typography.headlineSmall,
-                    fontWeight = FontWeight.Bold,
-                    modifier = Modifier.padding(bottom = 8.dp)
-                )
-
-                if (isLoading && (result?.summary.isNullOrBlank() && result?.error.isNullOrBlank())) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(vertical = 24.dp),
-                        horizontalArrangement = Arrangement.Center,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        CircularProgressIndicator()
-                        Text("Generating summary...", modifier = Modifier.padding(start = 12.dp), style = MaterialTheme.typography.bodyLarge)
-                    }
-                } else if (result != null) {
-                    val summaryText = result.summary
-                    val errorText = result.error
-
-                    val styledContent = remember(summaryText, errorText) {
-                        if (!summaryText.isNullOrBlank()) {
-                            MarkdownParser.parse(summaryText)
-                        } else {
-                            AnnotatedString(errorText ?: "")
-                        }
-                    }
-                    val textToUse = styledContent.text
-
-                    if (textToUse.isNotBlank()) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.End,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            val isTtsSessionActive = ttsState.currentText != null || ttsState.isLoading
-
-                            IconButton(
-                                onClick = {
-                                    if (isTtsSessionActive) {
-                                        ttsController.stop()
-                                    } else {
-                                        val chunks = splitTextIntoChunks(textToUse).map {
-                                            TtsChunk(it, "", -1)
-                                        }
-                                        if (chunks.isNotEmpty()) {
-                                            ttsController.start(
-                                                chunks = chunks,
-                                                bookTitle = title,
-                                                chapterTitle = "Summary",
-                                                coverImageUri = null,
-                                                ttsMode = loadTtsMode(context),
-                                                playbackSource = "POPUP"
-                                            )
-                                        }
-                                    }
-                                },
-                                enabled = !isMainTtsActive || (ttsState.playbackSource == "POPUP")
-                            ) {
-                                Icon(
-                                    imageVector = if (isTtsSessionActive) Icons.Default.Stop else Icons.Default.PlayArrow,
-                                    contentDescription = if (isTtsSessionActive) "Stop" else "Read aloud"
-                                )
-                            }
-                            Spacer(modifier = Modifier.width(8.dp))
-                            IconButton(onClick = {
-                                clipboardManager.setText(AnnotatedString(textToUse))
-                            }) {
-                                Icon(
-                                    imageVector = Icons.Default.ContentCopy,
-                                    contentDescription = "Copy"
-                                )
-                            }
-                        }
-                    }
-
-                    HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
-
-                    if (errorText != null && summaryText.isNullOrBlank()) {
-                        Text(errorText, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyLarge)
-                    } else if (textToUse.isNotBlank()) {
-                        val scrollState = rememberScrollState()
-                        var textLayoutResult by remember { mutableStateOf<TextLayoutResult?>(null) }
-
-                        LaunchedEffect(ttsState.currentText, textLayoutResult) {
-                            val currentChunk = ttsState.currentText
-                            val layoutResult = textLayoutResult
-                            if (!currentChunk.isNullOrBlank() && layoutResult != null) {
-                                val startIndex = textToUse.indexOf(currentChunk)
-                                if (startIndex != -1) {
-                                    val line = layoutResult.getLineForOffset(startIndex)
-                                    val lineTop = layoutResult.getLineTop(line)
-                                    val viewportHeight = scrollState.viewportSize
-                                    val targetScroll = (lineTop - viewportHeight / 2).coerceAtLeast(0f)
-                                    scope.launch {
-                                        scrollState.animateScrollTo(targetScroll.toInt())
-                                    }
-                                }
-                            }
-                        }
-
-                        val annotatedText = buildAnnotatedString {
-                            append(styledContent)
-                            val currentChunk = ttsState.currentText
-                            if (!currentChunk.isNullOrBlank()) {
-                                val startIndex = textToUse.indexOf(currentChunk)
-                                if (startIndex != -1) {
-                                    addStyle(
-                                        style = SpanStyle(background = MaterialTheme.colorScheme.primaryContainer),
-                                        start = startIndex,
-                                        end = startIndex + currentChunk.length
-                                    )
-                                }
-                            }
-                        }
-                        Text(
-                            text = annotatedText,
-                            modifier = Modifier.verticalScroll(scrollState),
-                            onTextLayout = { textLayoutResult = it }
-                        )
-                    } else {
-                        Text("No summary could be generated.", style = MaterialTheme.typography.bodyLarge)
-                    }
-                }
+                Icon(Icons.Default.ArrowDropDown, contentDescription = stringResource(R.string.tooltip_next_result))
             }
         }
     }
@@ -672,7 +599,8 @@ fun AiDefinitionPopup(
     isLoading: Boolean,
     onDismiss: () -> Unit,
     isMainTtsActive: Boolean = false,
-    onOpenExternalDictionary: () -> Unit
+    onOpenExternalDictionary: () -> Unit,
+    getAuthToken: suspend () -> String?
 ) {
     val ttsController = rememberTtsController()
     val ttsState by ttsController.ttsState.collectAsState()
@@ -711,7 +639,7 @@ fun AiDefinitionPopup(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         CircularProgressIndicator()
-                        Text("Thinking...", modifier = Modifier.padding(start = 12.dp), style = MaterialTheme.typography.bodyLarge)
+                        Text(stringResource(R.string.ai_thinking), modifier = Modifier.padding(start = 12.dp), style = MaterialTheme.typography.bodyLarge)
                     }
                 } else if (result != null) {
                     word?.let {
@@ -756,14 +684,18 @@ fun AiDefinitionPopup(
                                             TtsChunk(it, "", -1)
                                         }
                                         if (chunks.isNotEmpty()) {
-                                            ttsController.start(
-                                                chunks = chunks,
-                                                bookTitle = "AI Definition",
-                                                chapterTitle = word,
-                                                coverImageUri = null,
-                                                ttsMode = loadTtsMode(context),
-                                                playbackSource = "POPUP"
-                                            )
+                                            scope.launch {
+                                                val token = getAuthToken()
+                                                ttsController.start(
+                                                    chunks = chunks,
+                                                    bookTitle = "AI Definition",
+                                                    chapterTitle = word,
+                                                    coverImageUri = null,
+                                                    ttsMode = loadTtsMode(context),
+                                                    playbackSource = "POPUP",
+                                                    authToken = token
+                                                )
+                                            }
                                         }
                                     }
                                 },
@@ -771,7 +703,7 @@ fun AiDefinitionPopup(
                             ) {
                                 Icon(
                                     imageVector = if (isTtsSessionActive) Icons.Default.Stop else Icons.Default.PlayArrow,
-                                    contentDescription = if (isTtsSessionActive) "Stop" else "Read aloud"
+                                    contentDescription = stringResource(if (isTtsSessionActive) R.string.action_stop else R.string.action_read_aloud)
                                 )
                             }
                             Spacer(modifier = Modifier.width(8.dp))
@@ -780,14 +712,14 @@ fun AiDefinitionPopup(
                             }) {
                                 Icon(
                                     imageVector = Icons.Default.ContentCopy,
-                                    contentDescription = "Copy"
+                                    contentDescription = stringResource(R.string.action_copy)
                                 )
                             }
                             Spacer(modifier = Modifier.width(8.dp))
                             IconButton(onClick = onOpenExternalDictionary) {
                                 Icon(
                                     painter = painterResource(id = R.drawable.dictionary),
-                                    contentDescription = "Open in Dictionary App"
+                                    contentDescription = stringResource(R.string.content_desc_open_dictionary)
                                 )
                             }
                         }
@@ -839,11 +771,11 @@ fun AiDefinitionPopup(
                             onTextLayout = { textLayoutResult = it }
                         )
                     } else {
-                        Text("AI could not provide a definition.", style = MaterialTheme.typography.bodyLarge)
+                        Text(stringResource(R.string.ai_no_definition), style = MaterialTheme.typography.bodyLarge)
                     }
                 } else if (word != null) {
                     Text(
-                        text = "Asking AI about '$word'...",
+                        text = stringResource(R.string.ai_asking_about, word),
                         style = MaterialTheme.typography.bodyLarge,
                         modifier = Modifier.padding(vertical = 24.dp),
                         maxLines = 1,
@@ -874,13 +806,13 @@ fun SearchResultsPanel(
             }
             results.isEmpty() -> {
                 Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    Text("No results found.", style = MaterialTheme.typography.bodyLarge)
+                    Text(stringResource(R.string.search_no_results_simple), style = MaterialTheme.typography.bodyLarge)
                 }
             }
             else -> {
                 Column {
                     Text(
-                        text = "${results.size} " + if (results.size == 1) "result found" else "results found",
+                        text = LocalContext.current.resources.getQuantityString(R.plurals.search_results_count, results.size, results.size),
                         style = MaterialTheme.typography.titleSmall,
                         modifier = Modifier
                             .padding(horizontal = 16.dp, vertical = 12.dp)
@@ -907,12 +839,14 @@ fun SearchResultsPanel(
 
 suspend fun fetchAiDefinition(
     text: String,
+    context: Context,
+    authToken: String?,
     onUpdate: (String) -> Unit,
     onError: (String) -> Unit,
     onFinish: () -> Unit
 ) {
     if (text.isBlank()) {
-        onError("Text is empty.")
+        onError(context.getString(R.string.error_text_empty))
         onFinish()
         return
     }
@@ -926,6 +860,9 @@ suspend fun fetchAiDefinition(
             connection.requestMethod = "POST"
             connection.setRequestProperty("Content-Type", "application/json; charset=UTF-8")
             connection.setRequestProperty("Accept", "application/json")
+            if (authToken != null) {
+                connection.setRequestProperty("Authorization", "Bearer $authToken")
+            }
             connection.connectTimeout = 10000
             connection.readTimeout = 30000
             connection.doOutput = true
@@ -937,6 +874,11 @@ suspend fun fetchAiDefinition(
             }
 
             val responseCode = connection.responseCode
+            if (responseCode == 402) {
+                onError("INSUFFICIENT_CREDITS")
+                onFinish()
+                return@withContext
+            }
             Timber.d("Definition: Got response code $responseCode")
             if (responseCode == HttpURLConnection.HTTP_OK) {
                 var hasReceivedData = false
@@ -961,16 +903,16 @@ suspend fun fetchAiDefinition(
                 }
                 Timber.d("Definition: Finished reading stream.")
                 if (!hasReceivedData) {
-                    onError("AI returned an empty definition.")
+                    onError(context.getString(R.string.error_ai_empty_definition))
                 }
             } else {
                 val errorBody = try { connection.errorStream?.bufferedReader()?.use { it.readText() } } catch (_: Exception) { null }
                 val errorDetail = try { errorBody?.let { JSONObject(it).getString("detail") } } catch (_: Exception) { "Could not get definition." }
-                onError("Error: $responseCode. ${errorDetail ?: "An unknown server error occurred."}")
+                onError("${responseCode}. ${errorDetail ?: context.getString(R.string.error_unknown_server)}")
             }
         } catch (e: Exception) {
             Timber.e(e, "Network error fetching AI definition: ${e.message}")
-            onError("Network error. Check connection.")
+            onError(context.getString(R.string.error_network_check_connection))
         } finally {
             connection?.disconnect()
             onFinish()
@@ -1048,55 +990,18 @@ object MarkdownParser {
     }
 }
 
-class SummaryCacheManager(context: Context) {
-    private val cacheDir = File(context.cacheDir, "chapter_summaries")
-
-    init {
-        if (!cacheDir.exists()) {
-            cacheDir.mkdirs()
-        }
-    }
-
-    private fun getFileName(bookTitle: String, chapterIndex: Int): String {
-        // Sanitize title to be file-system safe
-        val safeTitle = bookTitle.replace(Regex("[^a-zA-Z0-9.-]"), "_")
-        return "summary_${safeTitle}_$chapterIndex.txt"
-    }
-
-    fun saveSummary(bookTitle: String, chapterIndex: Int, summary: String) {
-        try {
-            val file = File(cacheDir, getFileName(bookTitle, chapterIndex))
-            file.writeText(summary)
-            Timber.d("Saved summary for $bookTitle Ch $chapterIndex")
-        } catch (e: Exception) {
-            Timber.e(e, "Failed to save summary")
-        }
-    }
-
-    fun getSummary(bookTitle: String, chapterIndex: Int): String? {
-        return try {
-            val file = File(cacheDir, getFileName(bookTitle, chapterIndex))
-            if (file.exists()) file.readText() else null
-        } catch (_: Exception) {
-            null
-        }
-    }
-
-    fun hasSummary(bookTitle: String, chapterIndex: Int): Boolean {
-        val file = File(cacheDir, getFileName(bookTitle, chapterIndex))
-        return file.exists()
-    }
-}
-
 suspend fun fetchRecap(
     pastSummaries: List<String>,
     currentText: String,
+    context: Context,
+    authToken: String?,
     onUpdate: (String) -> Unit,
+    onCostReceived: (Double) -> Unit = {},
     onError: (String) -> Unit,
     onFinish: () -> Unit
 ) {
     if (pastSummaries.isEmpty() && currentText.isBlank()) {
-        onError("Not enough context for a recap.")
+        onError(context.getString(R.string.error_not_enough_context))
         onFinish()
         return
     }
@@ -1109,13 +1014,16 @@ suspend fun fetchRecap(
             connection.requestMethod = "POST"
             connection.setRequestProperty("Content-Type", "application/json; charset=UTF-8")
             connection.setRequestProperty("Accept", "application/json")
+            if (authToken != null) {
+                connection.setRequestProperty("Authorization", "Bearer $authToken")
+            }
             connection.connectTimeout = 15000
             connection.readTimeout = 120000
             connection.doOutput = true
             connection.doInput = true
 
             val jsonPayload = JSONObject().apply {
-                put("past_summaries", org.json.JSONArray(pastSummaries))
+                put("past_summaries", JSONArray(pastSummaries))
                 put("current_text", currentText)
             }
 
@@ -1124,6 +1032,11 @@ suspend fun fetchRecap(
             }
 
             val responseCode = connection.responseCode
+            if (responseCode == 402) {
+                onError("INSUFFICIENT_CREDITS")
+                onFinish()
+                return@withContext
+            }
             if (responseCode == HttpURLConnection.HTTP_OK) {
                 var hasReceivedData = false
                 connection.inputStream.bufferedReader(Charsets.UTF_8).use { reader ->
@@ -1131,6 +1044,9 @@ suspend fun fetchRecap(
                     while (reader.readLine().also { line = it } != null) {
                         try {
                             val jsonResponse = JSONObject(line!!)
+
+                            jsonResponse.optDouble("cost_deducted", -1.0).takeIf { it > -1.0 }?.let { onCostReceived(it) }
+
                             jsonResponse.optString("chunk").takeIf { it.isNotEmpty() }?.let {
                                 onUpdate(it)
                                 hasReceivedData = true
@@ -1143,14 +1059,14 @@ suspend fun fetchRecap(
                         }
                     }
                 }
-                if (!hasReceivedData) onError("Failed to parse recap.")
+                if (!hasReceivedData) onError(context.getString(R.string.error_parse_recap))
             } else {
                 val errorBody = try { connection.errorStream?.bufferedReader()?.use { it.readText() } } catch (_: Exception) { null }
-                onError("Error: $responseCode. ${errorBody ?: ""}")
+                onError("${responseCode}. ${errorBody ?: ""}")
             }
         } catch (e: Exception) {
             Timber.e(e, "Recap error: ${e.message}")
-            onError("Network error during recap generation.")
+            onError(context.getString(R.string.error_network_recap))
         } finally {
             connection?.disconnect()
             onFinish()
@@ -1159,6 +1075,7 @@ suspend fun fetchRecap(
 }
 
 @androidx.annotation.OptIn(UnstableApi::class)
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun TtsSettingsSheet(
     isVisible: Boolean,
@@ -1167,176 +1084,402 @@ fun TtsSettingsSheet(
     onModeChange: (TtsPlaybackManager.TtsMode) -> Unit,
     currentSpeakerId: String,
     onSpeakerChange: (String) -> Unit,
-    isTtsActive: Boolean
+    isTtsActive: Boolean,
+    getAuthToken: suspend () -> String?,
+    bookTitle: String
 ) {
-    if (isVisible) {
-        val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
-        rememberLazyListState()
-        val context = LocalContext.current
-        val scope = rememberCoroutineScope()
+    if (!isVisible) return
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
 
-        val samplePlayer = remember(context, scope) { SpeakerSamplePlayer(context, scope) }
+    val isOss = BuildConfig.FLAVOR == "oss"
+    var selectedTabIndex by remember(currentMode) { mutableIntStateOf(if (currentMode == TtsPlaybackManager.TtsMode.CLOUD && !isOss) 0 else 1) }
 
-        DisposableEffect(Unit) {
-            onDispose { samplePlayer.release() }
-        }
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val samplePlayer = remember(context, scope) {
+        SpeakerSamplePlayer(context, scope, getAuthToken = getAuthToken)
+    }
 
-        ModalBottomSheet(
-            onDismissRequest = onDismiss,
-            sheetState = sheetState,
-            containerColor = MaterialTheme.colorScheme.surface,
-            contentWindowInsets = { WindowInsets.navigationBars }
-        ) {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 24.dp)
-                    .padding(bottom = 24.dp)
-            ) {
-                Text(
-                    text = "Text-to-Speech Settings",
-                    style = MaterialTheme.typography.headlineSmall,
-                    fontWeight = FontWeight.Bold,
-                    modifier = Modifier.padding(bottom = 16.dp)
-                )
+    DisposableEffect(Unit) { onDispose { samplePlayer.release() } }
 
-                if (isTtsActive) {
-                    Surface(
-                        color = MaterialTheme.colorScheme.errorContainer,
-                        shape = RoundedCornerShape(12.dp),
-                        modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp)
-                    ) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            modifier = Modifier.padding(12.dp)
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = sheetState,
+        containerColor = MaterialTheme.colorScheme.surface,
+        contentWindowInsets = { WindowInsets.navigationBars }
+    ) {
+        Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp).padding(bottom = 24.dp)) {
+            Text(stringResource(R.string.tts_settings), style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold, modifier = Modifier.padding(bottom = 16.dp))
+
+            if (isTtsActive) {
+                Surface(color = MaterialTheme.colorScheme.errorContainer, shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(12.dp)) {
+                        Icon(Icons.Default.Stop, contentDescription = null, tint = MaterialTheme.colorScheme.onErrorContainer)
+                        Spacer(Modifier.width(12.dp))
+                        Text(stringResource(R.string.tts_stop_to_change_settings), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onErrorContainer)
+                    }
+                }
+            }
+
+            if (isOss) {
+                Spacer(Modifier.height(16.dp))
+                DeviceVoicesTab(isTtsActive, context, TtsPlaybackManager.TtsMode.BASE)
+            } else {
+                Text("Active TTS Engine", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
+                Spacer(Modifier.height(8.dp))
+                Row(modifier = Modifier.fillMaxWidth().height(48.dp).background(MaterialTheme.colorScheme.surfaceContainerHigh, RoundedCornerShape(24.dp)).padding(4.dp)) {
+                    val modes = listOf(TtsPlaybackManager.TtsMode.CLOUD to "Cloud AI", TtsPlaybackManager.TtsMode.BASE to "Device Native")
+                    modes.forEach { (mode, title) ->
+                        val isSelected = currentMode == mode
+                        Box(
+                            modifier = Modifier.weight(1f).fillMaxHeight().clip(RoundedCornerShape(20.dp))
+                                .background(if (isSelected) MaterialTheme.colorScheme.primary else Color.Transparent)
+                                .clickable(enabled = !isTtsActive) {
+                                    onModeChange(mode)
+                                    if (mode == TtsPlaybackManager.TtsMode.CLOUD && selectedTabIndex == 1) selectedTabIndex = 0
+                                    if (mode == TtsPlaybackManager.TtsMode.BASE && selectedTabIndex != 1) selectedTabIndex = 1
+                                },
+                            contentAlignment = Alignment.Center
                         ) {
-                            Icon(Icons.Default.Stop, contentDescription = null, tint = MaterialTheme.colorScheme.onErrorContainer)
-                            Spacer(Modifier.width(12.dp))
-                            Text(
-                                "Please stop playback to change settings.",
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.onErrorContainer
-                            )
+                            Text(title, color = if (isSelected) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
                         }
                     }
                 }
 
-                Text(
-                    text = "Synthesis Mode",
-                    style = MaterialTheme.typography.labelLarge,
-                    color = MaterialTheme.colorScheme.primary,
-                    modifier = Modifier.padding(bottom = 8.dp)
-                )
+                Spacer(Modifier.height(16.dp))
 
-                // Mode Selector
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(50.dp)
-                        .background(MaterialTheme.colorScheme.surfaceContainerHigh, RoundedCornerShape(25.dp))
-                        .padding(4.dp),
-                    horizontalArrangement = Arrangement.spacedBy(4.dp)
-                ) {
-                    TtsPlaybackManager.TtsMode.entries.forEach { mode ->
-                        val isSelected = currentMode == mode
-                        val label = if (mode == TtsPlaybackManager.TtsMode.BASE) "On-Device" else "Cloud (HQ)"
-                        val icon = if (mode == TtsPlaybackManager.TtsMode.BASE) Icons.Default.Smartphone else Icons.Default.Cloud
+                TabRow(selectedTabIndex = selectedTabIndex, containerColor = Color.Transparent, divider = {}) {
+                    Tab(selected = selectedTabIndex == 0, onClick = { selectedTabIndex = 0 }, text = { Text("Cloud Voices", maxLines = 1, overflow = TextOverflow.Ellipsis) })
+                    Tab(selected = selectedTabIndex == 1, onClick = { selectedTabIndex = 1 }, text = { Text("Device Voices", maxLines = 1, overflow = TextOverflow.Ellipsis) })
+                    Tab(selected = selectedTabIndex == 2, onClick = { selectedTabIndex = 2 }, text = { Text("Cloud Cache", maxLines = 1, overflow = TextOverflow.Ellipsis) })
+                }
 
-                        Surface(
-                            modifier = Modifier
-                                .weight(1f)
-                                .fillMaxHeight()
-                                .clickable(enabled = !isTtsActive) { onModeChange(mode) },
-                            shape = RoundedCornerShape(25.dp),
-                            color = if (isSelected) MaterialTheme.colorScheme.primary else Color.Transparent,
-                            contentColor = if (isSelected) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant
-                        ) {
-                            Row(
-                                horizontalArrangement = Arrangement.Center,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Icon(icon, contentDescription = null, modifier = Modifier.size(18.dp))
-                                Spacer(Modifier.width(8.dp))
-                                Text(
-                                    text = label,
-                                    style = MaterialTheme.typography.labelLarge,
-                                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium
+                Spacer(Modifier.height(16.dp))
+
+                when (selectedTabIndex) {
+                    0 -> AiVoicesTab(currentSpeakerId, onSpeakerChange, isTtsActive, samplePlayer, currentMode)
+                    1 -> DeviceVoicesTab(isTtsActive, context, currentMode)
+                    2 -> TtsCacheTab(bookTitle, context, currentSpeakerId)
+                }
+            }
+        }
+    }
+}
+
+@UnstableApi
+@Composable
+fun AiVoicesTab(
+    currentSpeakerId: String,
+    onSpeakerChange: (String) -> Unit,
+    isTtsActive: Boolean,
+    samplePlayer: SpeakerSamplePlayer,
+    currentMode: TtsPlaybackManager.TtsMode
+) {
+    LocalContext.current
+    val isCloudMode = currentMode == TtsPlaybackManager.TtsMode.CLOUD
+
+    Row(modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+        Text("Select High-Quality Cloud Voice", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
+        if (samplePlayer.cachedSpeakers.isNotEmpty()) {
+            TextButton(onClick = { samplePlayer.clearSamples() }, modifier = Modifier.heightIn(min = 24.dp)) {
+                Text("Clear Samples", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelMedium)
+            }
+        }
+    }
+
+    LazyColumn(modifier = Modifier.fillMaxWidth().heightIn(max = 300.dp).border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(12.dp)).background(MaterialTheme.colorScheme.surface, RoundedCornerShape(12.dp))) {
+        items(GEMINI_TTS_SPEAKERS.size) { index ->
+            val voice = GEMINI_TTS_SPEAKERS[index]
+            val isSelected = currentSpeakerId == voice.id
+            val isCached = samplePlayer.cachedSpeakers.contains(voice.id)
+
+            ListItem(
+                headlineContent = { Text(voice.name, fontWeight = if (isSelected && isCloudMode) FontWeight.Bold else FontWeight.Normal) },
+                supportingContent = { Text(voice.description, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) },
+                leadingContent = {
+                    if (isSelected && isCloudMode) {
+                        Icon(Icons.Default.Check, null, tint = MaterialTheme.colorScheme.primary)
+                    } else {
+                        Icon(Icons.Default.Cloud, null, tint = Color.Gray)
+                    }
+                },
+                trailingContent = {
+                    if (!isTtsActive) {
+                        IconButton(onClick = { samplePlayer.playOrStop(voice.id) }) {
+                            if (samplePlayer.loadingSpeakerId == voice.id) {
+                                CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                            } else {
+                                Icon(
+                                    if (samplePlayer.playingSpeakerId == voice.id) Icons.Default.Stop
+                                    else if (isCached) Icons.Default.PlayCircle
+                                    else Icons.Default.PlayArrow,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.primary
                                 )
                             }
                         }
                     }
-                }
+                },
+                modifier = Modifier.clickable(enabled = !isTtsActive && isCloudMode) { onSpeakerChange(voice.id) },
+                colors = ListItemDefaults.colors(
+                    containerColor = if (isSelected && isCloudMode) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.3f) else Color.Transparent
+                )
+            )
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+        }
+    }
+}
 
-                Spacer(Modifier.height(24.dp))
+@androidx.annotation.OptIn(UnstableApi::class)
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun DeviceVoicesTab(
+    isTtsActive: Boolean,
+    context: Context,
+    currentMode: TtsPlaybackManager.TtsMode
+) {
+    var savedVoiceName by remember { mutableStateOf(loadNativeVoice(context)) }
+    var ttsEngine by remember { mutableStateOf<TextToSpeech?>(null) }
+    var allVoices by remember { mutableStateOf<List<Voice>>(emptyList()) }
+    var isTtsLoading by remember { mutableStateOf(true) }
 
-                if (currentMode == TtsPlaybackManager.TtsMode.CLOUD) {
-                    Text(
-                        text = "Voice Selection",
-                        style = MaterialTheme.typography.labelLarge,
-                        color = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.padding(bottom = 8.dp)
-                    )
+    var selectedLanguage by remember { mutableStateOf("All") }
+    var languageMenuExpanded by remember { mutableStateOf(false) }
 
-                    LazyColumn(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .heightIn(max = 300.dp)
-                            .border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(12.dp))
-                            .background(MaterialTheme.colorScheme.surface, RoundedCornerShape(12.dp))
-                    ) {
-                        items(GOOGLE_TTS_SPEAKERS) { (name, id) ->
-                            val isSelected = currentSpeakerId == id
-                            val isPlaying = samplePlayer.playingSpeakerId == id
-                            val isLoading = samplePlayer.loadingSpeakerId == id
+    DisposableEffect(Unit) {
+        val tts = TextToSpeech(context) { status ->
+            if (status == TextToSpeech.SUCCESS) {
+                allVoices = ttsEngine?.voices?.toList()?.sortedBy { it.locale.displayName } ?: emptyList()
+                isTtsLoading = false
+            }
+        }
+        ttsEngine = tts
+        onDispose { tts.shutdown() }
+    }
 
-                            ListItem(
-                                headlineContent = { Text(name, fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal) },
-                                leadingContent = {
-                                    if (isSelected) {
-                                        Icon(Icons.Default.Check, contentDescription = "Selected", tint = MaterialTheme.colorScheme.primary)
-                                    } else {
-                                        Icon(Icons.Default.GraphicEq, contentDescription = null, tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f))
-                                    }
-                                },
-                                trailingContent = {
-                                    if (!isTtsActive) {
-                                        IconButton(onClick = { samplePlayer.playOrStop(id) }) {
-                                            if (isLoading) {
-                                                CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
-                                            } else {
-                                                Icon(
-                                                    imageVector = if (isPlaying) Icons.Default.Stop else Icons.Default.PlayArrow,
-                                                    contentDescription = "Play Sample",
-                                                    tint = if (isPlaying) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
-                                                )
-                                            }
-                                        }
-                                    }
-                                },
-                                colors = ListItemDefaults.colors(
-                                    containerColor = if (isSelected) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.3f) else Color.Transparent
-                                ),
-                                modifier = Modifier.clickable(enabled = !isTtsActive) {
-                                    onSpeakerChange(id)
-                                }
-                            )
-                            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
-                        }
+    if (isTtsLoading) {
+        Box(modifier = Modifier.fillMaxWidth().height(150.dp), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
+        return
+    }
+
+    val languages = remember(allVoices) {
+        val list = listOf("All") + allVoices.map { it.locale.displayLanguage }.filter { it.isNotBlank() }.distinct().sorted()
+        Timber.tag("TTS_DIAGNOSE").d("Languages list updated: size=${list.size}, items=$list")
+        list
+    }
+
+    val filteredVoices = remember(allVoices, selectedLanguage) {
+        if (selectedLanguage == "All") allVoices
+        else allVoices.filter { it.locale.displayLanguage == selectedLanguage }
+    }
+
+    val isBaseMode = currentMode == TtsPlaybackManager.TtsMode.BASE
+
+    Surface(
+        color = if (isBaseMode && savedVoiceName == null) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceContainerHigh,
+        shape = RoundedCornerShape(16.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(bottom = 16.dp)
+            .clickable(enabled = !isTtsActive && isBaseMode) {
+                savedVoiceName = null
+                saveNativeVoice(context, null)
+            }
+    ) {
+        Row(modifier = Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+            Icon(
+                Icons.Default.Smartphone,
+                null,
+                tint = if (isBaseMode && savedVoiceName == null) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Spacer(Modifier.width(16.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text("System Default Voice", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                Text("Uses device settings", style = MaterialTheme.typography.bodySmall)
+            }
+            if (isBaseMode && savedVoiceName == null) Icon(Icons.Default.Check, null, tint = MaterialTheme.colorScheme.primary)
+        }
+    }
+
+    androidx.compose.material3.ExposedDropdownMenuBox(
+        expanded = languageMenuExpanded,
+        onExpandedChange = { if (!isTtsActive) languageMenuExpanded = it },
+        modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)
+    ) {
+        OutlinedTextField(
+            value = selectedLanguage,
+            onValueChange = {},
+            readOnly = true,
+            label = { Text("Language Filter") },
+            trailingIcon = { androidx.compose.material3.ExposedDropdownMenuDefaults.TrailingIcon(expanded = languageMenuExpanded) },
+            colors = androidx.compose.material3.ExposedDropdownMenuDefaults.outlinedTextFieldColors(),
+            modifier = Modifier.fillMaxWidth().menuAnchor(),
+            enabled = !isTtsActive
+        )
+        ExposedDropdownMenu(
+            expanded = languageMenuExpanded,
+            onDismissRequest = { languageMenuExpanded = false }
+        ) {
+            languages.forEach { lang ->
+                Timber.tag("TTS_DIAGNOSE").d("Rendering Language DropdownMenuItem: '$lang'")
+                DropdownMenuItem(
+                    text = {
+                        Text(text = lang)
+                    },
+                    onClick = {
+                        selectedLanguage = lang
+                        languageMenuExpanded = false
+                        Timber.tag("TTS_DIAGNOSE").d("Language selected: $lang")
                     }
-                } else {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(top = 16.dp),
-                        contentAlignment = Alignment.Center
+                )
+            }
+        }
+    }
+
+    LazyColumn(modifier = Modifier.fillMaxWidth().heightIn(max = 200.dp).border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(12.dp))) {
+        items(filteredVoices.size) { index ->
+            val voice = filteredVoices[index]
+            val isSelected = isBaseMode && voice.name == savedVoiceName
+
+            ListItem(
+                headlineContent = { Text(voice.locale.displayName, fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal) },
+                supportingContent = { Text(if (voice.isNetworkConnectionRequired) "Online" else "Offline") },
+                leadingContent = {
+                    if (isSelected) {
+                        Icon(Icons.Default.Check, null, tint = MaterialTheme.colorScheme.primary)
+                    } else {
+                        Spacer(Modifier.size(24.dp))
+                    }
+                },
+                modifier = Modifier.clickable(enabled = !isTtsActive && isBaseMode) {
+                    savedVoiceName = voice.name
+                    saveNativeVoice(context, voice.name)
+                },
+                colors = ListItemDefaults.colors(containerColor = if (isSelected) MaterialTheme.colorScheme.primaryContainer.copy(0.2f) else Color.Transparent),
+                trailingContent = {
+                    IconButton(
+                        enabled = !isTtsActive,
+                        onClick = {
+                            ttsEngine?.apply {
+                                language = voice.locale
+                                speak("This is a voice sample.", TextToSpeech.QUEUE_FLUSH, null, "sample_${voice.name}")
+                            }
+                        }
                     ) {
-                        Text(
-                            "Using system default engine settings.",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        Icon(Icons.Default.PlayArrow, contentDescription = "Play Sample", tint = MaterialTheme.colorScheme.primary)
+                    }
+                }
+            )
+            HorizontalDivider()
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun TtsCacheTab(bookTitle: String, context: Context, currentSpeakerId: String) {
+    val cacheManager = remember { TtsCacheManager(context) }
+    var selectedSpeakerFilter by remember { mutableStateOf(currentSpeakerId) }
+    var filterMenuExpanded by remember { mutableStateOf(false) }
+
+    val allSpeakers = remember(bookTitle) {
+        val fromCache = cacheManager.getBookCacheDir(bookTitle).listFiles()?.flatMap { ch ->
+            ch.listFiles()?.mapNotNull { file ->
+                val parts = file.name.split("_")
+                if (parts.size >= 5) parts[3] else null
+            } ?: emptyList()
+        }?.distinct()?.sorted() ?: emptyList()
+        val list = (listOf(currentSpeakerId) + fromCache).distinct()
+        Timber.tag("TTS_DIAGNOSE").d("AllSpeakers list updated: size=${list.size}, items=$list")
+        list
+    }
+
+    var chapters by remember(selectedSpeakerFilter) { mutableStateOf(cacheManager.getChapterCaches(bookTitle, selectedSpeakerFilter)) }
+    val totalSize = remember(chapters) { chapters.sumOf { it.sizeBytes } }
+
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Row(modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+            Text("Cloud TTS Cache", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
+            Surface(color = MaterialTheme.colorScheme.secondaryContainer, shape = RoundedCornerShape(8.dp)) {
+                Text(formatBytes(totalSize), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSecondaryContainer, modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp))
+            }
+        }
+
+        if (allSpeakers.isNotEmpty()) {
+            androidx.compose.material3.ExposedDropdownMenuBox(
+                expanded = filterMenuExpanded,
+                onExpandedChange = { filterMenuExpanded = it },
+                modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp)
+            ) {
+                OutlinedTextField(
+                    value = selectedSpeakerFilter,
+                    onValueChange = {},
+                    readOnly = true,
+                    label = { Text("Voice Filter") },
+                    trailingIcon = { androidx.compose.material3.ExposedDropdownMenuDefaults.TrailingIcon(expanded = filterMenuExpanded) },
+                    colors = androidx.compose.material3.ExposedDropdownMenuDefaults.outlinedTextFieldColors(),
+                    modifier = Modifier.fillMaxWidth().menuAnchor()
+                )
+                ExposedDropdownMenu(
+                    expanded = filterMenuExpanded,
+                    onDismissRequest = { filterMenuExpanded = false }
+                ) {
+                    allSpeakers.forEach { spkr ->
+                        Timber.tag("TTS_DIAGNOSE").d("Rendering Voice DropdownMenuItem: '$spkr'")
+                        DropdownMenuItem(
+                            text = {
+                                Text(text = spkr)
+                            },
+                            onClick = {
+                                selectedSpeakerFilter = spkr
+                                filterMenuExpanded = false
+                                Timber.tag("TTS_DIAGNOSE").d("Voice filter selected: $spkr")
+                            }
                         )
                     }
                 }
+            }
+        }
+
+        if (chapters.isEmpty()) {
+            Box(modifier = Modifier.fillMaxWidth().height(150.dp), contentAlignment = Alignment.Center) {
+                Text("No audio cached for this voice.", style = MaterialTheme.typography.bodyMedium)
+            }
+        } else {
+            LazyColumn(modifier = Modifier.fillMaxWidth().heightIn(max = 240.dp).border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(12.dp))) {
+                items(chapters.size) { index ->
+                    val chapter = chapters[index]
+                    ListItem(
+                        headlineContent = {
+                            Text("${chapter.chapterTitle} (${chapter.chunkCount} chunks)", fontWeight = FontWeight.Medium)
+                        },
+                        supportingContent = { Text(formatBytes(chapter.sizeBytes)) },
+                        trailingContent = {
+                            IconButton(onClick = {
+                                cacheManager.deleteSpecificFiles(chapter.matchingFiles, chapter.directory)
+                                chapters = cacheManager.getChapterCaches(bookTitle, selectedSpeakerFilter)
+                            }) {
+                                Icon(Icons.Default.Delete, contentDescription = "Delete", tint = MaterialTheme.colorScheme.error)
+                            }
+                        }
+                    )
+                    HorizontalDivider()
+                }
+            }
+
+            Spacer(Modifier.height(16.dp))
+
+            Button(
+                onClick = {
+                    chapters.forEach { cacheManager.deleteSpecificFiles(it.matchingFiles, it.directory) }
+                    chapters = cacheManager.getChapterCaches(bookTitle, selectedSpeakerFilter)
+                },
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.errorContainer, contentColor = MaterialTheme.colorScheme.onErrorContainer)
+            ) {
+                Icon(Icons.Default.Delete, contentDescription = null)
+                Spacer(Modifier.width(8.dp))
+                Text("Clear Cache for $selectedSpeakerFilter")
             }
         }
     }
@@ -1353,399 +1496,6 @@ private fun saveNativeVoice(context: Context, @Suppress("SameParameterValue") vo
         prefs.edit { remove(PREF_NATIVE_TTS_VOICE) }
     } else {
         prefs.edit { putString(PREF_NATIVE_TTS_VOICE, voiceName) }
-    }
-}
-
-@Composable
-fun DeviceVoiceSettingsSheet(
-    isVisible: Boolean,
-    onDismiss: () -> Unit
-) {
-    if (isVisible) {
-        val listState = rememberLazyListState()
-        val context = LocalContext.current
-        @Suppress("UnusedVariable", "Unused") val scope = rememberCoroutineScope()
-
-        var ttsEngine by remember { mutableStateOf<TextToSpeech?>(null) }
-        var allVoices by remember { mutableStateOf<List<Voice>>(emptyList()) }
-        var isTtsLoading by remember { mutableStateOf(true) }
-
-        var savedVoiceName by remember { mutableStateOf(loadNativeVoice(context)) }
-
-        val allLanguagesOption = "All Languages"
-        var selectedLanguage by remember { mutableStateOf(allLanguagesOption) }
-
-        val numberedVoiceNames = remember(allVoices) {
-            val nameMap = mutableMapOf<String, String>()
-
-            val groupedByLanguage = allVoices.groupBy { it.locale.displayName }
-
-            groupedByLanguage.forEach { (langName, voiceList) ->
-                if (voiceList.size > 1) {
-                    voiceList.forEachIndexed { index, voice ->
-                        val type = try {
-                            if (voice.isNetworkConnectionRequired) "Online" else "Offline"
-                        } catch (_: Exception) {
-                            "Offline"
-                        }
-
-                        nameMap[voice.name] = "$langName ($type) - ${index + 1}"
-                    }
-                } else {
-                    val voice = voiceList[0]
-                    val type = try {
-                        if (voice.isNetworkConnectionRequired) "Online" else "Offline"
-                    } catch (_: Exception) {
-                        "Offline"
-                    }
-
-                    nameMap[voice.name] = "$langName ($type)"
-                }
-            }
-            nameMap
-        }
-
-        DisposableEffect(Unit) {
-            var tts: TextToSpeech? = null
-            tts = TextToSpeech(context) { status ->
-                if (status == TextToSpeech.SUCCESS) {
-                    try {
-                        val enginesVoices = tts?.voices
-                        if (enginesVoices != null) {
-                            allVoices = enginesVoices.toList().sortedBy { it.locale.displayName }
-                        }
-                    } catch (e: Exception) {
-                        Timber.e(e, "Failed to fetch voices")
-                    } finally {
-                        isTtsLoading = false
-                    }
-                } else {
-                    isTtsLoading = false
-                    Timber.e("TTS Initialization failed with status $status")
-                }
-            }
-            ttsEngine = tts
-            onDispose {
-                tts.shutdown()
-            }
-        }
-
-        val availableLanguages = remember(allVoices) {
-            val languages =
-                allVoices.asSequence().map { it.locale.displayLanguage }.filter { it.isNotBlank() }
-                    .distinct().sorted().toMutableList()
-
-            languages.add(0, allLanguagesOption)
-            languages
-        }
-
-        LaunchedEffect(allVoices, savedVoiceName) {
-            if (savedVoiceName != null && allVoices.isNotEmpty()) {
-                val savedVoice = allVoices.find { it.name == savedVoiceName }
-                if (savedVoice != null) {
-                    val voiceLanguage = savedVoice.locale.displayLanguage
-                    if (selectedLanguage == allLanguagesOption) {
-                        selectedLanguage = voiceLanguage
-                    }
-                }
-            }
-        }
-
-        val filteredVoices = remember(selectedLanguage, allVoices) {
-            if (selectedLanguage == allLanguagesOption) {
-                allVoices
-            } else {
-                allVoices.filter { it.locale.displayLanguage == selectedLanguage }
-            }
-        }
-
-        LaunchedEffect(filteredVoices, savedVoiceName) {
-            if (savedVoiceName != null && filteredVoices.isNotEmpty()) {
-                val index = filteredVoices.indexOfFirst { it.name == savedVoiceName }
-                if (index != -1) {
-                    Timber.d("Auto-scrolling to voice at index: $index")
-                    delay(300)
-                    listState.animateScrollToItem(index)
-                }
-            }
-        }
-
-        androidx.compose.ui.window.Dialog(
-            onDismissRequest = onDismiss, properties = androidx.compose.ui.window.DialogProperties(
-                usePlatformDefaultWidth = false
-            )
-        ) {
-            Column(
-                modifier = Modifier.fillMaxSize(), verticalArrangement = Arrangement.Bottom
-            ) {
-                Box(
-                    modifier = Modifier.weight(1f).fillMaxWidth().clickable(
-                        interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() },
-                        indication = null,
-                        onClick = onDismiss
-                    )
-                )
-
-                Surface(
-                    modifier = Modifier.fillMaxWidth().fillMaxHeight(0.9f),
-                    shape = RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp),
-                    color = MaterialTheme.colorScheme.surface,
-                    tonalElevation = 6.dp
-                ) {
-                    Column(
-                        modifier = Modifier.fillMaxSize()
-                            .windowInsetsPadding(WindowInsets.navigationBars)
-                            .padding(horizontal = 24.dp).padding(bottom = 24.dp, top = 24.dp)
-                    ) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(
-                                text = "On-Device Voice Settings",
-                                style = MaterialTheme.typography.headlineSmall,
-                                fontWeight = FontWeight.Bold,
-                                modifier = Modifier.weight(1f)
-                            )
-                            IconButton(onClick = onDismiss) {
-                                Icon(Icons.Default.Close, contentDescription = "Close Settings")
-                            }
-                        }
-
-                        Surface(
-                            color = if (savedVoiceName == null) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceContainerHigh,
-                            shape = RoundedCornerShape(16.dp),
-                            tonalElevation = if (savedVoiceName == null) 4.dp else 0.dp,
-                            modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp).clickable {
-                                savedVoiceName = null
-                                saveNativeVoice(context, null)
-                                Timber.d("Native TTS: Reset to System Default")
-                            }) {
-                            Row(
-                                modifier = Modifier.padding(16.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.Smartphone,
-                                    contentDescription = null,
-                                    tint = if (savedVoiceName == null) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                                Spacer(Modifier.width(16.dp))
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text(
-                                        text = "System Default",
-                                        style = MaterialTheme.typography.titleMedium,
-                                        fontWeight = FontWeight.Bold
-                                    )
-                                    Text(
-                                        text = "Matches your Android system settings",
-                                        style = MaterialTheme.typography.bodySmall
-                                    )
-                                }
-                                if (savedVoiceName == null) {
-                                    Icon(
-                                        Icons.Default.Check,
-                                        contentDescription = "Selected",
-                                        tint = MaterialTheme.colorScheme.primary
-                                    )
-                                }
-                            }
-                        }
-
-                        HorizontalDivider(modifier = Modifier.padding(bottom = 16.dp))
-
-                        if (isTtsLoading) {
-                            Box(
-                                modifier = Modifier.fillMaxWidth().height(200.dp),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                CircularProgressIndicator()
-                                Spacer(modifier = Modifier.height(8.dp))
-                                Text("Loading voices...", modifier = Modifier.padding(top = 48.dp))
-                            }
-                        } else if (allVoices.isEmpty()) {
-                            Box(
-                                modifier = Modifier.fillMaxWidth().height(100.dp),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Text(
-                                    "No voices available on this device.",
-                                    color = MaterialTheme.colorScheme.error
-                                )
-                            }
-                        } else {
-                            var expandedLanguageMenu by remember { mutableStateOf(false) }
-
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Text(
-                                    text = "Specific Voices",
-                                    style = MaterialTheme.typography.titleMedium,
-                                    fontWeight = FontWeight.Bold,
-                                )
-                            }
-
-                            Spacer(modifier = Modifier.height(8.dp))
-
-                            Box(modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp)) {
-                                Surface(
-                                    modifier = Modifier.fillMaxWidth().height(50.dp)
-                                        .clickable { expandedLanguageMenu = true },
-                                    shape = RoundedCornerShape(8.dp),
-                                    color = MaterialTheme.colorScheme.surface,
-                                    border = androidx.compose.foundation.BorderStroke(
-                                        1.dp, MaterialTheme.colorScheme.outlineVariant
-                                    )
-                                ) {
-                                    Row(
-                                        modifier = Modifier.padding(horizontal = 16.dp),
-                                        verticalAlignment = Alignment.CenterVertically,
-                                        horizontalArrangement = Arrangement.SpaceBetween
-                                    ) {
-                                        Text(
-                                            text = selectedLanguage,
-                                            style = MaterialTheme.typography.bodyMedium,
-                                            color = MaterialTheme.colorScheme.onSurface,
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis
-                                        )
-                                        Icon(
-                                            imageVector = Icons.Default.ArrowDropDown,
-                                            contentDescription = null,
-                                            tint = MaterialTheme.colorScheme.onSurfaceVariant
-                                        )
-                                    }
-                                }
-
-                                DropdownMenu(
-                                    expanded = expandedLanguageMenu,
-                                    onDismissRequest = { expandedLanguageMenu = false },
-                                    modifier = Modifier.fillMaxWidth(0.85f).heightIn(max = 400.dp)
-                                        .background(MaterialTheme.colorScheme.surfaceContainerHigh)
-                                ) {
-                                    availableLanguages.forEach { language ->
-                                        DropdownMenuItem(text = {
-                                            Text(
-                                                text = language,
-                                                style = MaterialTheme.typography.bodyLarge,
-                                                color = MaterialTheme.colorScheme.onSurface
-                                            )
-                                        }, onClick = {
-                                            selectedLanguage = language
-                                            expandedLanguageMenu = false
-                                        })
-                                    }
-                                }
-                            }
-
-                            if (filteredVoices.isNotEmpty()) {
-                                Text(
-                                    text = "Available Voices (${filteredVoices.size})",
-                                    style = MaterialTheme.typography.labelLarge,
-                                    color = MaterialTheme.colorScheme.primary,
-                                    modifier = Modifier.padding(bottom = 8.dp, start = 4.dp)
-                                )
-
-                                LazyColumn(
-                                    state = listState,
-                                    modifier = Modifier.fillMaxWidth().weight(1f, fill = false)
-                                        .padding(vertical = 4.dp).border(
-                                            1.dp,
-                                            MaterialTheme.colorScheme.outlineVariant,
-                                            RoundedCornerShape(12.dp)
-                                        )
-                                ) {
-                                    items(
-                                        filteredVoices.size,
-                                        key = { "${filteredVoices[it].name}_$it" }) { index ->
-                                        val voice = filteredVoices[index]
-                                        val isSelected = voice.name == savedVoiceName
-                                        val friendlyName = numberedVoiceNames[voice.name]
-                                            ?: voice.locale.displayName
-
-                                        ListItem(
-                                            headlineContent = {
-                                                Text(
-                                                    text = friendlyName,
-                                                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
-                                                    color = MaterialTheme.colorScheme.onSurface
-                                                )
-                                            },
-                                            supportingContent = if (voice.locale.variant.isNotEmpty()) {
-                                                { Text("Variant: ${voice.locale.variant}") }
-                                            } else null,
-                                            leadingContent = {
-                                                if (isSelected) {
-                                                    Icon(
-                                                        Icons.Default.Check,
-                                                        contentDescription = "Selected",
-                                                        tint = MaterialTheme.colorScheme.primary
-                                                    )
-                                                } else {
-                                                    Spacer(modifier = Modifier.size(24.dp))
-                                                }
-                                            },
-                                            trailingContent = {
-                                                IconButton(onClick = {
-                                                    val params = android.os.Bundle()
-                                                    try {
-                                                        ttsEngine?.language = voice.locale
-                                                    } catch (e: Exception) {
-                                                        Timber.e(e, "Failed to set language for sample")
-                                                    }
-                                                    ttsEngine?.voice = voice
-                                                    val sampleText =
-                                                        "This is a sample of ${voice.locale.displayLanguage}."
-                                                    ttsEngine?.speak(
-                                                        sampleText,
-                                                        TextToSpeech.QUEUE_FLUSH,
-                                                        params,
-                                                        "SAMPLE_ID"
-                                                    )
-                                                }) {
-                                                    Icon(
-                                                        imageVector = Icons.Default.PlayArrow,
-                                                        contentDescription = "Play Sample",
-                                                        tint = MaterialTheme.colorScheme.primary
-                                                    )
-                                                }
-                                            },
-                                            modifier = Modifier.clickable {
-                                                savedVoiceName = voice.name
-                                                saveNativeVoice(context, voice.name)
-                                            }.background(
-                                                if (isSelected) MaterialTheme.colorScheme.primaryContainer.copy(
-                                                    alpha = 0.2f
-                                                ) else Color.Transparent
-                                            )
-                                        )
-                                        HorizontalDivider(
-                                            color = MaterialTheme.colorScheme.outlineVariant.copy(
-                                                alpha = 0.5f
-                                            )
-                                        )
-                                    }
-                                }
-                            } else {
-                                Box(
-                                    modifier = Modifier.fillMaxWidth().padding(24.dp),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    Text(
-                                        "No voices found for this language.",
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -2018,12 +1768,12 @@ fun ColorComparePill(
     Canvas(modifier = modifier.clip(RoundedCornerShape(8.dp))) {
         drawRect(
             color = oldColor.copy(alpha = 1f),
-            size = androidx.compose.ui.geometry.Size(size.width / 2, size.height)
+            size = Size(size.width / 2, size.height)
         )
         drawRect(
             color = newColor.copy(alpha = 1f),
             topLeft = Offset(size.width / 2, 0f),
-            size = androidx.compose.ui.geometry.Size(size.width / 2, size.height)
+            size = Size(size.width / 2, size.height)
         )
     }
 }
@@ -2064,6 +1814,18 @@ fun loadReaderThemeId(context: Context): String {
     return prefs.getString(PREF_READER_THEME, "system") ?: "system"
 }
 
+const val PREF_EXCLUDE_IMAGES = "exclude_images"
+
+fun saveExcludeImages(context: Context, excludeImages: Boolean) {
+    val prefs = context.getSharedPreferences("reader_prefs", Context.MODE_PRIVATE)
+    prefs.edit { putBoolean(PREF_EXCLUDE_IMAGES, excludeImages) }
+}
+
+fun loadExcludeImages(context: Context): Boolean {
+    val prefs = context.getSharedPreferences("reader_prefs", Context.MODE_PRIVATE)
+    return prefs.getBoolean(PREF_EXCLUDE_IMAGES, false)
+}
+
 fun saveCustomThemes(context: Context, themes: List<ReaderTheme>) {
     val prefs = context.getSharedPreferences("reader_prefs", Context.MODE_PRIVATE)
     val jsonArray = JSONArray()
@@ -2086,7 +1848,7 @@ fun loadCustomThemes(context: Context): List<ReaderTheme> {
     val jsonString = prefs.getString(PREF_CUSTOM_THEMES, "[]") ?: "[]"
     val themes = mutableListOf<ReaderTheme>()
     try {
-        val jsonArray = org.json.JSONArray(jsonString)
+        val jsonArray = JSONArray(jsonString)
         for (i in 0 until jsonArray.length()) {
             val obj = jsonArray.getJSONObject(i)
             themes.add(
@@ -2118,6 +1880,9 @@ private fun calculateContrastRatio(color1: Color, color2: Color): Float {
 fun ReaderThemePanel(
     isVisible: Boolean,
     currentThemeId: String,
+    excludeImages: Boolean = false,
+    onExcludeImagesChange: (Boolean) -> Unit = {},
+    showExcludeImagesOption: Boolean = false,
     customThemes: List<ReaderTheme>,
     builtInThemes: List<ReaderTheme> = BuiltInThemes,
     onThemeSelected: (String) -> Unit,
@@ -2164,14 +1929,30 @@ fun ReaderThemePanel(
                         .padding(16.dp)
                         .padding(bottom = 16.dp)
                 ) {
-                    Text(
-                        "Reading Themes",
+                    Text(stringResource(R.string.reading_themes),
                         style = MaterialTheme.typography.titleLarge,
                         fontWeight = FontWeight.Bold,
                         modifier = Modifier.padding(bottom = 16.dp)
                     )
 
-                    Text("Presets", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
+                    if (showExcludeImagesOption) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("Preserve Image Colors", style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.SemiBold)
+                                Text("Keep original image colors when theme changes", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+                            }
+                            androidx.compose.material3.Switch(
+                                checked = excludeImages,
+                                onCheckedChange = onExcludeImagesChange
+                            )
+                        }
+                    }
+
+                    Text(stringResource(R.string.theme_presets), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
                     Spacer(Modifier.height(8.dp))
                     ThemeGrid(themes = builtInThemes, currentThemeId = currentThemeId, onThemeSelected = onThemeSelected)
 
@@ -2181,7 +1962,7 @@ fun ReaderThemePanel(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text("My Themes", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
+                        Text(stringResource(R.string.theme_my_themes), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
                         IconButton(onClick = { editingTheme = null; showBuilder = true }, modifier = Modifier.size(24.dp)) {
                             Icon(Icons.Default.Add, contentDescription = "Create Theme", tint = MaterialTheme.colorScheme.primary)
                         }
@@ -2189,7 +1970,7 @@ fun ReaderThemePanel(
                     Spacer(Modifier.height(8.dp))
 
                     if (customThemes.isEmpty()) {
-                        Text("No custom themes yet. Tap '+' to create one.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text(stringResource(R.string.theme_no_custom), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     } else {
                         ThemeGrid(
                             themes = customThemes,
@@ -2217,8 +1998,8 @@ fun ThemeGrid(
     onEdit: ((ReaderTheme) -> Unit)? = null,
     onDelete: ((ReaderTheme) -> Unit)? = null
 ) {
-    androidx.compose.foundation.lazy.grid.LazyVerticalGrid(
-        columns = androidx.compose.foundation.lazy.grid.GridCells.Adaptive(minSize = 80.dp),
+    LazyVerticalGrid(
+        columns = GridCells.Adaptive(minSize = 80.dp),
         horizontalArrangement = Arrangement.spacedBy(8.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
@@ -2290,7 +2071,7 @@ fun ThemeBuilderView(
             .padding(16.dp)
     ) {
         Text(
-            text = if (initialTheme == null) "New Theme" else "Edit Theme",
+            text = stringResource(if (initialTheme == null) R.string.theme_new else R.string.theme_edit),
             fontWeight = FontWeight.Bold,
             style = MaterialTheme.typography.titleLarge,
             color = MaterialTheme.colorScheme.onSurface
@@ -2299,10 +2080,10 @@ fun ThemeBuilderView(
         Spacer(Modifier.height(16.dp))
 
         Column(modifier = Modifier.weight(1f).verticalScroll(rememberScrollState())) {
-            androidx.compose.material3.OutlinedTextField(
+            OutlinedTextField(
                 value = name,
                 onValueChange = { name = it },
-                label = { Text("Theme Name") },
+                label = { Text(stringResource(R.string.theme_name)) },
                 modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
                 singleLine = true
             )
@@ -2325,14 +2106,12 @@ fun ThemeBuilderView(
                     } else this
                 }) {
                     Column(Modifier.padding(16.dp).fillMaxWidth()) {
-                        Text(
-                            text = "So many books, so little time.",
+                        Text(text = stringResource(R.string.theme_preview_quote),
                             color = txtColor,
                             style = MaterialTheme.typography.titleMedium
                         )
                         Spacer(Modifier.height(8.dp))
-                        Text(
-                            text = "- Frank Zappa",
+                        Text(text = stringResource(R.string.theme_preview_author),
                             color = txtColor,
                             style = MaterialTheme.typography.bodyMedium,
                             modifier = Modifier.fillMaxWidth(),
@@ -2344,8 +2123,7 @@ fun ThemeBuilderView(
 
             // Animated Contrast Warning
             AnimatedVisibility(visible = contrast < 4.5f) {
-                Text(
-                    "⚠️ Low contrast! This might cause eye strain.",
+                Text(stringResource(R.string.theme_low_contrast_warning),
                     color = MaterialTheme.colorScheme.error,
                     style = MaterialTheme.typography.labelSmall,
                     modifier = Modifier.padding(bottom = 8.dp)
@@ -2357,13 +2135,13 @@ fun ThemeBuilderView(
             // Sleek Color Swatches
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
                 ColorSwatchItem(
-                    label = "Page Color",
+                    label = stringResource(R.string.theme_page_color),
                     color = bgColor,
                     onClick = { editingColorType = "bg" },
                     modifier = Modifier.weight(1f)
                 )
                 ColorSwatchItem(
-                    label = "Text Color",
+                    label = stringResource(R.string.theme_text_color),
                     color = txtColor,
                     onClick = { editingColorType = "text" },
                     modifier = Modifier.weight(1f)
@@ -2379,13 +2157,13 @@ fun ThemeBuilderView(
             verticalAlignment = Alignment.CenterVertically
         ) {
             TextButton(onClick = onCancel) {
-                Text("Cancel", color = MaterialTheme.colorScheme.primary)
+                Text(stringResource(R.string.action_cancel), color = MaterialTheme.colorScheme.primary)
             }
             Spacer(Modifier.width(8.dp))
             Button(onClick = {
                 onSave(ReaderTheme(id = initialTheme?.id ?: System.currentTimeMillis().toString(), name = name, backgroundColor = bgColor, textColor = txtColor, isDark = isDark, textureId = textureId, isCustom = true))
             }) {
-                Text("Save", color = MaterialTheme.colorScheme.onPrimary)
+                Text(stringResource(R.string.action_save), color = MaterialTheme.colorScheme.onPrimary)
             }
         }
     }
@@ -2393,7 +2171,7 @@ fun ThemeBuilderView(
     editingColorType?.let { type ->
         ThemeColorPickerDialog(
             initialColor = if (type == "bg") bgColor else txtColor,
-            title = if (type == "bg") "Page Color" else "Text Color",
+            title = if (type == "bg") stringResource(R.string.theme_page_color) else stringResource(R.string.theme_text_color),
             bgColor = bgColor,
             textColor = txtColor,
             editingColorType = type,
@@ -2460,9 +2238,9 @@ fun ThemeColorPickerDialog(
         value = hsv[2]
     }
 
-    androidx.compose.ui.window.Dialog(
+    Dialog(
         onDismissRequest = onDismiss,
-        properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false)
+        properties = DialogProperties(usePlatformDefaultWidth = false)
     ) {
         Surface(
             shape = RoundedCornerShape(24.dp),
@@ -2502,14 +2280,12 @@ fun ThemeColorPickerDialog(
                     border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
                 ) {
                     Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) {
-                        Text(
-                            text = "Live Preview",
+                        Text(text = stringResource(R.string.theme_color_live_preview),
                             color = liveTextColor,
                             style = MaterialTheme.typography.bodyMedium,
                             fontWeight = FontWeight.Bold
                         )
-                        Text(
-                            text = "Reading is dreaming.",
+                        Text(text = stringResource(R.string.theme_color_preview_text),
                             color = liveTextColor,
                             style = MaterialTheme.typography.bodySmall
                         )
@@ -2553,7 +2329,7 @@ fun ThemeColorPickerDialog(
                         modifier = Modifier.weight(1.6f),
                         horizontalAlignment = Alignment.CenterHorizontally
                     ) {
-                        Text("Hex", color = Color.Gray, fontSize = 12.sp, maxLines = 1)
+                        Text(stringResource(R.string.theme_color_hex), color = Color.Gray, fontSize = 12.sp, maxLines = 1)
                         Spacer(Modifier.height(4.dp))
                         HexInput(color = currentColor, onHexChanged = { updateFromColor(it) })
                     }
@@ -2562,18 +2338,15 @@ fun ThemeColorPickerDialog(
                         modifier = Modifier.weight(2.4f),
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
-                        RgbInputColumn(
-                            label = "R", value = currentColor.red,
+                        RgbInputColumn(label = stringResource(R.string.color_r), value = currentColor.red,
                             onValueChange = { r -> updateFromColor(currentColor.copy(red = r)) },
                             modifier = Modifier.weight(1f)
                         )
-                        RgbInputColumn(
-                            label = "G", value = currentColor.green,
+                        RgbInputColumn(label = stringResource(R.string.color_g), value = currentColor.green,
                             onValueChange = { g -> updateFromColor(currentColor.copy(green = g)) },
                             modifier = Modifier.weight(1f)
                         )
-                        RgbInputColumn(
-                            label = "B", value = currentColor.blue,
+                        RgbInputColumn(label = stringResource(R.string.color_b), value = currentColor.blue,
                             onValueChange = { b -> updateFromColor(currentColor.copy(blue = b)) },
                             modifier = Modifier.weight(1f)
                         )
@@ -2589,11 +2362,11 @@ fun ThemeColorPickerDialog(
                 ) {
                     Button(
                         onClick = onDismiss,
-                        colors = androidx.compose.material3.ButtonDefaults.buttonColors(
+                        colors = ButtonDefaults.buttonColors(
                             containerColor = Color.White
                         )
                     ) {
-                        Text("Save", color = Color.Black, fontWeight = FontWeight.Bold)
+                        Text(stringResource(R.string.action_save), color = Color.Black, fontWeight = FontWeight.Bold)
                     }
                 }
             }
@@ -2602,23 +2375,633 @@ fun ThemeColorPickerDialog(
 }
 
 @Composable
-fun TextureOption(name: String, resId: Int?, isSelected: Boolean, onClick: () -> Unit) {
-    Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.clickable(onClick = onClick)) {
-        Box(modifier = Modifier.size(48.dp).clip(CircleShape).border(if (isSelected) 3.dp else 1.dp, if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant, CircleShape).run {
-            if (resId != null) {
-                val bmp = ImageBitmap.imageResource(LocalResources.current, resId)
-                this.drawBehind { drawRect(ShaderBrush(ImageShader(bmp, TileMode.Repeated, TileMode.Repeated))) }
-            } else this.background(MaterialTheme.colorScheme.surfaceVariant)
-        })
-        Text(name, style = MaterialTheme.typography.labelSmall, modifier = Modifier.padding(top = 4.dp))
+fun HighlightColorPickerDialog(
+    initialColors: Map<PdfHighlightColor, Color>,
+    initialSelection: PdfHighlightColor = PdfHighlightColor.YELLOW,
+    onDismiss: () -> Unit,
+    onSave: (Map<PdfHighlightColor, Color>) -> Unit
+) {
+    var currentColors by remember { mutableStateOf(initialColors) }
+    var selectedSlot by remember { mutableStateOf(initialSelection) }
+
+    val initialActiveColor = currentColors[selectedSlot] ?: selectedSlot.color
+    val initialHsv = remember(initialActiveColor) {
+        val hsv = FloatArray(3)
+        android.graphics.Color.colorToHSV(initialActiveColor.toArgb(), hsv)
+        hsv
+    }
+
+    var hue by remember { mutableFloatStateOf(initialHsv[0]) }
+    var saturation by remember { mutableFloatStateOf(initialHsv[1]) }
+    var value by remember { mutableFloatStateOf(initialHsv[2]) }
+
+    LaunchedEffect(selectedSlot) {
+        val color = currentColors[selectedSlot] ?: selectedSlot.color
+        val hsv = FloatArray(3)
+        android.graphics.Color.colorToHSV(color.toArgb(), hsv)
+        hue = hsv[0]
+        saturation = hsv[1]
+        value = hsv[2]
+    }
+
+    val currentColor by remember {
+        derivedStateOf {
+            val hsv = floatArrayOf(hue, saturation, value)
+            Color(android.graphics.Color.HSVToColor(255, hsv))
+        }
+    }
+
+    LaunchedEffect(currentColor) {
+        currentColors = currentColors + (selectedSlot to currentColor)
+    }
+
+    fun updateFromColor(color: Color) {
+        val hsv = FloatArray(3)
+        android.graphics.Color.colorToHSV(color.toArgb(), hsv)
+        hue = hsv[0]
+        saturation = hsv[1]
+        value = hsv[2]
+    }
+
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        Surface(
+            shape = RoundedCornerShape(24.dp),
+            color = Color(0xFF2C2C2C),
+            modifier = Modifier
+                .fillMaxWidth(0.9f)
+                .padding(16.dp)
+        ) {
+            Column(
+                modifier = Modifier
+                    .padding(20.dp)
+                    .verticalScroll(rememberScrollState()),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Box(
+                    modifier = Modifier
+                        .background(Color(0xFF3E3E3E), RoundedCornerShape(16.dp))
+                        .padding(horizontal = 24.dp, vertical = 8.dp)
+                ) {
+                    Text(
+                        text = "Customize Highlights",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = Color.White
+                    )
+                }
+
+                Spacer(Modifier.height(20.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceEvenly
+                ) {
+                    PdfHighlightColor.entries.forEach { slot ->
+                        val slotColor = currentColors[slot] ?: slot.color
+                        val isSelected = selectedSlot == slot
+                        Box(
+                            modifier = Modifier
+                                .size(48.dp)
+                                .clip(CircleShape)
+                                .background(slotColor)
+                                .clickable { selectedSlot = slot }
+                                .border(
+                                    width = if (isSelected) 3.dp else 1.dp,
+                                    color = if (isSelected) Color.White else Color.Gray,
+                                    shape = CircleShape
+                                ),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            if (isSelected) {
+                                Icon(
+                                    imageVector = Icons.Default.Check,
+                                    contentDescription = "Selected",
+                                    tint = if (slotColor.luminance() > 0.5f) Color.Black else Color.White
+                                )
+                            }
+                        }
+                    }
+                }
+
+                Spacer(Modifier.height(20.dp))
+
+                SpectrumBox(
+                    hue = hue,
+                    saturation = saturation,
+                    currentColor = currentColor,
+                    onHueSatChanged = { h, s -> hue = h; saturation = s },
+                    modifier = Modifier.fillMaxWidth().height(220.dp)
+                )
+
+                Spacer(Modifier.height(20.dp))
+
+                BrightnessSlider(
+                    hue = hue,
+                    saturation = saturation,
+                    value = value,
+                    onValueChanged = { value = it },
+                    modifier = Modifier.fillMaxWidth().height(24.dp).clip(RoundedCornerShape(12.dp))
+                )
+
+                Spacer(Modifier.height(24.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.Bottom,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    ColorComparePill(
+                        oldColor = selectedSlot.color,
+                        newColor = currentColor,
+                        modifier = Modifier.width(64.dp).height(36.dp)
+                    )
+
+                    Column(
+                        modifier = Modifier.weight(1.6f),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        Text("HEX", color = Color.Gray, fontSize = 12.sp, maxLines = 1)
+                        Spacer(Modifier.height(4.dp))
+                        HexInput(color = currentColor, onHexChanged = { updateFromColor(it) })
+                    }
+
+                    Row(
+                        modifier = Modifier.weight(2.4f),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        RgbInputColumn(label = "R", value = currentColor.red,
+                            onValueChange = { r -> updateFromColor(currentColor.copy(red = r)) },
+                            modifier = Modifier.weight(1f)
+                        )
+                        RgbInputColumn(label = "G", value = currentColor.green,
+                            onValueChange = { g -> updateFromColor(currentColor.copy(green = g)) },
+                            modifier = Modifier.weight(1f)
+                        )
+                        RgbInputColumn(label = "B", value = currentColor.blue,
+                            onValueChange = { b -> updateFromColor(currentColor.copy(blue = b)) },
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                }
+
+                Spacer(Modifier.height(24.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    TextButton(onClick = { updateFromColor(selectedSlot.color) }) {
+                        Text("Reset", color = Color(0xFFFF5252))
+                    }
+                    Row {
+                        TextButton(onClick = onDismiss) {
+                            Text("Cancel", color = Color.Gray)
+                        }
+                        Spacer(Modifier.width(8.dp))
+                        Button(
+                            onClick = { onSave(currentColors) },
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = Color.White
+                            )
+                        ) {
+                            Text("Save", color = Color.Black, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@androidx.annotation.OptIn(UnstableApi::class)
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun AiHubBottomSheet(
+    bookTitle: String,
+    currentChapterIndex: Int,
+    chapterTitle: String,
+    summaryCacheManager: SummaryCacheManager? = null,
+    summarizationResult: SummarizationResult?,
+    isSummarizationLoading: Boolean,
+    onGenerateSummary: (Boolean) -> Unit,
+    onClearSummary: () -> Unit = {},
+    recapResult: SummarizationResult? = null,
+    isRecapLoading: Boolean = false,
+    onGenerateRecap: (() -> Unit)? = null,
+    onClearRecap: () -> Unit = {},
+    onDismiss: () -> Unit,
+    isMainTtsActive: Boolean,
+    getAuthToken: suspend () -> String?,
+    credits: Int,
+    isProUser: Boolean
+) {
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    var selectedTabIndex by remember { mutableIntStateOf(0) }
+    val ttsController = rememberTtsController()
+    val ttsState by ttsController.ttsState.collectAsState()
+
+    LaunchedEffect(currentChapterIndex) {
+        onClearSummary()
+    }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            if (ttsState.playbackSource == "POPUP" && (ttsState.isPlaying || ttsState.isLoading)) {
+                ttsController.stop()
+            }
+        }
+    }
+
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = sheetState,
+        containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+        contentWindowInsets = { WindowInsets.navigationBars }
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp).heightIn(min = 300.dp, max = 600.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Box(modifier = Modifier.weight(1f))
+                Text(
+                    text = "AI Features",
+                    style = MaterialTheme.typography.headlineSmall,
+                    fontWeight = FontWeight.Bold,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.weight(2f)
+                )
+                Box(modifier = Modifier.weight(1f), contentAlignment = Alignment.CenterEnd) {
+                    if (BuildConfig.FLAVOR != "oss") {
+                        Surface(
+                            color = MaterialTheme.colorScheme.tertiaryContainer,
+                            shape = RoundedCornerShape(12.dp)
+                        ) {
+                            Text(
+                                text = "⭐ $credits",
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onTertiaryContainer,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                            )
+                        }
+                    }
+                }
+            }
+
+            val tabs = mutableListOf("Summary")
+            if (onGenerateRecap != null) tabs.add("Recap")
+            if (summaryCacheManager != null) tabs.add("Cache")
+
+            TabRow(selectedTabIndex = selectedTabIndex, modifier = Modifier.padding(bottom = 16.dp)) {
+                tabs.forEachIndexed { index, title ->
+                    Tab(selected = selectedTabIndex == index, onClick = { selectedTabIndex = index }) {
+                        Text(title, modifier = Modifier.padding(12.dp), style = MaterialTheme.typography.titleSmall)
+                    }
+                }
+            }
+
+            val activeTab = tabs.getOrNull(selectedTabIndex) ?: "Summary"
+            var cacheRefreshTrigger by remember { mutableIntStateOf(0) }
+
+            when (activeTab) {
+                "Summary" -> {
+                    val cachedSummary = remember(currentChapterIndex, cacheRefreshTrigger) { summaryCacheManager?.getSummary(bookTitle, currentChapterIndex) }
+                    val effectiveResult = summarizationResult ?: if (cachedSummary != null) SummarizationResult(summary = cachedSummary, isCacheHit = true) else null
+
+                    if (effectiveResult == null && !isSummarizationLoading) {
+                        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                Icon(painterResource(R.drawable.summarize), contentDescription = null, modifier = Modifier.size(48.dp), tint = MaterialTheme.colorScheme.primary)
+                                Spacer(Modifier.height(16.dp))
+                                Text("No summary for ${chapterTitle.lowercase()} yet.", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                Spacer(Modifier.height(16.dp))
+                                Button(
+                                    onClick = { onGenerateSummary(false) },
+                                    modifier = Modifier.fillMaxWidth(0.8f).padding(vertical = 8.dp)
+                                ) {
+                                    Icon(painterResource(R.drawable.ai), contentDescription = null, modifier = Modifier.size(18.dp))
+                                    Spacer(Modifier.width(8.dp))
+                                    Text("Generate Summary for $chapterTitle")
+                                }
+                            }
+                        }
+                    } else {
+                        AiResultContentView(
+                            title = chapterTitle,
+                            result = effectiveResult,
+                            isLoading = isSummarizationLoading,
+                            isMainTtsActive = isMainTtsActive,
+                            ttsController = ttsController,
+                            ttsState = ttsState,
+                            getAuthToken = getAuthToken,
+                            onRegenerate = { onGenerateSummary(true) }
+                        )
+                    }
+                }
+                "Recap" -> {
+                    // Recap Tab
+                    if (recapResult == null && !isRecapLoading) {
+                        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                Icon(painterResource(R.drawable.ai), contentDescription = null, modifier = Modifier.size(48.dp), tint = MaterialTheme.colorScheme.primary)
+                                Spacer(Modifier.height(16.dp))
+                                Text("Get a recap of the story up to your current position.", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center)
+                                Spacer(Modifier.height(16.dp))
+                                Button(
+                                    onClick = { onGenerateRecap?.invoke() },
+                                    modifier = Modifier.fillMaxWidth(0.8f).padding(vertical = 8.dp)
+                                ) {
+                                    Icon(painterResource(R.drawable.ai), contentDescription = null, modifier = Modifier.size(18.dp))
+                                    Spacer(Modifier.width(8.dp))
+                                    Text("Generate Story Recap")
+                                }
+                            }
+                        }
+                    } else {
+                        AiResultContentView(
+                            title = "Story Recap",
+                            result = recapResult,
+                            isLoading = isRecapLoading,
+                            isMainTtsActive = isMainTtsActive,
+                            ttsController = ttsController,
+                            ttsState = ttsState,
+                            getAuthToken = getAuthToken,
+                            onRegenerate = { onGenerateRecap?.invoke() },
+                            onClear = onClearRecap
+                        )
+                    }
+                }
+                "Cache" -> {
+                    if (summaryCacheManager != null) {
+                        ManageCacheTab(bookTitle, summaryCacheManager, onCacheChanged = {
+                            cacheRefreshTrigger++
+                            onClearSummary()
+                        })
+                    }
+                }
+            }
+        }
+    }
+}
+
+@androidx.annotation.OptIn(UnstableApi::class)
+@Composable
+fun AiResultContentView(
+    title: String,
+    result: SummarizationResult?,
+    isLoading: Boolean,
+    isMainTtsActive: Boolean,
+    ttsController: com.aryan.reader.tts.TtsController,
+    ttsState: TtsPlaybackManager.TtsState,
+    getAuthToken: suspend () -> String?,
+    onRegenerate: (() -> Unit)? = null,
+    onClear: (() -> Unit)? = null
+) {
+    val context = LocalContext.current
+    val clipboardManager = LocalClipboardManager.current
+    val scope = rememberCoroutineScope()
+
+    Column(modifier = Modifier.fillMaxSize()) {
+        Row(modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f).padding(end = 8.dp)
+            )
+
+            if (result != null && (!result.summary.isNullOrBlank() || isLoading)) {
+                Surface(
+                    color = if (result.isCacheHit || (result.cost == 0.0 && result.freeRemaining != null)) Color(
+                        0xFF4CAF50
+                    ).copy(alpha = 0.2f) else MaterialTheme.colorScheme.primaryContainer,
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Text(
+                        text = if (result.isCacheHit) {
+                            "⚡ Cache Hit • Free"
+                        } else if (result.cost != null) {
+                            if (result.cost == 0.0 && result.freeRemaining != null) {
+                                "✨ Generated • Free (${result.freeRemaining}/10 left)"
+                            } else {
+                                "✨ Generated • Cost: ${result.cost} credits"
+                            }
+                        } else {
+                            "✨ Generating... • Cost: Calculating"
+                        },
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (result.isCacheHit || (result.cost == 0.0 && result.freeRemaining != null)) Color(
+                            0xFF388E3C
+                        ) else MaterialTheme.colorScheme.onPrimaryContainer,
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                    )
+                }
+            }
+        }
+
+        if (isLoading && (result?.summary.isNullOrBlank() && result?.error.isNullOrBlank())) {
+            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    CircularProgressIndicator()
+                    Text("Thinking...", modifier = Modifier.padding(start = 12.dp), style = MaterialTheme.typography.bodyLarge)
+                }
+            }
+        } else if (result != null) {
+            val summaryText = result.summary
+            val errorText = result.error
+
+            val styledContent = remember(summaryText, errorText) {
+                if (!summaryText.isNullOrBlank()) {
+                    MarkdownParser.parse(summaryText)
+                } else {
+                    AnnotatedString(errorText ?: "")
+                }
+            }
+            val textToUse = styledContent.text
+
+            if (textToUse.isNotBlank()) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.End,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    val isTtsSessionActive = ttsState.currentText != null || ttsState.isLoading
+
+                    if (onClear != null && !isLoading) {
+                        IconButton(onClick = onClear) {
+                            Icon(
+                                imageVector = Icons.Default.Delete,
+                                contentDescription = "Clear",
+                                tint = MaterialTheme.colorScheme.error
+                            )
+                        }
+                        Spacer(modifier = Modifier.width(4.dp))
+                    }
+
+                    if (onRegenerate != null) {
+                        TextButton(onClick = onRegenerate) {
+                            Text("Regenerate")
+                        }
+                    }
+
+                    IconButton(
+                        onClick = {
+                            if (isTtsSessionActive) {
+                                ttsController.stop()
+                            } else {
+                                val chunks = splitTextIntoChunks(textToUse).map { TtsChunk(it, "", -1) }
+                                if (chunks.isNotEmpty()) {
+                                    scope.launch {
+                                        val token = getAuthToken()
+                                        ttsController.start(
+                                            chunks = chunks,
+                                            bookTitle = title,
+                                            chapterTitle = "AI Output",
+                                            coverImageUri = null,
+                                            ttsMode = loadTtsMode(context),
+                                            playbackSource = "POPUP",
+                                            authToken = token
+                                        )
+                                    }
+                                }
+                            }
+                        },
+                        enabled = !isMainTtsActive || (ttsState.playbackSource == "POPUP")
+                    ) {
+                        Icon(
+                            imageVector = if (isTtsSessionActive) Icons.Default.Stop else Icons.Default.PlayArrow,
+                            contentDescription = "Read Aloud"
+                        )
+                    }
+                    IconButton(onClick = {
+                        clipboardManager.setText(AnnotatedString(textToUse))
+                    }) {
+                        Icon(
+                            imageVector = Icons.Default.ContentCopy,
+                            contentDescription = "Copy"
+                        )
+                    }
+                }
+            }
+
+            HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+
+            if (errorText != null && summaryText.isNullOrBlank()) {
+                Text(errorText, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyLarge)
+            } else if (textToUse.isNotBlank()) {
+                val scrollState = rememberScrollState()
+                var textLayoutResult by remember { mutableStateOf<TextLayoutResult?>(null) }
+
+                LaunchedEffect(ttsState.currentText, textLayoutResult) {
+                    val currentChunk = ttsState.currentText
+                    val layoutResult = textLayoutResult
+                    if (!currentChunk.isNullOrBlank() && layoutResult != null) {
+                        val startIndex = textToUse.indexOf(currentChunk)
+                        if (startIndex != -1) {
+                            val line = layoutResult.getLineForOffset(startIndex)
+                            val lineTop = layoutResult.getLineTop(line)
+                            val viewportHeight = scrollState.viewportSize
+                            val targetScroll = (lineTop - viewportHeight / 2).coerceAtLeast(0f)
+                            scope.launch {
+                                scrollState.animateScrollTo(targetScroll.toInt())
+                            }
+                        }
+                    }
+                }
+
+                val annotatedText = buildAnnotatedString {
+                    append(styledContent)
+                    val currentChunk = ttsState.currentText
+                    if (!currentChunk.isNullOrBlank()) {
+                        val startIndex = textToUse.indexOf(currentChunk)
+                        if (startIndex != -1) {
+                            addStyle(
+                                style = SpanStyle(background = MaterialTheme.colorScheme.primaryContainer),
+                                start = startIndex,
+                                end = startIndex + currentChunk.length
+                            )
+                        }
+                    }
+                }
+                Text(
+                    text = annotatedText,
+                    modifier = Modifier.verticalScroll(scrollState).weight(1f, fill = false),
+                    onTextLayout = { textLayoutResult = it }
+                )
+            }
+        }
     }
 }
 
 @Composable
-fun ColorSlider(color: Color, onColorChanged: (Color) -> Unit) {
-    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        Slider(value = color.red, onValueChange = { onColorChanged(color.copy(red = it)) }, colors = androidx.compose.material3.SliderDefaults.colors(thumbColor = Color.Red, activeTrackColor = Color.Red), modifier = Modifier.weight(1f))
-        Slider(value = color.green, onValueChange = { onColorChanged(color.copy(green = it)) }, colors = androidx.compose.material3.SliderDefaults.colors(thumbColor = Color.Green, activeTrackColor = Color.Green), modifier = Modifier.weight(1f))
-        Slider(value = color.blue, onValueChange = { onColorChanged(color.copy(blue = it)) }, colors = androidx.compose.material3.SliderDefaults.colors(thumbColor = Color.Blue, activeTrackColor = Color.Blue), modifier = Modifier.weight(1f))
+fun ManageCacheTab(bookTitle: String, summaryCacheManager: SummaryCacheManager, onCacheChanged: () -> Unit = {}) {
+    var cachedItems by androidx.compose.runtime.remember { mutableStateOf(summaryCacheManager.getAllSummaries(bookTitle)) }
+
+    if (cachedItems.isEmpty()) {
+        Box(modifier = Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
+            Text("No cached summaries for this book.", style = MaterialTheme.typography.bodyMedium)
+        }
+    } else {
+        Column(modifier = Modifier.fillMaxSize()) {
+            LazyColumn(modifier = Modifier.weight(1f).padding(vertical = 8.dp)) {
+                items(cachedItems.size) { index ->
+                    val item = cachedItems[index]
+                    var expanded by androidx.compose.runtime.remember { mutableStateOf(false) }
+
+                    Column(modifier = Modifier.fillMaxWidth().clickable { expanded = !expanded }) {
+                        ListItem(
+                            headlineContent = {
+                                Text(
+                                    text = item.chapterTitle,
+                                    style = MaterialTheme.typography.bodyLarge,
+                                    fontWeight = FontWeight.Medium
+                                )
+                            },
+                            trailingContent = {
+                                IconButton(onClick = {
+                                    summaryCacheManager.deleteSummary(bookTitle, item.chapterIndex)
+                                    cachedItems = summaryCacheManager.getAllSummaries(bookTitle)
+                                    onCacheChanged()
+                                }) {
+                                    Icon(
+                                        imageVector = Icons.Default.Delete,
+                                        contentDescription = "Delete",
+                                        tint = MaterialTheme.colorScheme.error
+                                    )
+                                }
+                            }
+                        )
+                        AnimatedVisibility(visible = expanded) {
+                            Text(
+                                text = item.summary,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+                            )
+                        }
+                        HorizontalDivider()
+                    }
+                }
+            }
+            TextButton(
+                onClick = {
+                    summaryCacheManager.clearBookCache(bookTitle)
+                    cachedItems = emptyList()
+                    onCacheChanged()
+                },
+                modifier = Modifier.align(Alignment.End)
+            ) {
+                Text("Clear All", color = MaterialTheme.colorScheme.error)
+            }
+        }
     }
 }
