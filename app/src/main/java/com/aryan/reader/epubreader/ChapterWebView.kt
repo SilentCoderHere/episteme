@@ -26,10 +26,8 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
-import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.Rect
-import android.util.Base64
 import android.webkit.JavascriptInterface
 import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
@@ -83,14 +81,15 @@ import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupPositionProvider
 import androidx.core.net.toUri
 import com.aryan.reader.R
-import com.aryan.reader.ReaderTexture
+import com.aryan.reader.getReaderTextureDataUri
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
 import org.json.JSONObject
 import timber.log.Timber
 import java.io.BufferedReader
-import java.io.ByteArrayOutputStream
 import java.io.InputStreamReader
+
+private const val TAG_LINK_NAV = "LINK_NAV"
 
 private fun getFontCssInjection(): String {
     return """
@@ -313,6 +312,17 @@ class FootnoteJsBridge(
     }
 }
 
+@Suppress("unused")
+class LinkNavJsBridge(
+    private val currentChapterTitle: String
+) {
+    @JavascriptInterface
+    fun onLinkClicked(href: String, epubType: String, linkText: String) {
+        Timber.tag(TAG_LINK_NAV)
+            .d("[JS-CLICK] href='$href', epub:type='$epubType', label='$linkText' | currentChapter='$currentChapterTitle'")
+    }
+}
+
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
 fun ChapterWebView(
@@ -336,6 +346,9 @@ fun ChapterWebView(
     currentFontSize: Float,
     currentLineHeight: Float,
     currentParagraphGap: Float,
+    currentImageSize: Float,
+    currentHorizontalMargin: Float,
+    currentVerticalMargin: Float,
     onChapterInitiallyScrolled: () -> Unit,
     modifier: Modifier = Modifier,
     onTap: () -> Unit,
@@ -370,7 +383,9 @@ fun ChapterWebView(
     onAutoScrollChapterEnd: () -> Unit = {},
     activeHighlightPalette: List<HighlightColor>,
     onUpdatePalette: (Int, HighlightColor) -> Unit,
-    activeTextureId: String? = null
+    onInternalLinkClick: (String) -> Unit,
+    activeTextureId: String? = null,
+    activeTextureAlpha: Float = 0.55f
 ) {
     Timber.d(
         "RenderChapterViaWebView for '$chapterTitle', Key: $key, isDarkTheme: $isDarkTheme, initialScrollTarget: $initialScrollTarget"
@@ -390,17 +405,8 @@ fun ChapterWebView(
 
     val textureBase64 by remember(activeTextureId) {
         mutableStateOf(
-            activeTextureId?.let { id ->
-                ReaderTexture.entries.find { it.id == id }?.resId?.let { resId ->
-                    val bmp = BitmapFactory.decodeResource(context.resources, resId)
-                    val out = ByteArrayOutputStream()
-                    bmp.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, out)
-                    "data:image/png;base64," + Base64.encodeToString(
-                        out.toByteArray(),
-                        Base64.NO_WRAP
-                    )
-                }
-            })
+            getReaderTextureDataUri(context, activeTextureId)
+        )
     }
 
     val currentOnSnippetForBookmarkReady by rememberUpdatedState(onSnippetForBookmarkReady)
@@ -447,7 +453,7 @@ fun ChapterWebView(
                     TextButton(onClick = {
                         val clipboard =
                             context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                        val clip = ClipData.newPlainText("Copied Link", urlToShow)
+                        val clip = ClipData.newPlainText(context.getString(R.string.clip_label_copied_link), urlToShow)
                         clipboard.setPrimaryClip(clip)
                         showExternalLinkDialog = null
                     }) { Text(stringResource(R.string.action_copy)) }
@@ -460,10 +466,10 @@ fun ChapterWebView(
 
     Box(modifier = modifier.fillMaxSize()) {
 
-        LaunchedEffect(isDarkTheme, effectiveBg, effectiveText, textureBase64) {
+        LaunchedEffect(isDarkTheme, effectiveBg, effectiveText, textureBase64, activeTextureAlpha) {
             val bgHex = String.format("#%06X", (0xFFFFFF and effectiveBg.toArgb()))
             val textHex = String.format("#%06X", (0xFFFFFF and effectiveText.toArgb()))
-            localWebViewRef?.evaluateJavascript("javascript:window.applyReaderTheme($isDarkTheme, '$bgHex', '$textHex', ${textureBase64?.let { "'$it'" } ?: "null"});", null)
+            localWebViewRef?.evaluateJavascript("javascript:window.applyReaderTheme($isDarkTheme, '$bgHex', '$textHex', ${textureBase64?.let { "'$it'" } ?: "null"}, ${activeTextureAlpha.coerceIn(0f, 1f)});", null)
         }
 
         key(
@@ -471,6 +477,9 @@ fun ChapterWebView(
             currentFontSize,
             currentLineHeight,
             currentParagraphGap,
+            currentImageSize,
+            currentHorizontalMargin,
+            currentVerticalMargin,
             currentFontFamily,
             currentTextAlign
         ) {
@@ -550,6 +559,11 @@ fun ChapterWebView(
                             consoleMessage?.let {
                                 val message = it.message()
                                 when {
+                                    message.startsWith("LINK_NAV:") -> {
+                                        Timber.tag(TAG_LINK_NAV)
+                                            .d("JS -> ${message.substringAfter("LINK_NAV: ")}")
+                                    }
+
                                     message.startsWith("FootnoteDiag:") -> {
                                         Timber.tag("FootnoteDiag")
                                             .d("JS -> ${message.substringAfter("FootnoteDiag: ")}")
@@ -653,15 +667,30 @@ fun ChapterWebView(
                         }, "FootnoteBridge"
                     )
 
+                    addJavascriptInterface(
+                        LinkNavJsBridge(chapterTitle), "LinkNavBridge"
+                    )
+
                     webViewClient = object : WebViewClient() {
                         override fun shouldOverrideUrlLoading(
                             view: WebView?, request: WebResourceRequest?
                         ): Boolean {
                             val url = request?.url?.toString()
                             if (url != null && (url.startsWith("http://") || url.startsWith("https://"))) {
-                                Timber.d("Intercepted external link: $url")
+                                Timber.tag(TAG_LINK_NAV)
+                                    .d("[EXTERNAL-INTERCEPT] url='$url' from chapter '$chapterTitle'")
                                 showExternalLinkDialog = url
                                 return true
+                            }
+                            if (url != null && url.startsWith("file://")) {
+                                Timber.tag(TAG_LINK_NAV)
+                                    .d("[INTERNAL-LINK-INTERCEPTED] url='$url' from chapter '$chapterTitle'")
+                                onInternalLinkClick(url)
+                                return true
+                            }
+                            if (url != null) {
+                                Timber.tag(TAG_LINK_NAV)
+                                    .d("[INTERNAL-LINK-PASSED] url='$url' from chapter '$chapterTitle' — allowing WebView to handle")
                             }
                             return false
                         }
@@ -699,7 +728,7 @@ fun ChapterWebView(
                             val bgHex = String.format("#%06X", (0xFFFFFF and effectiveBg.toArgb()))
                             val textHex =
                                 String.format("#%06X", (0xFFFFFF and effectiveText.toArgb()))
-                            view?.evaluateJavascript("javascript:window.applyReaderTheme($isDarkTheme, '$bgHex', '$textHex', ${textureBase64?.let { "'$it'" } ?: "null"});",
+                            view?.evaluateJavascript("javascript:window.applyReaderTheme($isDarkTheme, '$bgHex', '$textHex', ${textureBase64?.let { "'$it'" } ?: "null"}, ${activeTextureAlpha.coerceIn(0f, 1f)});",
                                 null)
 
                             val fragmentsJson = org.json.JSONArray(tocFragments).toString()
@@ -744,7 +773,7 @@ fun ChapterWebView(
                             }
 
                             view?.evaluateJavascript(
-                                "javascript:window.updateReaderStyles($currentFontSize, $currentLineHeight, '$fontNameForJs', '${currentTextAlign.cssValue}', $currentParagraphGap);",
+                                "javascript:window.updateReaderStyles($currentFontSize, $currentLineHeight, '$fontNameForJs', '${currentTextAlign.cssValue}', $currentParagraphGap, $currentImageSize, $currentHorizontalMargin, $currentVerticalMargin);",
                                 null
                             )
 
@@ -768,10 +797,59 @@ fun ChapterWebView(
                                 }
                             } else if (!initialFragmentId.isNullOrBlank()) {
                                 Timber.tag("NavDiag").d("WebView onPageFinished: Scrolling to Element ID: $initialFragmentId")
-                                view?.evaluateJavascript(
-                                    "javascript:var el = document.getElementById('$initialFragmentId'); if(el) { el.scrollIntoView(); } else { console.log('Element not found: $initialFragmentId'); }",
-                                    null
-                                )
+                                val js = """
+                                    (function() {
+                                        var targetId = '$initialFragmentId';
+                                        var el = document.getElementById(targetId) || document.querySelector('[name="' + targetId + '"]');
+                                        if (el) {
+                                            var targetScrollY = window.scrollY + el.getBoundingClientRect().top - (window.VIEWPORT_PADDING_TOP + 10);
+                                            window.scrollTo({ top: targetScrollY, behavior: 'auto' });
+                                            return -2;
+                                        }
+                                        if (window.virtualization && window.virtualization.chunksData) {
+                                            for (var i = 0; i < window.virtualization.chunksData.length; i++) {
+                                                var chunkHtml = window.virtualization.chunksData[i];
+                                                if (chunkHtml && (chunkHtml.indexOf('id="' + targetId + '"') !== -1 || chunkHtml.indexOf('name="' + targetId + '"') !== -1 || chunkHtml.indexOf("id='" + targetId + "'") !== -1 || chunkHtml.indexOf("name='" + targetId + "'") !== -1)) {
+                                                    return i;
+                                                }
+                                            }
+                                        }
+                                        return -1;
+                                    })()
+                                """.trimIndent()
+
+                                view?.evaluateJavascript(js) { result ->
+                                    val chunkIdx = result?.toIntOrNull() ?: -1
+                                    if (chunkIdx >= 0) {
+                                        for (i in 0..chunkIdx) {
+                                            onChunkRequested(i)
+                                        }
+                                        val scrollJs = """
+                                            (function() {
+                                                var chunkIndex = $chunkIdx;
+                                                var fragmentId = '$initialFragmentId';
+                                                setTimeout(function() {
+                                                    var chunkDiv = document.querySelector('.chunk-container[data-chunk-index="' + chunkIndex + '"]');
+                                                    if (chunkDiv && chunkDiv.innerHTML === "" && window.virtualization && window.virtualization.chunksData[chunkIndex]) {
+                                                        chunkDiv.innerHTML = window.virtualization.chunksData[chunkIndex];
+                                                        chunkDiv.style.height = "";
+                                                    }
+                                                    setTimeout(function() {
+                                                        var el = document.getElementById(fragmentId) || document.querySelector('[name="' + fragmentId + '"]');
+                                                        if (el) {
+                                                            var targetScrollY = window.scrollY + el.getBoundingClientRect().top - (window.VIEWPORT_PADDING_TOP + 10);
+                                                            window.scrollTo({ top: targetScrollY, behavior: 'auto' });
+                                                        } else if (chunkDiv) {
+                                                            var targetScrollY = window.scrollY + chunkDiv.getBoundingClientRect().top - window.VIEWPORT_PADDING_TOP;
+                                                            window.scrollTo({ top: targetScrollY, behavior: 'auto' });
+                                                        }
+                                                    }, 50);
+                                                }, 200);
+                                            })()
+                                        """.trimIndent()
+                                        view.evaluateJavascript(scrollJs, null)
+                                    }
+                                }
                                 onChapterInitiallyScrolled()
                                 scrollActionTaken = true
                             } else if (initialScrollTarget != null) {
@@ -859,7 +937,7 @@ fun ChapterWebView(
                 )
 
                 webView.evaluateJavascript(
-                    "javascript:window.updateReaderStyles($currentFontSize, $currentLineHeight, '$fontNameForJs', '${currentTextAlign.cssValue}', $currentParagraphGap);",
+                    "javascript:window.updateReaderStyles($currentFontSize, $currentLineHeight, '$fontNameForJs', '${currentTextAlign.cssValue}', $currentParagraphGap, $currentImageSize, $currentHorizontalMargin, $currentVerticalMargin);",
                     null
                 )
 
@@ -979,7 +1057,7 @@ fun ChapterWebView(
                                 onCopy = {
                                 val clipboard =
                                     context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                                val clip = ClipData.newPlainText("Copied Text", state.selectedText)
+                                val clip = ClipData.newPlainText(context.getString(R.string.clip_label_copied_text), state.selectedText)
                                 clipboard.setPrimaryClip(clip)
                                 state.finishActionModeCallback()
                                 localWebViewRef?.clearFocus()

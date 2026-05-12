@@ -21,6 +21,7 @@ import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
@@ -109,6 +110,7 @@ import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalViewConfiguration
 import androidx.compose.ui.res.imageResource
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.PlatformTextStyle
 import androidx.compose.ui.text.SpanStyle
@@ -146,7 +148,7 @@ import coil.compose.AsyncImage
 import coil.imageLoader
 import coil.request.ImageRequest.Builder
 import com.aryan.reader.R
-import com.aryan.reader.ReaderTexture
+import com.aryan.reader.loadReaderTextureBitmap
 import com.aryan.reader.countWords
 import com.aryan.reader.epub.EpubBook
 import com.aryan.reader.epubreader.HighlightColor
@@ -185,10 +187,140 @@ data class PaginatedSelection(
     val endOffset: Int,
     val text: String,
     val rect: Rect,
+    val startPageIndex: Int,
+    val endPageIndex: Int,
     val startBlockCharOffset: Int = 0,
     val endBlockCharOffset: Int = 0,
     val textPerBlock: Map<String, String> = emptyMap()
 )
+
+private data class SelectionBlockKey(
+    val pageIndex: Int,
+    val blockIndex: Int,
+    val blockCharOffset: Int
+)
+
+private fun buildSelectionBlockKey(
+    pageIndex: Int,
+    blockIndex: Int,
+    blockCharOffset: Int
+): String = "${pageIndex}_${blockIndex}_${blockCharOffset}"
+
+private fun parseSelectionBlockKey(key: String): SelectionBlockKey? {
+    val parts = key.split("_")
+    if (parts.size != 3) return null
+    return SelectionBlockKey(
+        pageIndex = parts[0].toIntOrNull() ?: return null,
+        blockIndex = parts[1].toIntOrNull() ?: return null,
+        blockCharOffset = parts[2].toIntOrNull() ?: return null
+    )
+}
+
+private fun compareSelectionBlockKeys(
+    firstKey: String,
+    secondKey: String
+): Int {
+    val first = parseSelectionBlockKey(firstKey)
+    val second = parseSelectionBlockKey(secondKey)
+
+    if (first == null && second == null) return firstKey.compareTo(secondKey)
+    if (first == null) return 1
+    if (second == null) return -1
+
+    return compareValuesBy(
+        first,
+        second,
+        SelectionBlockKey::pageIndex,
+        SelectionBlockKey::blockIndex,
+        SelectionBlockKey::blockCharOffset
+    )
+}
+
+private fun getTextBlockCharOffset(block: TextContentBlock): Int = when (block) {
+    is ParagraphBlock -> block.startCharOffsetInSource
+    is HeaderBlock -> block.startCharOffsetInSource
+    is QuoteBlock -> block.startCharOffsetInSource
+    is ListItemBlock -> block.startCharOffsetInSource
+}
+
+private fun headerFontScale(level: Int): Float = when (level) {
+    1 -> 1.5f
+    2 -> 1.4f
+    3 -> 1.3f
+    4 -> 1.2f
+    5 -> 1.1f
+    else -> 1.0f
+}
+
+private const val WEB_VIEW_NORMAL_LINE_HEIGHT_MULTIPLIER = 1.2f
+
+private fun paginationLineHeightMultiplierForWebViewSetting(multiplier: Float): Float {
+    return if (abs(multiplier - 1.0f) < 0.001f) WEB_VIEW_NORMAL_LINE_HEIGHT_MULTIPLIER else multiplier
+}
+
+private fun createHeaderTextStyle(
+    baseStyle: TextStyle,
+    level: Int,
+    textAlign: TextAlign?
+): TextStyle {
+    val scale = headerFontScale(level)
+    val scaledFontSize = baseStyle.fontSize * scale
+    val scaledLineHeight = if (baseStyle.lineHeight != TextUnit.Unspecified) {
+        baseStyle.lineHeight * scale
+    } else {
+        scaledFontSize * 1.2f
+    }
+
+    return baseStyle.copy(
+        fontWeight = FontWeight.Bold,
+        fontSize = scaledFontSize,
+        lineHeight = scaledLineHeight,
+        textAlign = textAlign ?: baseStyle.textAlign
+    )
+}
+
+private fun compareBlockPositionsOnPage(
+    firstBlockIndex: Int,
+    firstBlockCharOffset: Int,
+    secondBlockIndex: Int,
+    secondBlockCharOffset: Int
+): Int = when {
+    firstBlockIndex != secondBlockIndex -> firstBlockIndex.compareTo(secondBlockIndex)
+    else -> firstBlockCharOffset.compareTo(secondBlockCharOffset)
+}
+
+private fun isBlockSelectedOnPage(
+    block: TextContentBlock,
+    pageIndex: Int,
+    selection: PaginatedSelection
+): Boolean {
+    if (pageIndex < selection.startPageIndex || pageIndex > selection.endPageIndex) return false
+    if (pageIndex > selection.startPageIndex && pageIndex < selection.endPageIndex) return true
+
+    val blockCharOffset = getTextBlockCharOffset(block)
+    val afterStart = if (pageIndex == selection.startPageIndex) {
+        compareBlockPositionsOnPage(
+            block.blockIndex,
+            blockCharOffset,
+            selection.startBlockIndex,
+            selection.startBlockCharOffset
+        ) >= 0
+    } else {
+        true
+    }
+    val beforeEnd = if (pageIndex == selection.endPageIndex) {
+        compareBlockPositionsOnPage(
+            block.blockIndex,
+            blockCharOffset,
+            selection.endBlockIndex,
+            selection.endBlockCharOffset
+        ) <= 0
+    } else {
+        true
+    }
+
+    return afterStart && beforeEnd
+}
 
 class ReactiveBlockMap(
     private val delegate: MutableMap<String, Triple<TextLayoutResult, LayoutCoordinates, TextContentBlock>> = mutableStateMapOf()
@@ -302,10 +434,102 @@ private fun highlightQueryInText(
     }
 }
 
+private fun computeImageRenderSizePx(
+    block: ImageBlock,
+    density: Density,
+    maxWidthPx: Float,
+    imageSizeMultiplier: Float
+): Pair<Float, Float> {
+    val intrinsicWidth = block.intrinsicWidth
+    val intrinsicHeight = block.intrinsicHeight
+    if (intrinsicWidth == null || intrinsicHeight == null || intrinsicWidth <= 0f || intrinsicHeight <= 0f) {
+        return 0f to 0f
+    }
+
+    val aspectRatio = intrinsicHeight / intrinsicWidth
+    val baseWidth = with(density) {
+        if (block.style.width.isSpecified && block.style.width > 0.dp) {
+            block.style.width.toPx()
+        } else {
+            maxWidthPx
+        }
+    }
+
+    var scaledWidth = baseWidth * imageSizeMultiplier
+    if (block.style.maxWidth.isSpecified && block.style.maxWidth > 0.dp) {
+        scaledWidth = scaledWidth.coerceAtMost(with(density) { block.style.maxWidth.toPx() } * imageSizeMultiplier)
+    }
+    scaledWidth = scaledWidth.coerceAtMost(maxWidthPx)
+
+    return scaledWidth to (scaledWidth * aspectRatio)
+}
+
+private fun computeImageRenderSizeDp(
+    block: ImageBlock,
+    density: Density,
+    maxWidthDp: Dp,
+    imageSizeMultiplier: Float
+): Pair<Dp, Dp>? {
+    val (widthPx, heightPx) = computeImageRenderSizePx(
+        block = block,
+        density = density,
+        maxWidthPx = with(density) { maxWidthDp.toPx() },
+        imageSizeMultiplier = imageSizeMultiplier
+    )
+    if (widthPx <= 0f || heightPx <= 0f) return null
+    return with(density) { widthPx.toDp() to heightPx.toDp() }
+}
+
+private fun imageBlockContentAlignment(style: BlockStyle): Alignment {
+    return when {
+        style.float == "right" || style.horizontalAlign == "right" || style.horizontalAlign == "end" -> Alignment.CenterEnd
+        style.float == "left" || style.horizontalAlign == "left" || style.horizontalAlign == "start" -> Alignment.CenterStart
+        else -> Alignment.Center
+    }
+}
+
+private fun tableCellImageModifier(
+    block: ImageBlock,
+    density: Density,
+    imageSizeMultiplier: Float
+): Modifier {
+    val baseModifier = if (block.style.width.isSpecified && block.style.width > 0.dp) {
+        Modifier.width(block.style.width * imageSizeMultiplier)
+    } else {
+        Modifier.fillMaxWidth(imageSizeMultiplier.coerceIn(0f, 1f))
+    }
+
+    val intrinsicWidth = block.intrinsicWidth
+    val intrinsicHeight = block.intrinsicHeight
+    val sizedModifier = if (
+        intrinsicWidth != null &&
+        intrinsicHeight != null &&
+        intrinsicWidth > 0f &&
+        intrinsicHeight > 0f
+    ) {
+        baseModifier.aspectRatio(intrinsicWidth / intrinsicHeight)
+    } else {
+        baseModifier.height(
+            if (block.expectedHeight > 0) {
+                with(density) { (block.expectedHeight * imageSizeMultiplier).toDp() }
+            } else {
+                250.dp
+            }
+        )
+    }
+
+    return if (block.style.maxWidth.isSpecified && block.style.maxWidth > 0.dp) {
+        sizedModifier.widthIn(max = block.style.maxWidth * imageSizeMultiplier)
+    } else {
+        sizedModifier
+    }
+}
+
 @Composable
 private fun WrappingContentLayout(
     block: WrappingContentBlock,
     textStyle: TextStyle,
+    imageSizeMultiplier: Float,
     modifier: Modifier = Modifier,
     searchQuery: String,
     ttsHighlightInfo: TtsHighlightInfo?,
@@ -378,29 +602,12 @@ private fun WrappingContentLayout(
         }
     }) { measurables, constraints ->
         val (imageRenderWidthPx, imageRenderHeightPx) = run {
-            val imageStyle = block.floatedImage.style
-            val intrinsicWidth = block.floatedImage.intrinsicWidth
-            val intrinsicHeight = block.floatedImage.intrinsicHeight
-
-            if (intrinsicWidth == null || intrinsicHeight == null || intrinsicWidth <= 0f) {
-                0f to 0f
-            } else {
-                val aspectRatio = intrinsicHeight / intrinsicWidth
-                val renderWidth = with(density) {
-                    var w = intrinsicWidth
-
-                    if (imageStyle.width != Dp.Unspecified) {
-                        w = imageStyle.width.toPx()
-                    }
-
-                    if (imageStyle.maxWidth != Dp.Unspecified) {
-                        w = w.coerceAtMost(imageStyle.maxWidth.toPx())
-                    }
-
-                    w.coerceAtMost(constraints.maxWidth.toFloat())
-                }
-                renderWidth to (renderWidth * aspectRatio)
-            }
+            computeImageRenderSizePx(
+                block = block.floatedImage,
+                density = density,
+                maxWidthPx = constraints.maxWidth.toFloat(),
+                imageSizeMultiplier = imageSizeMultiplier
+            )
         }
 
         val imagePlacable = if (imageRenderWidthPx > 0 && imageRenderHeightPx > 0) {
@@ -516,6 +723,7 @@ private fun WrappingContentLayout(
 fun PaginatedReaderScreen(
     modifier: Modifier = Modifier,
     book: EpubBook,
+    bookId: String? = null,
     isDarkTheme: Boolean,
     effectiveBg: Color,
     effectiveText: Color,
@@ -525,11 +733,16 @@ fun PaginatedReaderScreen(
     fontSizeMultiplier: Float,
     lineHeightMultiplier: Float,
     paragraphGapMultiplier: Float,
+    imageSizeMultiplier: Float,
+    horizontalMarginMultiplier: Float,
+    verticalMarginMultiplier: Float,
     fontFamily: FontFamily,
     textAlign: ReaderTextAlign,
     ttsHighlightInfo: TtsHighlightInfo?,
     initialChapterIndexInBook: Int?,
-    removeEdgePadding: Boolean = false,
+    fallbackLocatorForReconfiguration: Locator? = null,
+    onReconfigurationAnchorCaptured: (Locator) -> Unit = {},
+    onReconfigurationRestoreActiveChanged: (Boolean) -> Unit = {},
     onPaginatorReady: (IPaginator) -> Unit,
     onTap: (Offset?) -> Unit,
     isProUser: Boolean,
@@ -546,7 +759,8 @@ fun PaginatedReaderScreen(
     onHighlightDeleted: (String) -> Unit,
     activeHighlightPalette: List<HighlightColor>,
     onUpdatePalette: (Int, HighlightColor) -> Unit,
-    activeTextureId: String? = null
+    activeTextureId: String? = null,
+    activeTextureAlpha: Float = 0.55f
 ) {
     LaunchedEffect(userHighlights) {
         Timber.d("PaginatedReaderScreen: Received ${userHighlights.size} highlights.")
@@ -557,11 +771,7 @@ fun PaginatedReaderScreen(
 
     val context = LocalContext.current
     val textureBitmap = remember(activeTextureId) {
-        activeTextureId?.let { id ->
-            ReaderTexture.entries.find { it.id == id }?.resId?.let { resId ->
-                ImageBitmap.imageResource(context.resources, resId)
-            }
-        }
+        loadReaderTextureBitmap(context, activeTextureId)
     }
 
     val textureModifier = if (textureBitmap != null) {
@@ -569,62 +779,62 @@ fun PaginatedReaderScreen(
             val brush = ShaderBrush(
                 ImageShader(textureBitmap, TileMode.Repeated, TileMode.Repeated)
             )
-            drawRect(brush = brush, blendMode = BlendMode.Multiply, alpha = 0.6f)
+            drawRect(brush = brush, blendMode = BlendMode.SrcOver, alpha = activeTextureAlpha.coerceIn(0f, 1f))
         }
     } else Modifier
 
-    BoxWithConstraints(modifier = modifier.fillMaxSize().background(effectiveBg).then(textureModifier)) {
+    var isNavigatingByLink by remember { mutableStateOf(false) }
+
+    BoxWithConstraints(modifier = modifier.fillMaxSize().background(effectiveBg)) {
         val textMeasurer = rememberTextMeasurer()
         val baseTextStyle = MaterialTheme.typography.bodyLarge
 
         var debouncedFontSizeMult by remember { mutableFloatStateOf(fontSizeMultiplier) }
         var debouncedLineHeightMult by remember { mutableFloatStateOf(lineHeightMultiplier) }
         var debouncedParagraphGapMult by remember { mutableFloatStateOf(paragraphGapMultiplier) }
+        var debouncedImageSizeMult by remember { mutableFloatStateOf(imageSizeMultiplier) }
+        var debouncedHorizontalMarginMult by remember { mutableFloatStateOf(horizontalMarginMultiplier) }
+        var debouncedVerticalMarginMult by remember { mutableFloatStateOf(verticalMarginMultiplier) }
         var debouncedFontFamily by remember { mutableStateOf(fontFamily) }
         var debouncedTextAlign by remember { mutableStateOf(textAlign) }
 
         var anchorLocatorForReconfig by remember { mutableStateOf<Locator?>(null) }
         val currentPaginatorRef = remember { mutableStateOf<IPaginator?>(null) }
+        val latestFallbackLocatorForReconfiguration by rememberUpdatedState(fallbackLocatorForReconfiguration)
 
-        val previousState = remember {
-            arrayOf<Any>(this.constraints, isDarkTheme, effectiveBg, effectiveText)
+        var previousConstraints by remember {
+            mutableStateOf(this.constraints)
         }
 
-        if (previousState[0] != this.constraints ||
-            previousState[1] != isDarkTheme ||
-            previousState[2] != effectiveBg ||
-            previousState[3] != effectiveText
-        ) {
+        if (previousConstraints != this.constraints) {
             val activePaginator = currentPaginatorRef.value
-            if (activePaginator is BookPaginator) {
-                val currentPage = pagerState.currentPage
-                val locator = activePaginator.getLocatorForPage(currentPage)
-                anchorLocatorForReconfig = locator
+            val currentPage = pagerState.currentPage
+            val locator = resolvePaginatedReconfigurationAnchor(
+                currentPageLocator = (activePaginator as? BookPaginator)?.getLocatorForPage(currentPage),
+                fallbackLocator = fallbackLocatorForReconfiguration
+            )
+            anchorLocatorForReconfig = locator
 
-                Timber.tag("ThemeReconfig").d("""
+            Timber.tag("ThemeReconfig").d("""
             RECONFIG DETECTED
-            - Reason: ${if (previousState[0] != this.constraints) "Constraints" else "Theme/Colors"}
+            - Reason: Constraints
             - Current Page: $currentPage
             - Saved Locator: $locator
         """.trimIndent())
-            }
-            previousState[0] = this.constraints
-            previousState[1] = isDarkTheme
-            previousState[2] = effectiveBg
-            previousState[3] = effectiveText
+            previousConstraints = this.constraints
         }
 
-        val textStyle = remember(
-            baseTextStyle, effectiveText,
+        val layoutTextStyle = remember(
+            baseTextStyle,
             debouncedFontSizeMult,
             debouncedLineHeightMult,
             debouncedFontFamily
         ) {
             val adjustedFontSize = baseTextStyle.fontSize * debouncedFontSizeMult
-            val adjustedLineHeight = adjustedFontSize * debouncedLineHeightMult
+            val adjustedLineHeight = adjustedFontSize * paginationLineHeightMultiplierForWebViewSetting(debouncedLineHeightMult)
 
             baseTextStyle.copy(
-                color = effectiveText,
+                color = Color.Unspecified,
                 fontSize = adjustedFontSize,
                 lineHeight = adjustedLineHeight,
                 fontFamily = debouncedFontFamily,
@@ -636,6 +846,9 @@ fun PaginatedReaderScreen(
                     trim = LineHeightStyle.Trim.None
                 )
             )
+        }
+        val textStyle = remember(layoutTextStyle, effectiveText) {
+            layoutTextStyle.copy(color = effectiveText)
         }
 
         LaunchedEffect(pagerState) {
@@ -650,23 +863,35 @@ fun PaginatedReaderScreen(
             }
         }
 
-        LaunchedEffect(fontSizeMultiplier, lineHeightMultiplier, paragraphGapMultiplier, fontFamily, textAlign) {
-            if (fontSizeMultiplier != debouncedFontSizeMult || lineHeightMultiplier != debouncedLineHeightMult || paragraphGapMultiplier != debouncedParagraphGapMult || fontFamily != debouncedFontFamily || textAlign != debouncedTextAlign) {
+        LaunchedEffect(fontSizeMultiplier, lineHeightMultiplier, paragraphGapMultiplier, imageSizeMultiplier, horizontalMarginMultiplier, verticalMarginMultiplier, fontFamily, textAlign) {
+            if (fontSizeMultiplier != debouncedFontSizeMult ||
+                lineHeightMultiplier != debouncedLineHeightMult ||
+                paragraphGapMultiplier != debouncedParagraphGapMult ||
+                imageSizeMultiplier != debouncedImageSizeMult ||
+                horizontalMarginMultiplier != debouncedHorizontalMarginMult ||
+                verticalMarginMultiplier != debouncedVerticalMarginMult ||
+                fontFamily != debouncedFontFamily ||
+                textAlign != debouncedTextAlign
+            ) {
                 Timber.d("Formatting changed. Waiting for debounce.")
                 delay(400L)
 
                 val activePaginator = currentPaginatorRef.value
-                if (activePaginator is BookPaginator) {
-                    val currentPage = pagerState.currentPage
-                    val locator = activePaginator.getLocatorForPage(currentPage)
-                    if (locator != null) {
-                        anchorLocatorForReconfig = locator
-                    }
+                val currentPage = pagerState.currentPage
+                val locator = resolvePaginatedReconfigurationAnchor(
+                    currentPageLocator = (activePaginator as? BookPaginator)?.getLocatorForPage(currentPage),
+                    fallbackLocator = fallbackLocatorForReconfiguration
+                )
+                if (locator != null) {
+                    anchorLocatorForReconfig = locator
                 }
 
                 debouncedFontSizeMult = fontSizeMultiplier
                 debouncedLineHeightMult = lineHeightMultiplier
                 debouncedParagraphGapMult = paragraphGapMultiplier
+                debouncedImageSizeMult = imageSizeMultiplier
+                debouncedHorizontalMarginMult = horizontalMarginMultiplier
+                debouncedVerticalMarginMult = verticalMarginMultiplier
                 debouncedFontFamily = fontFamily
                 debouncedTextAlign = textAlign
                 Timber.d("Debounce complete. Applying new format settings.")
@@ -682,8 +907,28 @@ fun PaginatedReaderScreen(
         }
 
         val density = LocalDensity.current
-        val horizontalPadding = if (removeEdgePadding) 0.dp else 16.dp
-        val verticalPadding = 16.dp
+        val requestedHorizontalPadding = 16.dp * debouncedHorizontalMarginMult
+        val requestedVerticalPadding = 16.dp * debouncedVerticalMarginMult
+        val effectiveReaderPadding =
+            remember(this.constraints, density, requestedHorizontalPadding, requestedVerticalPadding) {
+                val requestedHorizontalPaddingPx = with(density) { requestedHorizontalPadding.roundToPx() }
+                val requestedVerticalPaddingPx = with(density) { requestedVerticalPadding.roundToPx() }
+                val minReadableWidthPx = with(density) { 96.dp.roundToPx() }
+                    .coerceAtMost(this.constraints.maxWidth)
+                val minReadableHeightPx = with(density) { 160.dp.roundToPx() }
+                    .coerceAtMost(this.constraints.maxHeight)
+                val horizontalPaddingPx = requestedHorizontalPaddingPx.coerceAtMost(
+                    ((this.constraints.maxWidth - minReadableWidthPx) / 2).coerceAtLeast(0)
+                )
+                val verticalPaddingPx = requestedVerticalPaddingPx.coerceAtMost(
+                    ((this.constraints.maxHeight - minReadableHeightPx) / 2).coerceAtLeast(0)
+                )
+                with(density) {
+                    horizontalPaddingPx.toDp() to verticalPaddingPx.toDp()
+                }
+            }
+        val horizontalPadding = effectiveReaderPadding.first
+        val verticalPadding = effectiveReaderPadding.second
 
         val textConstraints =
             remember(this.constraints, density, horizontalPadding, verticalPadding) {
@@ -691,9 +936,9 @@ fun PaginatedReaderScreen(
                 val verticalPaddingPx = with(density) { verticalPadding.roundToPx() }
                 val finalConstraints = this.constraints.copy(
                     minWidth = 0,
-                    maxWidth = this.constraints.maxWidth - (2 * horizontalPaddingPx),
+                    maxWidth = (this.constraints.maxWidth - (2 * horizontalPaddingPx)).coerceAtLeast(1),
                     minHeight = 0,
-                    maxHeight = this.constraints.maxHeight - (2 * verticalPaddingPx)
+                    maxHeight = (this.constraints.maxHeight - (2 * verticalPaddingPx)).coerceAtLeast(1)
                 )
                 finalConstraints
             }
@@ -713,7 +958,15 @@ fun PaginatedReaderScreen(
             remember(initialChapterIndexInBook, anchorLocatorForReconfig) {
                 anchorLocatorForReconfig?.chapterIndex ?: initialChapterIndexInBook ?: 0
             }
-        val paginator = remember(book, textConstraints, isDarkTheme, textStyle, userTextAlign, effectiveBg, effectiveText, debouncedParagraphGapMult) {
+
+        LaunchedEffect(anchorLocatorForReconfig) {
+            anchorLocatorForReconfig?.let { locator ->
+                onReconfigurationAnchorCaptured(locator)
+                onReconfigurationRestoreActiveChanged(true)
+            }
+        }
+
+        val paginator = remember(book, bookId, textConstraints, layoutTextStyle, userTextAlign, debouncedParagraphGapMult, debouncedImageSizeMult, debouncedVerticalMarginMult) {
         val userAgentStylesheet = UserAgentStylesheet.default
             var allRules = OptimizedCssRules()
             val allFontFaces = mutableListOf<FontFaceInfo>()
@@ -721,12 +974,11 @@ fun PaginatedReaderScreen(
             val uaResult = CssParser.parse(
                 cssContent = userAgentStylesheet,
                 cssPath = null,
-                baseFontSizeSp = textStyle.fontSize.value,
+                baseFontSizeSp = layoutTextStyle.fontSize.value,
                 density = density.density,
                 constraints = textConstraints,
-                isDarkTheme = isDarkTheme,
-                themeBackgroundColor = effectiveBg,
-                themeTextColor = effectiveText
+                isDarkTheme = false,
+                adaptThemeColors = false
             )
             allRules = allRules.merge(uaResult.rules)
             allFontFaces.addAll(uaResult.fontFaces)
@@ -735,12 +987,11 @@ fun PaginatedReaderScreen(
                 val bookCssResult = CssParser.parse(
                     cssContent = content,
                     cssPath = path,
-                    baseFontSizeSp = textStyle.fontSize.value,
+                    baseFontSizeSp = layoutTextStyle.fontSize.value,
                     density = density.density,
                     constraints = textConstraints,
-                    isDarkTheme = isDarkTheme,
-                    themeBackgroundColor = effectiveBg,
-                    themeTextColor = effectiveText
+                    isDarkTheme = false,
+                    adaptThemeColors = false
                 )
                 allRules = allRules.merge(bookCssResult.rules)
                 allFontFaces.addAll(bookCssResult.fontFaces)
@@ -748,12 +999,11 @@ fun PaginatedReaderScreen(
             val fontFamilyMap = loadFontFamilies(
                 fontFaces = allFontFaces, extractionPath = book.extractionBasePath
             )
-            book.title
             val bookCacheDao =
                 BookCacheDatabase.getDatabase(context.applicationContext).bookCacheDao()
             val proto = ProtoBuf { serializersModule = semanticBlockModule }
 
-            val uniqueBookId = if (book.fileName.length > 20) book.fileName else book.title
+            val uniqueBookId = bookId ?: if (book.fileName.length > 20) book.fileName else book.title
 
             Timber.d("Recreating BookPaginator for ID: $uniqueBookId. TextAlign: $userTextAlign")
             Timber.tag("ReflowPaginationDiag").d("PaginatedReaderScreen: Instantiating BookPaginator. book.chaptersForPagination.size=${book.chaptersForPagination.size}, initialChapter=$effectiveInitialChapter")
@@ -763,7 +1013,7 @@ fun PaginatedReaderScreen(
                 chapters = book.chaptersForPagination,
                 textMeasurer = textMeasurer,
                 constraints = textConstraints,
-                textStyle = textStyle,
+                textStyle = layoutTextStyle,
                 extractionBasePath = book.extractionBasePath,
                 density = density,
                 fontFamilyMap = fontFamilyMap,
@@ -780,7 +1030,9 @@ fun PaginatedReaderScreen(
                 context = context.applicationContext,
                 mathMLRenderer = mathMLRenderer,
                 userTextAlign = userTextAlign,
-                paragraphGapMultiplier = debouncedParagraphGapMult
+                paragraphGapMultiplier = debouncedParagraphGapMult,
+                imageSizeMultiplier = debouncedImageSizeMult,
+                verticalMarginMultiplier = debouncedVerticalMarginMult
             )
         }
 
@@ -793,25 +1045,32 @@ fun PaginatedReaderScreen(
             if (anchorLocatorForReconfig != null) {
                 Timber.tag("POS_DIAG").d("Restoration Triggered. Anchor Locator: $anchorLocatorForReconfig")
 
-                snapshotFlow { paginator.isLoading }.filter { !it }.first()
+                try {
+                    onReconfigurationRestoreActiveChanged(true)
+                    snapshotFlow { paginator.isLoading }.filter { !it }.first()
 
-                val targetLocator = anchorLocatorForReconfig
-                if (targetLocator != null) {
-                    val page = paginator.findPageForLocator(targetLocator)
+                    val targetLocator = anchorLocatorForReconfig
+                    if (targetLocator != null) {
+                        val page = paginator.findPageForLocator(targetLocator)
 
-                    Timber.tag("POS_DIAG").d("Restoration Result: Paginator resolved locator to page: $page")
+                        Timber.tag("POS_DIAG").d("Restoration Result: Paginator resolved locator to page: $page")
 
-                    if (page != null) {
-                        pagerState.scrollToPage(page)
-                        Timber.tag("POS_DIAG").i("Restoration: Pager scrolled to $page")
-                    } else {
-                        val startPage = paginator.chapterStartPageIndices[targetLocator.chapterIndex]
-                        if (startPage != null) {
-                            Timber.tag("POS_DIAG").w("Restoration: Precise page not found, falling back to chapter start: $startPage")
-                            pagerState.scrollToPage(startPage)
+                        if (page != null) {
+                            pagerState.scrollToPage(page)
+                            paginator.onUserScrolledTo(page)
+                            Timber.tag("POS_DIAG").i("Restoration: Pager scrolled to $page")
+                        } else {
+                            val startPage = paginator.chapterStartPageIndices[targetLocator.chapterIndex]
+                            if (startPage != null) {
+                                Timber.tag("POS_DIAG").w("Restoration: Precise page not found, falling back to chapter start: $startPage")
+                                pagerState.scrollToPage(startPage)
+                                paginator.onUserScrolledTo(startPage)
+                            }
                         }
+                        anchorLocatorForReconfig = null
                     }
-                    anchorLocatorForReconfig = null
+                } finally {
+                    onReconfigurationRestoreActiveChanged(false)
                 }
             }
         }
@@ -839,13 +1098,31 @@ fun PaginatedReaderScreen(
 
         LaunchedEffect(pagerState, paginator) {
             snapshotFlow { pagerState.currentPage }.debounce(500)
-                .collectLatest { page -> paginator.onUserScrolledTo(page) }
+                .collectLatest { page ->
+                    if (anchorLocatorForReconfig == null) {
+                        paginator.onUserScrolledTo(page)
+                    }
+                }
         }
 
         LaunchedEffect(paginator, pagerState) {
             paginator.pageShiftRequest.collect { shiftAmount ->
-                val newPage = pagerState.currentPage + shiftAmount
-                pagerState.scrollToPage(newPage)
+                val anchor = resolvePaginatedReconfigurationAnchor(
+                    currentPageLocator = anchorLocatorForReconfig,
+                    fallbackLocator = latestFallbackLocatorForReconfiguration
+                )
+                val resolvedPage = anchor?.let { locator ->
+                    (paginator as? BookPaginator)?.findPageForLocator(locator)
+                }
+
+                if (resolvedPage != null) {
+                    pagerState.scrollToPage(resolvedPage)
+                    paginator.onUserScrolledTo(resolvedPage)
+                } else {
+                    val newPage = pagerState.currentPage + shiftAmount
+                    pagerState.scrollToPage(newPage)
+                    paginator.onUserScrolledTo(newPage)
+                }
             }
         }
 
@@ -861,6 +1138,7 @@ fun PaginatedReaderScreen(
             searchQuery = searchQuery,
             ttsHighlightInfo = ttsHighlightInfo,
             textStyle = textStyle,
+            imageSizeMultiplier = debouncedImageSizeMult,
             horizontalPadding = horizontalPadding,
             verticalPadding = verticalPadding,
             onGetPage = { pageIndex ->
@@ -887,6 +1165,7 @@ fun PaginatedReaderScreen(
             },
             onLinkClick = { currentChapterPath, href, onNavComplete ->
                 coroutineScope.launch(Dispatchers.IO) {
+                    isNavigatingByLink = true
                     var isFootnote = false
                     var footnoteHtml: String? = null
 
@@ -971,8 +1250,12 @@ fun PaginatedReaderScreen(
                     withContext(Dispatchers.Main) {
                         if (!footnoteHtml.isNullOrBlank()) {
                             onFootnoteRequested(footnoteHtml)
+                            isNavigatingByLink = false
                         } else {
-                            paginator.navigateToHref(currentChapterPath, href, onNavComplete)
+                            paginator.navigateToHref(currentChapterPath, href) {
+                                onNavComplete(it)
+                                isNavigatingByLink = false
+                            }
                         }
                     }
                 }
@@ -992,8 +1275,35 @@ fun PaginatedReaderScreen(
             isDarkTheme = isDarkTheme,
             activeHighlightPalette = activeHighlightPalette,
             onUpdatePalette = onUpdatePalette,
-            effectiveText = effectiveText
+            effectiveText = effectiveText,
+            pageTextureModifier = if (isPageTurnAnimationEnabled) Modifier else textureModifier,
+            pageTextureBitmap = textureBitmap,
+            pageTextureAlpha = activeTextureAlpha.coerceIn(0f, 1f)
         )
+
+        androidx.compose.animation.AnimatedVisibility(
+            visible = isNavigatingByLink,
+            enter = androidx.compose.animation.fadeIn(),
+            exit = androidx.compose.animation.fadeOut()
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(MaterialTheme.colorScheme.background.copy(alpha = 0.7f))
+                    .clickable(enabled = true) { },
+                contentAlignment = Alignment.Center
+            ) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    CircularProgressIndicator()
+                    Spacer(Modifier.height(16.dp))
+                    Text(
+                        "Navigating...",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onBackground
+                    )
+                }
+            }
+        }
     }
 }
 
@@ -1300,6 +1610,7 @@ private fun TextWithEmphasis(
     text: AnnotatedString,
     modifier: Modifier = Modifier,
     style: TextStyle,
+    pageIndex: Int,
     @Suppress("unused") textMeasurer: TextMeasurer,
     onLinkClick: (String) -> Unit,
     onGeneralTap: (Offset) -> Unit,
@@ -1518,27 +1829,18 @@ private fun TextWithEmphasis(
 
         textLayoutResult?.let { layoutResult ->
             if (activeSelection != null) {
-                // ADD absolute offset helper:
-                val currentBlockAbs = when (block) {
-                    is ParagraphBlock -> block.startCharOffsetInSource
-                    is HeaderBlock -> block.startCharOffsetInSource
-                    is QuoteBlock -> block.startCharOffsetInSource
-                    is ListItemBlock -> block.startCharOffsetInSource
-                }
+                val currentBlockAbs = getTextBlockCharOffset(block)
+                val isSelectedOnPage = isBlockSelectedOnPage(block, pageIndex, activeSelection)
+                val isStart =
+                    pageIndex == activeSelection.startPageIndex &&
+                        block.blockIndex == activeSelection.startBlockIndex &&
+                        currentBlockAbs == activeSelection.startBlockCharOffset
+                val isEnd =
+                    pageIndex == activeSelection.endPageIndex &&
+                        block.blockIndex == activeSelection.endBlockIndex &&
+                        currentBlockAbs == activeSelection.endBlockCharOffset
 
-                val isStart = block.blockIndex == activeSelection.startBlockIndex && currentBlockAbs == activeSelection.startBlockCharOffset
-                val isEnd = block.blockIndex == activeSelection.endBlockIndex && currentBlockAbs == activeSelection.endBlockCharOffset
-
-                val isBetween = when {
-                    block.blockIndex > activeSelection.startBlockIndex && block.blockIndex < activeSelection.endBlockIndex -> true
-                    block.blockIndex == activeSelection.startBlockIndex && block.blockIndex == activeSelection.endBlockIndex ->
-                        currentBlockAbs > activeSelection.startBlockCharOffset && currentBlockAbs < activeSelection.endBlockCharOffset
-                    block.blockIndex == activeSelection.startBlockIndex -> currentBlockAbs > activeSelection.startBlockCharOffset
-                    block.blockIndex == activeSelection.endBlockIndex -> currentBlockAbs < activeSelection.endBlockCharOffset
-                    else -> false
-                }
-
-                if (isStart || isEnd || isBetween) {
+                if (isSelectedOnPage) {
                     val sOffset = if (isStart) activeSelection.startOffset else 0
                     val eOffset = if (isEnd) activeSelection.endOffset else layoutResult.layoutInput.text.length
 
@@ -1682,9 +1984,17 @@ private fun TextWithEmphasis(
                                             endOffset = end,
                                             text = selText,
                                             rect = Rect(topLeftWin, bottomRightWin),
+                                            startPageIndex = pageIndex,
+                                            endPageIndex = pageIndex,
                                             startBlockCharOffset = startBlockAbs,
                                             endBlockCharOffset = startBlockAbs,
-                                            textPerBlock = mapOf("${block.blockIndex}_${startBlockAbs}" to selText)
+                                            textPerBlock = mapOf(
+                                                buildSelectionBlockKey(
+                                                    pageIndex = pageIndex,
+                                                    blockIndex = block.blockIndex,
+                                                    blockCharOffset = startBlockAbs
+                                                ) to selText
+                                            )
                                         )
                                     )
                                 }
@@ -1730,10 +2040,14 @@ private fun checkLayoutMismatch(
     expectedHeight: Int,
     actualHeight: Int,
     textSnippet: String,
+    diagnostics: String = "",
     @Suppress("SameParameterValue") tolerance: Int = 2
 ) {
     if (expectedHeight == 0) {
-        Timber.tag("PAGINATION_MISMATCH").w("Block #$blockIndex ($blockType) has expectedHeight=0. Skipping check. Text: '$textSnippet'")
+        Timber.tag("PAGINATION_MISMATCH").w(
+            "Block #$blockIndex ($blockType) has expectedHeight=0. Skipping check. Text: '$textSnippet'" +
+                    if (diagnostics.isNotBlank()) "\n -> Diagnostics: $diagnostics" else ""
+        )
         return
     }
 
@@ -1744,7 +2058,8 @@ private fun checkLayoutMismatch(
                     " -> Expected: ${expectedHeight}px\n" +
                     " -> Actual:   ${actualHeight}px\n" +
                     " -> Diff:     +${diff}px\n" +
-                    " -> Content:  '$textSnippet'"
+                    " -> Content:  '$textSnippet'" +
+                    if (diagnostics.isNotBlank()) "\n -> Diagnostics: $diagnostics" else ""
         )
     }
 }
@@ -1763,6 +2078,7 @@ internal fun PaginatedReaderContent(
     searchQuery: String,
     ttsHighlightInfo: TtsHighlightInfo?,
     textStyle: TextStyle,
+    imageSizeMultiplier: Float,
     horizontalPadding: Dp,
     verticalPadding: Dp,
     onGetPage: (Int) -> Page?,
@@ -1783,7 +2099,10 @@ internal fun PaginatedReaderContent(
     onHighlightDeleted: (String) -> Unit,
     activeHighlightPalette: List<HighlightColor>,
     onUpdatePalette: (Int, HighlightColor) -> Unit,
-    isDarkTheme: Boolean
+    isDarkTheme: Boolean,
+    pageTextureModifier: Modifier = Modifier,
+    pageTextureBitmap: ImageBitmap? = null,
+    pageTextureAlpha: Float = 0f
 ) {
     val coroutineScope = rememberCoroutineScope()
     val density = LocalDensity.current
@@ -1797,10 +2116,10 @@ internal fun PaginatedReaderContent(
         val urlToShow = showExternalLinkDialog!!
         AlertDialog(
             onDismissRequest = { showExternalLinkDialog = null },
-            title = { Text("External Link") },
+            title = { Text(stringResource(R.string.dialog_external_link_title)) },
             text = {
                 Text(
-                    "You clicked on an external link:\n\n$urlToShow\n\nWhat would you like to do?"
+                    stringResource(R.string.dialog_external_link_desc, urlToShow)
                 )
             },
             confirmButton = {
@@ -1809,10 +2128,10 @@ internal fun PaginatedReaderContent(
                         onClick = {
                             val clipboard =
                                 context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                            val clip = ClipData.newPlainText("Copied Link", urlToShow)
+                            val clip = ClipData.newPlainText(context.getString(R.string.clip_label_copied_link), urlToShow)
                             clipboard.setPrimaryClip(clip)
                             showExternalLinkDialog = null
-                        }) { Text("Copy") }
+                        }) { Text(stringResource(R.string.action_copy)) }
                     TextButton(
                         onClick = {
                             val intent = Intent(Intent.ACTION_VIEW, urlToShow.toUri())
@@ -1823,15 +2142,15 @@ internal fun PaginatedReaderContent(
                                     e, "No activity found to handle intent for URL: $urlToShow"
                                 )
                                 Toast.makeText(
-                                    context, "No browser found to open the link.", Toast.LENGTH_LONG
+                                    context, context.getString(R.string.error_no_browser), Toast.LENGTH_LONG
                                 ).show()
                             }
                             showExternalLinkDialog = null
-                        }) { Text("Open") }
+                        }) { Text(stringResource(R.string.action_open)) }
                 }
             },
             dismissButton = {
-                TextButton(onClick = { showExternalLinkDialog = null }) { Text("Cancel") }
+                TextButton(onClick = { showExternalLinkDialog = null }) { Text(stringResource(R.string.action_cancel)) }
             })
     }
 
@@ -1924,12 +2243,21 @@ internal fun PaginatedReaderContent(
                                 pageIndex,
                                 effectiveBg,
                                 isDarkTheme,
-                                pageTurnTouchY
+                                pageTurnTouchY,
+                                pageTextureBitmap,
+                                pageTextureAlpha
                             )
                         } else Modifier
 
                         var pageContent by remember { mutableStateOf<Page?>(null) }
                         var currentChapterPath by remember { mutableStateOf<String?>(null) }
+                        val themedPageContent = remember(pageContent, isDarkTheme, effectiveBg, effectiveText) {
+                            pageContent?.applyReaderThemeForDisplay(
+                                isDarkTheme = isDarkTheme,
+                                themeBackgroundColor = effectiveBg,
+                                themeTextColor = effectiveText
+                            )
+                        }
 
                         LaunchedEffect(pageIndex, uiState.generation) {
                             val fetchStartTime = System.currentTimeMillis()
@@ -1948,7 +2276,7 @@ internal fun PaginatedReaderContent(
                         }
 
                         val textBlocksOnPage =
-                            pageContent?.content?.extractTextBlocks()
+                            themedPageContent?.content?.extractTextBlocks()
                                 ?.filter { it.cfi != null } ?: emptyList()
                         val lastTextBlock = textBlocksOnPage.lastOrNull()
                         val lastBlockAbs = lastTextBlock?.let {
@@ -1962,6 +2290,7 @@ internal fun PaginatedReaderContent(
 
                         LaunchedEffect(activeSelection, lastTextBlock, isDraggingHandle) {
                             if (isDraggingHandle && activeSelection != null && lastTextBlock != null &&
+                                activeSelection!!.endPageIndex == pageIndex &&
                                 activeSelection!!.endBlockIndex == lastTextBlock.blockIndex &&
                                 activeSelection!!.endBlockCharOffset == lastBlockAbs) {
                                 if (activeSelection!!.endOffset >= lastTextBlock.content.text.length - 3) {
@@ -2041,14 +2370,19 @@ internal fun PaginatedReaderContent(
                                 }
 
                                 val newTextPerBlock = (previousSel?.textPerBlock ?: emptyMap()).toMutableMap()
-                                newTextPerBlock["${firstTextBlock.blockIndex}_${firstTextBlockAbs}"] = text.substring(0, endIndex)
+                                newTextPerBlock[
+                                    buildSelectionBlockKey(
+                                        pageIndex = pageIndex,
+                                        blockIndex = firstTextBlock.blockIndex,
+                                        blockCharOffset = firstTextBlockAbs
+                                    )
+                                ] = text.substring(0, endIndex)
 
-                                val newText = newTextPerBlock.entries.sortedBy {
-                                    val parts = it.key.split("_")
-                                    val idx = parts[0].toIntOrNull() ?: 0
-                                    val abs = parts.getOrNull(1)?.toIntOrNull() ?: 0
-                                    idx * 1000000L + abs
-                                }.joinToString(" ") { it.value }
+                                val newText = newTextPerBlock.entries
+                                    .sortedWith { first, second ->
+                                        compareSelectionBlockKeys(first.key, second.key)
+                                    }
+                                    .joinToString(" ") { it.value }
 
                                 activeSelection = PaginatedSelection(
                                     startBlockIndex = previousSel?.startBlockIndex ?: firstTextBlock.blockIndex,
@@ -2059,6 +2393,8 @@ internal fun PaginatedReaderContent(
                                     endOffset = endIndex,
                                     text = newText,
                                     rect = Rect(windowTopLeft, windowBottomRight),
+                                    startPageIndex = previousSel?.startPageIndex ?: pending.fromPageIndex,
+                                    endPageIndex = pageIndex,
                                     startBlockCharOffset = previousSel?.startBlockCharOffset ?: firstTextBlockAbs,
                                     endBlockCharOffset = firstTextBlockAbs,
                                     textPerBlock = newTextPerBlock
@@ -2070,7 +2406,7 @@ internal fun PaginatedReaderContent(
                             pendingCrossPageSelection = null
                         }
 
-                        Box(modifier = Modifier.fillMaxSize().then(pageModifier)) {
+                        Box(modifier = Modifier.fillMaxSize().background(effectiveBg).then(pageTextureModifier).then(pageModifier)) {
                             Box(modifier = Modifier.fillMaxSize()) {
                                 Box(modifier = Modifier.fillMaxSize().pointerInput(Unit) {
                                     detectTapGestures(
@@ -2083,7 +2419,8 @@ internal fun PaginatedReaderContent(
                                     horizontal = horizontalPadding,
                                     vertical = verticalPadding
                                 ), contentAlignment = Alignment.TopStart) {
-                                    if (pageContent != null) {
+                                    if (themedPageContent != null) {
+                                        val displayPage = themedPageContent
                                         val onGeneralTapCallback: (Offset) -> Unit = { offset ->
                                             activeSelection = null
                                             onTap(offset)
@@ -2109,7 +2446,7 @@ internal fun PaginatedReaderContent(
                                             val ttsHighlightColor =
                                                 MaterialTheme.colorScheme.secondary.copy(alpha = 0.5f)
 
-                                            pageContent!!.content.forEach { block ->
+                                            displayPage.content.forEach { block ->
                                                 val marginModifier = Modifier.padding(
                                                     top = block.style.margin.top.coerceAtLeast(0.dp),
                                                     bottom = block.style.margin.bottom.coerceAtLeast(
@@ -2181,6 +2518,79 @@ internal fun PaginatedReaderContent(
                                                                 expectedHeight = block.expectedHeight,
                                                                 actualHeight = actualHeight,
                                                                 textSnippet = snippet,
+                                                                diagnostics = buildString {
+                                                                    append("page=")
+                                                                    append(pageIndex)
+                                                                    append(", width=")
+                                                                    append(coordinates.size.width)
+                                                                    append("px, styleWidth=")
+                                                                    append(block.style.width)
+                                                                    append(", maxWidth=")
+                                                                    append(block.style.maxWidth)
+                                                                    append(", margin=")
+                                                                    append(block.style.margin)
+                                                                    append(", padding=")
+                                                                    append(block.style.padding)
+                                                                    append(", borders=(")
+                                                                    append(block.style.borderLeft?.width ?: 0.dp)
+                                                                    append(", ")
+                                                                    append(block.style.borderTop?.width ?: 0.dp)
+                                                                    append(", ")
+                                                                    append(block.style.borderRight?.width ?: 0.dp)
+                                                                    append(", ")
+                                                                    append(block.style.borderBottom?.width ?: 0.dp)
+                                                                    append(")")
+                                                                    when (block) {
+                                                                        is ParagraphBlock -> {
+                                                                            append(", start=")
+                                                                            append(block.startCharOffsetInSource)
+                                                                            append(", end=")
+                                                                            append(block.endCharOffsetInSource)
+                                                                            append(", chars=")
+                                                                            append(block.content.length)
+                                                                            append(", textAlign=")
+                                                                            append(block.textAlign)
+                                                                        }
+
+                                                                        is HeaderBlock -> {
+                                                                            append(", start=")
+                                                                            append(block.startCharOffsetInSource)
+                                                                            append(", end=")
+                                                                            append(block.endCharOffsetInSource)
+                                                                            append(", chars=")
+                                                                            append(block.content.length)
+                                                                            append(", textAlign=")
+                                                                            append(block.textAlign)
+                                                                        }
+
+                                                                        is QuoteBlock -> {
+                                                                            append(", start=")
+                                                                            append(block.startCharOffsetInSource)
+                                                                            append(", end=")
+                                                                            append(block.endCharOffsetInSource)
+                                                                            append(", chars=")
+                                                                            append(block.content.length)
+                                                                            append(", textAlign=")
+                                                                            append(block.textAlign)
+                                                                        }
+
+                                                                        is ListItemBlock -> {
+                                                                            append(", start=")
+                                                                            append(block.startCharOffsetInSource)
+                                                                            append(", end=")
+                                                                            append(block.endCharOffsetInSource)
+                                                                            append(", chars=")
+                                                                            append(block.content.length)
+                                                                        }
+
+                                                                        is TextContentBlock -> {
+                                                                            append(", chars=")
+                                                                            append(block.content.length)
+                                                                        }
+
+                                                                        else -> Unit
+                                                                    }
+                                                                },
                                                                 tolerance = 2
                                                             )
                                                         }
@@ -2295,6 +2705,7 @@ internal fun PaginatedReaderContent(
                                                                 text = finalContent,
                                                                 style = paragraphStyle,
                                                                 modifier = paddingModifier,
+                                                                pageIndex = pageIndex,
                                                                 textMeasurer = textMeasurer,
                                                                 onLinkClick = onLinkClickCallback,
                                                                 onGeneralTap = onGeneralTapCallback,
@@ -2320,10 +2731,10 @@ internal fun PaginatedReaderContent(
                                                         }
 
                                                         is HeaderBlock -> {
-                                                            val style = textStyle.copy(
-                                                                fontWeight = FontWeight.Bold,
+                                                            val style = createHeaderTextStyle(
+                                                                baseStyle = textStyle,
+                                                                level = block.level,
                                                                 textAlign = block.textAlign
-                                                                    ?: textStyle.textAlign
                                                             )
                                                             val searchHighlighted =
                                                                 highlightQueryInText(
@@ -2377,6 +2788,7 @@ internal fun PaginatedReaderContent(
                                                                 text = finalContent,
                                                                 style = style,
                                                                 modifier = paddingModifier,
+                                                                pageIndex = pageIndex,
                                                                 textMeasurer = textMeasurer,
                                                                 onLinkClick = onLinkClickCallback,
                                                                 onGeneralTap = onGeneralTapCallback,
@@ -2462,6 +2874,7 @@ internal fun PaginatedReaderContent(
                                                                 text = finalContent,
                                                                 style = quoteStyle,
                                                                 modifier = quoteModifier,
+                                                                pageIndex = pageIndex,
                                                                 textMeasurer = textMeasurer,
                                                                 onLinkClick = onLinkClickCallback,
                                                                 onGeneralTap = onGeneralTapCallback,
@@ -2494,12 +2907,14 @@ internal fun PaginatedReaderContent(
                                                                 val markerAreaModifier =
                                                                     Modifier.width(32.dp)
                                                                         .padding(end = 8.dp)
+                                                                val itemMarkerImage = block.itemMarkerImage
+                                                                val itemMarker = block.itemMarker
 
-                                                                if (block.itemMarkerImage != null) {
+                                                                if (itemMarkerImage != null) {
                                                                     val imageRequest =
                                                                         Builder(LocalContext.current).data(
                                                                             File(
-                                                                                block.itemMarkerImage
+                                                                                itemMarkerImage
                                                                             )
                                                                         ).crossfade(true).build()
                                                                     val imageSize = with(density) {
@@ -2508,16 +2923,16 @@ internal fun PaginatedReaderContent(
 
                                                                     AsyncImage(
                                                                         model = imageRequest,
-                                                                        contentDescription = "List item marker",
+                                                                        contentDescription = stringResource(R.string.content_desc_list_item_marker),
                                                                         modifier = markerAreaModifier.height(
                                                                             imageSize
                                                                         ),
                                                                         alignment = Alignment.CenterEnd,
                                                                         contentScale = ContentScale.FillHeight
                                                                     )
-                                                                } else if (block.itemMarker != null) {
+                                                                } else if (itemMarker != null) {
                                                                     Text(
-                                                                        text = block.itemMarker,
+                                                                        text = itemMarker,
                                                                         style = textStyle.copy(
                                                                             textAlign = TextAlign.End
                                                                         ),
@@ -2576,6 +2991,7 @@ internal fun PaginatedReaderContent(
                                                                     text = finalContent,
                                                                     style = textStyle,
                                                                     modifier = Modifier.weight(1f),
+                                                                    pageIndex = pageIndex,
                                                                     textMeasurer = textMeasurer,
                                                                     onLinkClick = onLinkClickCallback,
                                                                     onGeneralTap = onGeneralTapCallback,
@@ -2605,6 +3021,7 @@ internal fun PaginatedReaderContent(
                                                             WrappingContentLayout(
                                                                 block = block,
                                                                 textStyle = textStyle,
+                                                                imageSizeMultiplier = imageSizeMultiplier,
                                                                 modifier = paddingModifier,
                                                                 searchQuery = searchQuery,
                                                                 ttsHighlightInfo = ttsHighlightInfo,
@@ -2639,6 +3056,7 @@ internal fun PaginatedReaderContent(
                                                                         RenderFlexChildBlock(
                                                                             childBlock = childBlock,
                                                                             textStyle = textStyle,
+                                                                            imageSizeMultiplier = imageSizeMultiplier,
                                                                             searchQuery = searchQuery,
                                                                             searchHighlightColor = searchHighlightColor,
                                                                             ttsHighlightInfo = ttsHighlightInfo,
@@ -2691,6 +3109,7 @@ internal fun PaginatedReaderContent(
                                                                         RenderFlexChildBlock(
                                                                             childBlock = childBlock,
                                                                             textStyle = textStyle,
+                                                                            imageSizeMultiplier = imageSizeMultiplier,
                                                                             searchQuery = searchQuery,
                                                                             searchHighlightColor = searchHighlightColor,
                                                                             ttsHighlightInfo = ttsHighlightInfo,
@@ -2723,10 +3142,12 @@ internal fun PaginatedReaderContent(
                                                         }
 
                                                         is MathBlock -> {
+                                                            val svgContent = block.svgContent?.takeIf { it.isNotBlank() }
                                                             Timber.d(
-                                                                "PaginatedReader: Rendering MathBlock. Alt: '${block.altText}', Has SVG: ${!block.svgContent.isNullOrBlank()}"
+                                                                "PaginatedReader: Rendering MathBlock. Alt: '${block.altText}', Has SVG: ${svgContent != null}"
                                                             )
-                                                            if (!block.svgContent.isNullOrBlank()) {
+                                                            if (svgContent != null) {
+                                                                val nonBlankSvgContent = svgContent
                                                                 BoxWithConstraints(
                                                                     modifier = paddingModifier
                                                                 ) {
@@ -2810,7 +3231,7 @@ internal fun PaginatedReaderContent(
                                                                     val imageRequest =
                                                                         Builder(LocalContext.current).data(
                                                                             SvgData(
-                                                                                block.svgContent
+                                                                                nonBlankSvgContent
                                                                             )
                                                                         ).listener(
                                                                             onError = { _, result ->
@@ -2851,23 +3272,6 @@ internal fun PaginatedReaderContent(
 
                                                         is ImageBlock -> {
                                                             val style = block.style
-                                                            val finalImageModifier = Modifier.then(
-                                                                if (style.width.isSpecified && style.width > 0.dp) Modifier.width(style.width)
-                                                                else Modifier.fillMaxWidth()
-                                                            ).then(
-                                                                if (style.maxWidth.isSpecified && style.maxWidth > 0.dp) Modifier.widthIn(max = style.maxWidth)
-                                                                else Modifier
-                                                            ).then(
-                                                                if (block.expectedHeight > 0) {
-                                                                    Modifier.height(with(density) { block.expectedHeight.toDp() })
-                                                                } else {
-                                                                    Modifier.height(250.dp)
-                                                                }
-                                                            ).then(paddingModifier)
-                                                                .onGloballyPositioned { coords ->
-                                                                    Timber.tag("IMAGE_DIAG").v("Actual Rendered Height for [#${block.blockIndex}]: ${coords.size.height}px")
-                                                                }
-
                                                             val colorFilter =
                                                                 if (block.style.filter == "invert(100%)") {
                                                                     val matrix = floatArrayOf(
@@ -2912,14 +3316,57 @@ internal fun PaginatedReaderContent(
                                                                         )
                                                                     }).crossfade(true).build()
 
-                                                            AsyncImage(
-                                                                model = imageRequest,
-                                                                contentDescription = block.altText
-                                                                    ?: "Image from EPUB",
-                                                                modifier = finalImageModifier,
-                                                                contentScale = ContentScale.Fit,
-                                                                colorFilter = colorFilter
-                                                            )
+                                                            BoxWithConstraints(
+                                                                modifier = paddingModifier,
+                                                                contentAlignment = imageBlockContentAlignment(style)
+                                                            ) {
+                                                                val scaledSize = computeImageRenderSizeDp(
+                                                                    block = block,
+                                                                    density = density,
+                                                                    maxWidthDp = maxWidth,
+                                                                    imageSizeMultiplier = imageSizeMultiplier
+                                                                )
+                                                                val finalImageModifier = Modifier
+                                                                    .then(
+                                                                        if (scaledSize != null) {
+                                                                            Modifier.width(scaledSize.first).height(scaledSize.second)
+                                                                        } else if (style.width.isSpecified && style.width > 0.dp) {
+                                                                            Modifier.width(style.width)
+                                                                        } else {
+                                                                            Modifier.fillMaxWidth()
+                                                                        }
+                                                                    )
+                                                                    .then(
+                                                                        if (scaledSize == null && style.maxWidth.isSpecified && style.maxWidth > 0.dp) {
+                                                                            Modifier.widthIn(max = style.maxWidth)
+                                                                        } else {
+                                                                            Modifier
+                                                                        }
+                                                                    )
+                                                                    .then(
+                                                                        if (scaledSize == null) {
+                                                                            if (block.expectedHeight > 0) {
+                                                                                Modifier.height(with(density) { (block.expectedHeight * imageSizeMultiplier).toDp() })
+                                                                            } else {
+                                                                                Modifier.height(250.dp)
+                                                                            }
+                                                                        } else {
+                                                                            Modifier
+                                                                        }
+                                                                    )
+                                                                    .onGloballyPositioned { coords ->
+                                                                        Timber.tag("IMAGE_DIAG").v("Actual Rendered Height for [#${block.blockIndex}]: ${coords.size.height}px")
+                                                                    }
+
+                                                                AsyncImage(
+                                                                    model = imageRequest,
+                                                                    contentDescription = block.altText
+                                                                        ?: "Image from EPUB",
+                                                                    modifier = finalImageModifier,
+                                                                    contentScale = ContentScale.Fit,
+                                                                    colorFilter = colorFilter
+                                                                )
+                                                            }
                                                         }
 
                                                         is SpacerBlock -> {
@@ -3040,9 +3487,10 @@ internal fun PaginatedReaderContent(
                                                                                             Row(
                                                                                                 verticalAlignment = Alignment.Top
                                                                                             ) {
-                                                                                                if (blockInCell.itemMarker != null) {
+                                                                                                val itemMarker = blockInCell.itemMarker
+                                                                                                if (itemMarker != null) {
                                                                                                     Text(
-                                                                                                        text = blockInCell.itemMarker,
+                                                                                                        text = itemMarker,
                                                                                                         style = cellTextStyle,
                                                                                                         modifier = Modifier.padding(
                                                                                                             end = 4.dp
@@ -3073,13 +3521,6 @@ internal fun PaginatedReaderContent(
                                                                                         }
 
                                                                                         is ImageBlock -> {
-                                                                                            val imageModifier = Modifier.fillMaxWidth().then(
-                                                                                                if (blockInCell.expectedHeight > 0) {
-                                                                                                    Modifier.height(with(density) { blockInCell.expectedHeight.toDp() })
-                                                                                                } else {
-                                                                                                    Modifier.height(250.dp)
-                                                                                                }
-                                                                                            )
                                                                                             AsyncImage(
                                                                                                 model = Builder(
                                                                                                     LocalContext.current
@@ -3091,7 +3532,11 @@ internal fun PaginatedReaderContent(
                                                                                                     .build(),
                                                                                                 contentDescription = blockInCell.altText,
                                                                                                 contentScale = ContentScale.Fit,
-                                                                                                modifier = imageModifier
+                                                                                                modifier = tableCellImageModifier(
+                                                                                                    block = blockInCell,
+                                                                                                    density = density,
+                                                                                                    imageSizeMultiplier = imageSizeMultiplier
+                                                                                                )
                                                                                             )
                                                                                         }
 
@@ -3139,7 +3584,7 @@ internal fun PaginatedReaderContent(
                     val currentPageBlocks =
                         blockLayoutMap.filterKeys { it.endsWith(currentPageSuffix) }.values.filter { it.second.isAttached }
                     val visibleSelectedBlocks =
-                        currentPageBlocks.filter { it.third.blockIndex in sel.startBlockIndex..sel.endBlockIndex }
+                        currentPageBlocks.filter { isBlockSelectedOnPage(it.third, pagerState.currentPage, sel) }
 
                     if (!isDraggingHandle && visibleSelectedBlocks.isNotEmpty()) {
                         val menuAnchorRect = run {
@@ -3151,14 +3596,15 @@ internal fun PaginatedReaderContent(
                             visibleSelectedBlocks.forEach { triple ->
                                 val (textLayout, coords, block) = triple
 
-                                val currentBlockAbs = when (block) {
-                                    is ParagraphBlock -> block.startCharOffsetInSource
-                                    is HeaderBlock -> block.startCharOffsetInSource
-                                    is QuoteBlock -> block.startCharOffsetInSource
-                                    is ListItemBlock -> block.startCharOffsetInSource
-                                }
-                                val isStartBlockPart = block.blockIndex == sel.startBlockIndex && currentBlockAbs == sel.startBlockCharOffset
-                                val isEndBlockPart = block.blockIndex == sel.endBlockIndex && currentBlockAbs == sel.endBlockCharOffset
+                                val currentBlockAbs = getTextBlockCharOffset(block)
+                                val isStartBlockPart =
+                                    pagerState.currentPage == sel.startPageIndex &&
+                                        block.blockIndex == sel.startBlockIndex &&
+                                        currentBlockAbs == sel.startBlockCharOffset
+                                val isEndBlockPart =
+                                    pagerState.currentPage == sel.endPageIndex &&
+                                        block.blockIndex == sel.endBlockIndex &&
+                                        currentBlockAbs == sel.endBlockCharOffset
 
                                 val blockStartOffset = if (isStartBlockPart) sel.startOffset else 0
                                 val blockEndOffset = if (isEndBlockPart) sel.endOffset else textLayout.layoutInput.text.length
@@ -3224,7 +3670,7 @@ internal fun PaginatedReaderContent(
                                 onCopy = {
                                     val clipboardManager =
                                         context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                                    val clip = ClipData.newPlainText("Copied Text", sel.text)
+                                    val clip = ClipData.newPlainText(context.getString(R.string.clip_label_copied_text), sel.text)
                                     clipboardManager.setPrimaryClip(clip)
                                     activeSelection = null
                                 },
@@ -3304,30 +3750,28 @@ internal fun PaginatedReaderContent(
                                 var newEndOffset = if (isStartHandle) sel.endOffset else offset
                                 var newStartCfi = if (isStartHandle) block.cfi!! else sel.startBaseCfi
                                 var newEndCfi = if (isStartHandle) sel.endBaseCfi else block.cfi!!
+                                var newStartPageIdx = if (isStartHandle) pagerState.currentPage else sel.startPageIndex
+                                var newEndPageIdx = if (isStartHandle) sel.endPageIndex else pagerState.currentPage
 
-                                val currentBlockAbs = when (block) {
-                                    is ParagraphBlock -> block.startCharOffsetInSource
-                                    is HeaderBlock -> block.startCharOffsetInSource
-                                    is QuoteBlock -> block.startCharOffsetInSource
-                                    is ListItemBlock -> block.startCharOffsetInSource
-                                }
+                                val currentBlockAbs = getTextBlockCharOffset(block)
                                 var newStartBlockAbs = if (isStartHandle) currentBlockAbs else sel.startBlockCharOffset
                                 var newEndBlockAbs = if (!isStartHandle) currentBlockAbs else sel.endBlockCharOffset
 
-                                // UPDATE Swap conditions completely:
                                 val isReversed = when {
-                                    newStartIdx > newEndIdx -> true
-                                    newStartIdx < newEndIdx -> false
+                                    newStartPageIdx != newEndPageIdx -> newStartPageIdx > newEndPageIdx
                                     else -> {
-                                        when {
-                                            newStartBlockAbs > newEndBlockAbs -> true
-                                            newStartBlockAbs < newEndBlockAbs -> false
-                                            else -> newStartOffset > newEndOffset
-                                        }
+                                        val blockCompare = compareBlockPositionsOnPage(
+                                            newStartIdx,
+                                            newStartBlockAbs,
+                                            newEndIdx,
+                                            newEndBlockAbs
+                                        )
+                                        if (blockCompare != 0) blockCompare > 0 else newStartOffset > newEndOffset
                                     }
                                 }
 
                                 if (isReversed) {
+                                    newStartPageIdx = newEndPageIdx.also { newEndPageIdx = newStartPageIdx }
                                     newStartIdx = newEndIdx.also { newEndIdx = newStartIdx }
                                     newStartOffset = newEndOffset.also { newEndOffset = newStartOffset }
                                     newStartCfi = newEndCfi.also { newEndCfi = newStartCfi }
@@ -3335,33 +3779,48 @@ internal fun PaginatedReaderContent(
                                     activeDragHandle = if (activeDragHandle == SelectionHandle.START) SelectionHandle.END else SelectionHandle.START
                                 }
 
-                                if (newStartIdx != sel.startBlockIndex || newEndIdx != sel.endBlockIndex || newStartOffset != sel.startOffset || newEndOffset != sel.endOffset) {
+                                if (
+                                    newStartPageIdx != sel.startPageIndex ||
+                                    newEndPageIdx != sel.endPageIndex ||
+                                    newStartIdx != sel.startBlockIndex ||
+                                    newEndIdx != sel.endBlockIndex ||
+                                    newStartOffset != sel.startOffset ||
+                                    newEndOffset != sel.endOffset
+                                ) {
                                     hapticFeedback.performHapticFeedback(HapticFeedbackType.TextHandleMove)
 
-                                    val relevantBlocks = attachedBlocks.filter { it.third.blockIndex in newStartIdx..newEndIdx }
-                                        .sortedWith(compareBy({ it.third.blockIndex }, { b ->
-                                            when(b.third) {
-                                                is ParagraphBlock -> (b.third as ParagraphBlock).startCharOffsetInSource
-                                                is HeaderBlock -> (b.third as HeaderBlock).startCharOffsetInSource
-                                                is QuoteBlock -> (b.third as QuoteBlock).startCharOffsetInSource
-                                                is ListItemBlock -> (b.third as ListItemBlock).startCharOffsetInSource
-                                            }
-                                        }))
+                                    val relevantBlocks = attachedBlocks
+                                        .filter {
+                                            isBlockSelectedOnPage(
+                                                block = it.third,
+                                                pageIndex = pagerState.currentPage,
+                                                selection = PaginatedSelection(
+                                                    startBlockIndex = newStartIdx,
+                                                    endBlockIndex = newEndIdx,
+                                                    startBaseCfi = newStartCfi,
+                                                    endBaseCfi = newEndCfi,
+                                                    startOffset = newStartOffset,
+                                                    endOffset = newEndOffset,
+                                                    text = sel.text,
+                                                    rect = sel.rect,
+                                                    startPageIndex = newStartPageIdx,
+                                                    endPageIndex = newEndPageIdx,
+                                                    startBlockCharOffset = newStartBlockAbs,
+                                                    endBlockCharOffset = newEndBlockAbs,
+                                                    textPerBlock = sel.textPerBlock
+                                                )
+                                            )
+                                        }
+                                        .sortedWith(compareBy({ it.third.blockIndex }, { getTextBlockCharOffset(it.third) }))
 
                                     val newTextPerBlock = sel.textPerBlock.toMutableMap()
                                     newTextPerBlock.keys.removeAll { keyStr ->
-                                        val bIdx = keyStr.split("_").firstOrNull()?.toIntOrNull() ?: -1
-                                        bIdx !in newStartIdx..newEndIdx
+                                        parseSelectionBlockKey(keyStr)?.pageIndex == pagerState.currentPage
                                     }
 
                                     for (b in relevantBlocks) {
                                         val txt = b.third.content.text
-                                        val bAbs = when(b.third) {
-                                            is ParagraphBlock -> b.third.startCharOffsetInSource
-                                            is HeaderBlock -> b.third.startCharOffsetInSource
-                                            is QuoteBlock -> b.third.startCharOffsetInSource
-                                            is ListItemBlock -> b.third.startCharOffsetInSource
-                                        }
+                                        val bAbs = getTextBlockCharOffset(b.third)
                                         val isStartBlockPart = b.third.blockIndex == newStartIdx && bAbs == newStartBlockAbs
                                         val isEndBlockPart = b.third.blockIndex == newEndIdx && bAbs == newEndBlockAbs
 
@@ -3372,30 +3831,36 @@ internal fun PaginatedReaderContent(
                                         val safeE = e.coerceIn(safeS, txt.length)
 
                                         if (safeS < safeE) {
-                                            newTextPerBlock["${b.third.blockIndex}_${bAbs}"] = txt.substring(safeS, safeE)
+                                            newTextPerBlock[
+                                                buildSelectionBlockKey(
+                                                    pageIndex = pagerState.currentPage,
+                                                    blockIndex = b.third.blockIndex,
+                                                    blockCharOffset = bAbs
+                                                )
+                                            ] = txt.substring(safeS, safeE)
                                         } else {
-                                            newTextPerBlock.remove("${b.third.blockIndex}_${bAbs}")
+                                            newTextPerBlock.remove(
+                                                buildSelectionBlockKey(
+                                                    pageIndex = pagerState.currentPage,
+                                                    blockIndex = b.third.blockIndex,
+                                                    blockCharOffset = bAbs
+                                                )
+                                            )
                                         }
                                     }
 
-                                    val newText = newTextPerBlock.entries.sortedBy {
-                                        val parts = it.key.split("_")
-                                        val idx = parts[0].toIntOrNull() ?: 0
-                                        val abs = parts.getOrNull(1)?.toIntOrNull() ?: 0
-                                        idx * 1000000L + abs
-                                    }.joinToString(" ") { it.value }
-
-                                    val sLayout = blockLayoutMap["${newStartCfi}$currentPageSuffix"]?.takeIf {
-                                        val abs = when(it.third) {
-                                            is ParagraphBlock -> it.third.startCharOffsetInSource
-                                            is HeaderBlock -> it.third.startCharOffsetInSource
-                                            is QuoteBlock -> it.third.startCharOffsetInSource
-                                            is ListItemBlock -> it.third.startCharOffsetInSource
+                                    val newText = newTextPerBlock.entries
+                                        .sortedWith { first, second ->
+                                            compareSelectionBlockKeys(first.key, second.key)
                                         }
+                                        .joinToString(" ") { it.value }
+
+                                    val sLayout = blockLayoutMap["${newStartCfi}_$newStartPageIdx"]?.takeIf {
+                                        val abs = getTextBlockCharOffset(it.third)
                                         abs == newStartBlockAbs
                                     }
 
-                                    val eLayout = blockLayoutMap["${newEndCfi}$currentPageSuffix"]
+                                    val eLayout = blockLayoutMap["${newEndCfi}_$newEndPageIdx"]
                                     var newRect = sel.rect
 
                                     if (sLayout != null && eLayout != null && sLayout.second.isAttached && eLayout.second.isAttached) {
@@ -3453,6 +3918,8 @@ internal fun PaginatedReaderContent(
                                         endOffset = newEndOffset,
                                         text = newText,
                                         rect = newRect,
+                                        startPageIndex = newStartPageIdx,
+                                        endPageIndex = newEndPageIdx,
                                         startBlockCharOffset = newStartBlockAbs,
                                         endBlockCharOffset = newEndBlockAbs,
                                         textPerBlock = newTextPerBlock
@@ -3476,34 +3943,34 @@ internal fun PaginatedReaderContent(
                                     @Suppress("UNUSED_VARIABLE") val isScrolling = pagerState.isScrollInProgress
                                     @Suppress("UNUSED_VARIABLE") val tick = blockLayoutMap.tick
 
-                                    val selCfi = if (isStart) sel.startBaseCfi else sel.endBaseCfi
-                                    val selOffset = if (isStart) sel.startOffset else sel.endOffset
-                                    val targetBlockAbs = if (isStart) sel.startBlockCharOffset else sel.endBlockCharOffset
-                                    val layoutInfo = blockLayoutMap["${selCfi}$currentPageSuffix"]?.takeIf {
-                                        val blockAbs = when (val block = it.third) {
-                                            is ParagraphBlock -> block.startCharOffsetInSource
-                                            is HeaderBlock -> block.startCharOffsetInSource
-                                            is QuoteBlock -> block.startCharOffsetInSource
-                                            is ListItemBlock -> block.startCharOffsetInSource
+                                    val handlePageIndex = if (isStart) sel.startPageIndex else sel.endPageIndex
+                                    val pos = if (handlePageIndex == pagerState.currentPage) {
+                                        val selCfi = if (isStart) sel.startBaseCfi else sel.endBaseCfi
+                                        val selOffset = if (isStart) sel.startOffset else sel.endOffset
+                                        val targetBlockAbs = if (isStart) sel.startBlockCharOffset else sel.endBlockCharOffset
+                                        val layoutInfo = blockLayoutMap["${selCfi}_$handlePageIndex"]?.takeIf {
+                                            val blockAbs = getTextBlockCharOffset(it.third)
+                                            blockAbs == targetBlockAbs
                                         }
-                                        blockAbs == targetBlockAbs
-                                    }
 
-                                    val pos = if (layoutInfo != null && layoutInfo.second.isAttached && rootCoords != null && rootCoords!!.isAttached) {
-                                        val textLayout = layoutInfo.first
-                                        val coords = layoutInfo.second
-                                        val maxIdx = maxOf(0, textLayout.layoutInput.text.length - 1)
-                                        val safeOffset = selOffset.coerceIn(0, textLayout.layoutInput.text.length)
-                                        val safeOffsetForLine = safeOffset.coerceIn(0, maxIdx)
+                                        if (layoutInfo != null && layoutInfo.second.isAttached && rootCoords != null && rootCoords!!.isAttached) {
+                                            val textLayout = layoutInfo.first
+                                            val coords = layoutInfo.second
+                                            val maxIdx = maxOf(0, textLayout.layoutInput.text.length - 1)
+                                            val safeOffset = selOffset.coerceIn(0, textLayout.layoutInput.text.length)
+                                            val safeOffsetForLine = safeOffset.coerceIn(0, maxIdx)
 
-                                        val line = textLayout.getLineForOffset(safeOffsetForLine)
-                                        val x = textLayout.getHorizontalPosition(safeOffset, usePrimaryDirection = true)
-                                        val y = textLayout.getLineBottom(line)
+                                            val line = textLayout.getLineForOffset(safeOffsetForLine)
+                                            val x = textLayout.getHorizontalPosition(safeOffset, usePrimaryDirection = true)
+                                            val y = textLayout.getLineBottom(line)
 
-                                        try {
-                                            val windowPos = coords.localToWindow(Offset(x, y))
-                                            rootCoords!!.windowToLocal(windowPos)
-                                        } catch (e: Exception) {
+                                            try {
+                                                val windowPos = coords.localToWindow(Offset(x, y))
+                                                rootCoords!!.windowToLocal(windowPos)
+                                            } catch (e: Exception) {
+                                                Offset.Unspecified
+                                            }
+                                        } else {
                                             Offset.Unspecified
                                         }
                                     } else {
@@ -3574,7 +4041,7 @@ internal fun PaginatedReaderContent(
                 if (showColorPickerDialog != null) {
                     AlertDialog(
                         onDismissRequest = { showColorPickerDialog = null },
-                        title = { Text("Select Color") },
+                        title = { Text(stringResource(R.string.dialog_select_color)) },
                         text = {
                             LazyVerticalGrid(
                                 columns = GridCells.Adaptive(minSize = 48.dp),
@@ -3601,7 +4068,7 @@ internal fun PaginatedReaderContent(
                         confirmButton = {
                             TextButton(onClick = {
                                 showColorPickerDialog = null
-                            }) { Text("Close") }
+                            }) { Text(stringResource(R.string.action_close)) }
                         })
                 }
 
@@ -3620,7 +4087,7 @@ internal fun PaginatedReaderContent(
         } else {
             Timber.w("Book has no pages to display.")
             Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                Text("This book has no content to display.")
+                Text(stringResource(R.string.msg_book_no_content))
             }
         }
     }
@@ -3663,6 +4130,7 @@ private fun ChapterLoadingPlaceholder(title: String?) {
 private fun RenderFlexChildBlock(
     childBlock: ContentBlock,
     textStyle: TextStyle,
+    imageSizeMultiplier: Float,
     searchQuery: String,
     searchHighlightColor: Color,
     ttsHighlightInfo: TtsHighlightInfo?,
@@ -3711,17 +4179,11 @@ private fun RenderFlexChildBlock(
 
         // Apply block specific styles (like header font weight)
         val finalStyle = if (block is HeaderBlock) {
-            textStyle.copy(
-                fontWeight = FontWeight.Bold, fontSize = textStyle.fontSize * block.level.let {
-                    when (it) {
-                        1 -> 1.5f
-                        2 -> 1.4f
-                        3 -> 1.3f
-                        4 -> 1.2f
-                        5 -> 1.1f
-                        else -> 1.0f
-                    }
-                })
+            createHeaderTextStyle(
+                baseStyle = textStyle,
+                level = block.level,
+                textAlign = block.textAlign
+            )
         } else {
             textStyle
         }
@@ -3730,6 +4192,7 @@ private fun RenderFlexChildBlock(
             text = finalContent,
             style = finalStyle,
             modifier = Modifier,
+            pageIndex = pageIndex,
             textMeasurer = textMeasurer,
             onLinkClick = onLinkClickCallback,
             onGeneralTap = onGeneralTapCallback,
@@ -3752,23 +4215,25 @@ private fun RenderFlexChildBlock(
                 val markerAreaModifier = Modifier
                     .width(32.dp)
                     .padding(end = 8.dp)
+                val itemMarkerImage = childBlock.itemMarkerImage
+                val itemMarker = childBlock.itemMarker
 
-                if (childBlock.itemMarkerImage != null) {
+                if (itemMarkerImage != null) {
                     val imageRequest =
-                        Builder(LocalContext.current).data(File(childBlock.itemMarkerImage))
+                        Builder(LocalContext.current).data(File(itemMarkerImage))
                             .crossfade(true).build()
                     val imageSize = with(density) { (textStyle.fontSize.value * 0.8f).sp.toDp() }
 
                     AsyncImage(
                         model = imageRequest,
-                        contentDescription = "List item marker",
+                        contentDescription = stringResource(R.string.content_desc_list_item_marker),
                         modifier = markerAreaModifier.height(imageSize),
                         alignment = Alignment.CenterEnd,
                         contentScale = ContentScale.FillHeight
                     )
-                } else if (childBlock.itemMarker != null) {
+                } else if (itemMarker != null) {
                     Text(
-                        text = childBlock.itemMarker,
+                        text = itemMarker,
                         style = textStyle.copy(textAlign = TextAlign.End),
                         modifier = markerAreaModifier
                     )
@@ -3785,23 +4250,6 @@ private fun RenderFlexChildBlock(
         is TextContentBlock -> renderTextBlock(childBlock)
         is ImageBlock -> {
             val style = childBlock.style
-            val imageModifier = Modifier
-                .then(
-                    if (style.width != Dp.Unspecified && style.width > 0.dp) Modifier.width(style.width)
-                    else Modifier
-                )
-                .then(
-                    if (style.maxWidth != Dp.Unspecified && style.maxWidth > 0.dp) Modifier.widthIn(max = style.maxWidth)
-                    else Modifier
-                )
-                .then(
-                    if (childBlock.expectedHeight > 0) {
-                        Modifier.height(with(density) { childBlock.expectedHeight.toDp() })
-                    } else {
-                        Modifier.height(250.dp)
-                    }
-                )
-
             val colorFilter = if (childBlock.style.filter == "invert(100%)") {
                 val matrix = floatArrayOf(
                     -1f,
@@ -3828,15 +4276,52 @@ private fun RenderFlexChildBlock(
                 ColorFilter.colorMatrix(ColorMatrix(matrix))
             } else null
 
-            AsyncImage(
-                model = Builder(LocalContext.current).data(File(childBlock.path)).crossfade(true)
-                    .build(),
-                contentDescription = childBlock.altText,
-                modifier = imageModifier,
-                contentScale = ContentScale.Fit,
-                colorFilter = colorFilter,
-                imageLoader = imageLoader
-            )
+            BoxWithConstraints(contentAlignment = imageBlockContentAlignment(style)) {
+                val scaledSize = computeImageRenderSizeDp(
+                    block = childBlock,
+                    density = density,
+                    maxWidthDp = maxWidth,
+                    imageSizeMultiplier = imageSizeMultiplier
+                )
+                val imageModifier = Modifier
+                    .then(
+                        if (scaledSize != null) {
+                            Modifier.width(scaledSize.first).height(scaledSize.second)
+                        } else if (style.width != Dp.Unspecified && style.width > 0.dp) {
+                            Modifier.width(style.width)
+                        } else {
+                            Modifier
+                        }
+                    )
+                    .then(
+                        if (scaledSize == null && style.maxWidth != Dp.Unspecified && style.maxWidth > 0.dp) {
+                            Modifier.widthIn(max = style.maxWidth)
+                        } else {
+                            Modifier
+                        }
+                    )
+                    .then(
+                        if (scaledSize == null) {
+                            if (childBlock.expectedHeight > 0) {
+                                Modifier.height(with(density) { (childBlock.expectedHeight * imageSizeMultiplier).toDp() })
+                            } else {
+                                Modifier.height(250.dp)
+                            }
+                        } else {
+                            Modifier
+                        }
+                    )
+
+                AsyncImage(
+                    model = Builder(LocalContext.current).data(File(childBlock.path)).crossfade(true)
+                        .build(),
+                    contentDescription = childBlock.altText,
+                    modifier = imageModifier,
+                    contentScale = ContentScale.Fit,
+                    colorFilter = colorFilter,
+                    imageLoader = imageLoader
+                )
+            }
         }
 
         is SpacerBlock -> {
@@ -3909,13 +4394,6 @@ private fun RenderFlexChildBlock(
                                             modifier = Modifier.fillMaxWidth()
                                         )
                                     } else if (blockInCell is ImageBlock) {
-                                        val imageModifier = Modifier.fillMaxWidth().then(
-                                            if (blockInCell.expectedHeight > 0) {
-                                                Modifier.height(with(density) { blockInCell.expectedHeight.toDp() })
-                                            } else {
-                                                Modifier.height(250.dp)
-                                            }
-                                        )
                                         AsyncImage(
                                             model = Builder(LocalContext.current).data(
                                                 File(
@@ -3924,7 +4402,11 @@ private fun RenderFlexChildBlock(
                                             ).build(),
                                             contentDescription = blockInCell.altText,
                                             contentScale = ContentScale.Fit,
-                                            modifier = imageModifier
+                                            modifier = tableCellImageModifier(
+                                                block = blockInCell,
+                                                density = density,
+                                                imageSizeMultiplier = imageSizeMultiplier
+                                            )
                                         )
                                     }
                                 }
@@ -3949,7 +4431,9 @@ private fun Modifier.realisticBookPage(
     pageIndex: Int,
     paperColor: Color,
     isDarkTheme: Boolean,
-    touchY: Float?
+    touchY: Float?,
+    textureBitmap: ImageBitmap? = null,
+    textureAlpha: Float = 0f
 ): Modifier = composed {
 
     val frontPath = remember { Path() }
@@ -3977,9 +4461,19 @@ private fun Modifier.realisticBookPage(
         .drawWithContent {
             val drawStart = System.nanoTime()
             val pageOffset = (pageIndex - pagerState.currentPage) - pagerState.currentPageOffsetFraction
+            fun drawPaperBackground() {
+                drawRect(color = paperColor)
+                if (textureBitmap != null && textureAlpha > 0f) {
+                    drawRect(
+                        brush = ShaderBrush(ImageShader(textureBitmap, TileMode.Repeated, TileMode.Repeated)),
+                        blendMode = BlendMode.SrcOver,
+                        alpha = textureAlpha
+                    )
+                }
+            }
 
             if (abs(pageOffset) < 0.001f) {
-                drawRect(color = paperColor)
+                drawPaperBackground()
                 drawContent()
             }
             else if (pageOffset < 0f && pageOffset > -1f) {
@@ -4040,7 +4534,7 @@ private fun Modifier.realisticBookPage(
                     frontPath.close()
 
                     clipPath(frontPath) {
-                        drawRect(color = paperColor)
+                        drawPaperBackground()
                         this@drawWithContent.drawContent()
                     }
 
@@ -4083,6 +4577,15 @@ private fun Modifier.realisticBookPage(
                     clipRect(0f, 0f, w, h) {
                         clipPath(frontPath) {
                             drawPath(reflectedScreenPath, color = paperColor)
+                            if (textureBitmap != null && textureAlpha > 0f) {
+                                clipPath(reflectedScreenPath) {
+                                    drawRect(
+                                        brush = ShaderBrush(ImageShader(textureBitmap, TileMode.Repeated, TileMode.Repeated)),
+                                        blendMode = BlendMode.SrcOver,
+                                        alpha = textureAlpha
+                                    )
+                                }
+                            }
                             val flapTint = if (isDarkTheme) Color.White.copy(alpha = 0.08f) else Color.Black.copy(alpha = 0.06f)
                             drawPath(reflectedScreenPath, color = flapTint)
 
@@ -4110,12 +4613,12 @@ private fun Modifier.realisticBookPage(
                     }
 
                 } else {
-                    drawRect(color = paperColor)
+                    drawPaperBackground()
                     drawContent()
                 }
             }
             else {
-                drawRect(color = paperColor)
+                drawPaperBackground()
                 drawContent()
             }
 
@@ -4132,10 +4635,14 @@ fun Modifier.drawCssBorders(
     blockStyle: BlockStyle,
     @Suppress("unused") density: Density
 ): Modifier = this.drawBehind {
-    val topWidth = blockStyle.borderTop?.width?.toPx() ?: 0f
-    val rightWidth = blockStyle.borderRight?.width?.toPx() ?: 0f
-    val bottomWidth = blockStyle.borderBottom?.width?.toPx() ?: 0f
-    val leftWidth = blockStyle.borderLeft?.width?.toPx() ?: 0f
+    val borderTop = blockStyle.borderTop
+    val borderRight = blockStyle.borderRight
+    val borderBottom = blockStyle.borderBottom
+    val borderLeft = blockStyle.borderLeft
+    val topWidth = borderTop?.width?.toPx() ?: 0f
+    val rightWidth = borderRight?.width?.toPx() ?: 0f
+    val bottomWidth = borderBottom?.width?.toPx() ?: 0f
+    val leftWidth = borderLeft?.width?.toPx() ?: 0f
 
     val tlRadius = blockStyle.borderTopLeftRadius.toPx()
     val trRadius = blockStyle.borderTopRightRadius.toPx()
@@ -4167,9 +4674,9 @@ fun Modifier.drawCssBorders(
     }
 
     // TOP
-    if (topWidth > 0f && blockStyle.borderTop != null) {
-        val color = blockStyle.borderTop.color
-        val effect = getPathEffect(blockStyle.borderTop.style, topWidth)
+    if (topWidth > 0f && borderTop != null) {
+        val color = borderTop.color
+        val effect = getPathEffect(borderTop.style, topWidth)
         val offset = topWidth / 2f
 
         val startX = if (tlRadius > 0) tlRadius else 0f
@@ -4185,9 +4692,9 @@ fun Modifier.drawCssBorders(
     }
 
     // BOTTOM
-    if (bottomWidth > 0f && blockStyle.borderBottom != null) {
-        val color = blockStyle.borderBottom.color
-        val effect = getPathEffect(blockStyle.borderBottom.style, bottomWidth)
+    if (bottomWidth > 0f && borderBottom != null) {
+        val color = borderBottom.color
+        val effect = getPathEffect(borderBottom.style, bottomWidth)
         val offset = size.height - (bottomWidth / 2f)
 
         val startX = if (blRadius > 0) blRadius else 0f
@@ -4203,9 +4710,9 @@ fun Modifier.drawCssBorders(
     }
 
     // LEFT
-    if (leftWidth > 0f && blockStyle.borderLeft != null) {
-        val color = blockStyle.borderLeft.color
-        val effect = getPathEffect(blockStyle.borderLeft.style, leftWidth)
+    if (leftWidth > 0f && borderLeft != null) {
+        val color = borderLeft.color
+        val effect = getPathEffect(borderLeft.style, leftWidth)
         val offset = leftWidth / 2f
 
         val startY = if (tlRadius > 0) tlRadius else 0f
@@ -4221,9 +4728,9 @@ fun Modifier.drawCssBorders(
     }
 
     // RIGHT
-    if (rightWidth > 0f && blockStyle.borderRight != null) {
-        val color = blockStyle.borderRight.color
-        val effect = getPathEffect(blockStyle.borderRight.style, rightWidth)
+    if (rightWidth > 0f && borderRight != null) {
+        val color = borderRight.color
+        val effect = getPathEffect(borderRight.style, rightWidth)
         val offset = size.width - (rightWidth / 2f)
 
         val startY = if (trRadius > 0) trRadius else 0f
@@ -4238,9 +4745,9 @@ fun Modifier.drawCssBorders(
         )
     }
 
-    if (tlRadius > 0f && topWidth > 0f && leftWidth > 0f && blockStyle.borderTop != null) {
+    if (tlRadius > 0f && topWidth > 0f && leftWidth > 0f && borderTop != null) {
         drawArc(
-            color = blockStyle.borderTop.color,
+            color = borderTop.color,
             startAngle = 180f, sweepAngle = 90f,
             useCenter = false,
             topLeft = Offset(leftWidth/2f, topWidth/2f),
@@ -4249,9 +4756,9 @@ fun Modifier.drawCssBorders(
         )
     }
 
-    if (trRadius > 0f && topWidth > 0f && rightWidth > 0f && blockStyle.borderTop != null) {
+    if (trRadius > 0f && topWidth > 0f && rightWidth > 0f && borderTop != null) {
         drawArc(
-            color = blockStyle.borderTop.color,
+            color = borderTop.color,
             startAngle = 270f, sweepAngle = 90f,
             useCenter = false,
             topLeft = Offset(size.width - (trRadius * 2) + (rightWidth/2f), topWidth/2f),
@@ -4260,9 +4767,9 @@ fun Modifier.drawCssBorders(
         )
     }
 
-    if (brRadius > 0f && bottomWidth > 0f && rightWidth > 0f && blockStyle.borderBottom != null) {
+    if (brRadius > 0f && bottomWidth > 0f && rightWidth > 0f && borderBottom != null) {
         drawArc(
-            color = blockStyle.borderBottom.color,
+            color = borderBottom.color,
             startAngle = 0f, sweepAngle = 90f,
             useCenter = false,
             topLeft = Offset(size.width - (brRadius * 2) + (rightWidth/2f), size.height - (brRadius * 2) + (bottomWidth/2f)),
@@ -4271,9 +4778,9 @@ fun Modifier.drawCssBorders(
         )
     }
 
-    if (blRadius > 0f && bottomWidth > 0f && leftWidth > 0f && blockStyle.borderBottom != null) {
+    if (blRadius > 0f && bottomWidth > 0f && leftWidth > 0f && borderBottom != null) {
         drawArc(
-            color = blockStyle.borderBottom.color,
+            color = borderBottom.color,
             startAngle = 90f, sweepAngle = 90f,
             useCenter = false,
             topLeft = Offset(leftWidth/2f, size.height - (blRadius * 2) + (bottomWidth/2f)),

@@ -73,6 +73,7 @@ import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.PhoneAndroid
 import androidx.compose.material.icons.filled.VerifiedUser
 import androidx.compose.material.icons.outlined.AccountCircle
+import androidx.compose.material.icons.outlined.FavoriteBorder
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Badge
 import androidx.compose.material3.BadgedBox
@@ -134,6 +135,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.os.LocaleListCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.media3.common.util.UnstableApi
 import androidx.navigation.NavHostController
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
@@ -151,11 +153,17 @@ internal fun Context.findActivity(): Activity? = when (this) {
     else -> null
 }
 
+@UnstableApi
+@androidx.annotation.OptIn(UnstableApi::class)
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun HomeScreen(
     viewModel: MainViewModel, windowSizeClass: WindowSizeClass, navController: NavHostController
 ) {
+    val compStart = remember { System.currentTimeMillis() }
+    LaunchedEffect(Unit) {
+        ReaderPerfLog.d("HomeScreen initial composition ${System.currentTimeMillis() - compStart}ms")
+    }
     val context = LocalContext.current
     val customTabUriHandler = remember { CustomTabUriHandler(context) }
     var showCloseAllTabsDialog by remember { mutableStateOf(false) }
@@ -163,14 +171,15 @@ fun HomeScreen(
 
     CompositionLocalProvider(LocalUriHandler provides customTabUriHandler) {
         val uiState by viewModel.uiState.collectAsStateWithLifecycle()
-        val recentFilesForHome = uiState.recentFiles.filter { it.isRecent }
-        val openTabs = uiState.openTabs
-        val selectedContextItems = uiState.contextualActionItems
-        val isContextualModeActive = selectedContextItems.isNotEmpty()
+        val screenModel = remember(uiState) { uiState.toHomeScreenModel() }
+        val recentFilesForHome = screenModel.recentFiles
+        val openTabs = screenModel.openTabs
+        val selectedContextItems = screenModel.selectedItems
+        val isContextualModeActive = screenModel.isContextualModeActive
         val scope = rememberCoroutineScope()
         val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
         val snackbarHostState = remember { SnackbarHostState() }
-        val deviceLimitState = uiState.deviceLimitState
+        val deviceLimitState = screenModel.deviceLimitState
 
         var showDeleteConfirmDialog by remember { mutableStateOf(false) }
         var showClearCloudDataDialog by remember { mutableStateOf(false) }
@@ -304,6 +313,12 @@ fun HomeScreen(
                                 navController.navigate(AppDestinations.FONTS_SCREEN_ROUTE)
                             }
                         },
+                        onAiSettingsClick = {
+                            scope.launch {
+                                drawerState.close()
+                                navController.navigate(AppDestinations.AI_SETTINGS_SCREEN_ROUTE)
+                            }
+                        },
                         navController = navController,
                         onFolderSyncToggle = viewModel::setFolderSyncEnabled
                     )
@@ -339,12 +354,29 @@ fun HomeScreen(
                                 },
                                 onAppThemeClick = { showAppThemePanel = true },
                                 onTestPanelDetectionClick = { viewModel.testPanelDetection(context) },
-                                onLanguageClick = { showLanguageDialog = true }
+                                onTestSpeechBubbleDetectionClick = { viewModel.testSpeechBubbleDetection(context) },
+                                onLanguageClick = { showLanguageDialog = true },
+                                onExportLogsClick = { viewModel.exportLogsToFile(context) },
+                                onToggleHideReaderAi = {
+                                    saveHideReaderAiFeatures(context, !loadHideReaderAiFeatures(context))
+                                },
+                                onScreenCaptureProtectionChange = { enabled ->
+                                    viewModel.setScreenCaptureProtectionEnabled(enabled)
+                                    val messageRes = if (enabled) {
+                                        R.string.banner_screen_capture_protection_on
+                                    } else {
+                                        R.string.banner_screen_capture_protection_off
+                                    }
+                                    viewModel.showBanner(context.getString(messageRes))
+                                }
                             )
                         } else {
                             ContextualTopAppBar(
                                 selectedItemCount = selectedContextItems.size,
                                 onNavIconClick = { viewModel.clearContextualAction() },
+                                onTagClick = {
+                                    viewModel.openTagSelection(selectedContextItems.map { it.bookId }.toSet())
+                                },
                                 onInfoClick = {
                                     if (selectedContextItems.size == 1) {
                                         itemForInfoDialog = selectedContextItems.first()
@@ -362,8 +394,8 @@ fun HomeScreen(
                                 .fillMaxSize()
                                 .padding(paddingValues)
                         ) {
-                            if (recentFilesForHome.isEmpty() && (!uiState.isTabsEnabled || openTabs.isEmpty())) {
-                                if (uiState.recentFiles.isEmpty()) {
+                            if (screenModel.isEmpty) {
+                                if (screenModel.isLibraryEmpty) {
                                     EmptyState(
                                         title = stringResource(R.string.your_library_empty),
                                         message = stringResource(R.string.your_library_empty_desc),
@@ -472,7 +504,8 @@ fun HomeScreen(
                                 },
                                 onUpdateName = { newName ->
                                     viewModel.updateCustomName(item.bookId, newName)
-                                }
+                                },
+                                onOpenTags = { viewModel.openTagSelection(setOf(item.bookId)) }
                             )
                         }
                     }
@@ -522,7 +555,8 @@ fun HomeScreen(
                             uiState = uiState,
                             onThemeModeChanged = viewModel::setAppThemeMode,
                             onContrastOptionChanged = viewModel::setAppContrastOption,
-                            onTextDimFactorChanged = viewModel::setAppTextDimFactor,
+                            onTextDimFactorLightChanged = viewModel::setAppTextDimFactorLight,
+                            onTextDimFactorDarkChanged = viewModel::setAppTextDimFactorDark,
                             onSeedColorChanged = viewModel::setAppSeedColor,
                             onCustomThemeAdded = viewModel::addCustomAppTheme,
                             onCustomThemeDeleted = viewModel::deleteCustomAppTheme,
@@ -590,6 +624,9 @@ private fun RecentFilesContent(
     hasSyncedFolder: Boolean
 ) {
     val canRefresh = isSyncEnabled || hasSyncedFolder
+    val selectedItemUris = remember(selectedContextItems) {
+        selectedContextItems.mapNotNullTo(mutableSetOf()) { it.uriString }
+    }
 
     val content = @Composable {
         Box(modifier = Modifier.fillMaxSize()) {
@@ -602,7 +639,7 @@ private fun RecentFilesContent(
                 isTabsEnabled = isTabsEnabled,
                 onTabCloseClick = onTabCloseClick,
                 onCloseAllTabsClick = onCloseAllTabsClick,
-                selectedItemUris = selectedContextItems.mapNotNull { it.uriString }.toSet(),
+                selectedItemUris = selectedItemUris,
                 pinnedHomeBookIds = pinnedHomeBookIds,
                 onItemClick = onItemClick,
                 onItemLongClick = onItemLongClick,
@@ -847,7 +884,7 @@ fun RecentFileCard(
                     ) {
                         Icon(
                             Icons.Default.Check,
-                            contentDescription = "Selected",
+                            contentDescription = stringResource(R.string.content_desc_selected),
                             modifier = Modifier.size(48.dp)
                                 .background(MaterialTheme.colorScheme.primary, CircleShape)
                                 .padding(8.dp),
@@ -988,10 +1025,16 @@ fun DefaultTopAppBar(
     onStrictFilterToggleClick: () -> Unit,
     onAppThemeClick: () -> Unit,
     onTestPanelDetectionClick: () -> Unit,
-    onLanguageClick: () -> Unit
+    onTestSpeechBubbleDetectionClick: () -> Unit,
+    onLanguageClick: () -> Unit,
+    onExportLogsClick: () -> Unit,
+    onToggleHideReaderAi: () -> Unit,
+    onScreenCaptureProtectionChange: (Boolean) -> Unit
 ) {
     var showOptionsMenu by remember { mutableStateOf(false) }
     var showLimitMenu by remember { mutableStateOf(false) }
+    val context = LocalContext.current
+    var hideReaderAiFeatures by remember { mutableStateOf(loadHideReaderAiFeatures(context)) }
 
     CustomTopAppBar(title = { }, navigationIcon = {
         IconButton(onClick = onDrawerClick) {
@@ -1001,13 +1044,13 @@ fun DefaultTopAppBar(
                         Badge()
                     }
                 }) {
-                Icon(Icons.Default.Menu, contentDescription = "Open Drawer")
+                Icon(Icons.Default.Menu, contentDescription = stringResource(R.string.content_desc_open_drawer))
             }
         }
     }, actions = {
         Box {
             IconButton(onClick = onAppThemeClick) {
-                Icon(painterResource(id = R.drawable.palette), contentDescription = "App Theme")
+                Icon(painterResource(id = R.drawable.palette), contentDescription = stringResource(R.string.content_desc_app_theme))
             }
         }
         // Recent Files Limit Menu
@@ -1027,7 +1070,7 @@ fun DefaultTopAppBar(
                             showLimitMenu = false
                         },
                         trailingIcon = if (uiState.recentFilesLimit == limit) {
-                            { Icon(Icons.Default.Check, contentDescription = "Selected") }
+                            { Icon(Icons.Default.Check, contentDescription = stringResource(R.string.content_desc_selected)) }
                         } else null
                     )
                 }
@@ -1037,7 +1080,7 @@ fun DefaultTopAppBar(
         // Options Menu (MoreVert)
         Box {
             IconButton(onClick = { showOptionsMenu = true }) {
-                Icon(Icons.Default.MoreVert, contentDescription = "More Options")
+                Icon(Icons.Default.MoreVert, contentDescription = stringResource(R.string.content_desc_more_options))
             }
             DropdownMenu(
                 expanded = showOptionsMenu, onDismissRequest = { showOptionsMenu = false }) {
@@ -1048,35 +1091,62 @@ fun DefaultTopAppBar(
 
                 HorizontalDivider()
 
-                DropdownMenuItem(text = { Text("Enable Multi-Tab Reading") }, onClick = {
+                DropdownMenuItem(text = { Text(stringResource(R.string.options_enable_multi_tab_reading)) }, onClick = {
                     onTabsToggle(!uiState.isTabsEnabled)
                     showOptionsMenu = false
                 }, trailingIcon = {
                     if (uiState.isTabsEnabled) {
-                        Icon(Icons.Default.Check, contentDescription = "Enabled")
+                        Icon(Icons.Default.Check, contentDescription = stringResource(R.string.content_desc_enabled))
                     }
                 })
+
+                DropdownMenuItem(
+                    text = { Text(stringResource(R.string.options_screen_capture_protection)) },
+                    onClick = {
+                        onScreenCaptureProtectionChange(!uiState.isScreenCaptureProtectionEnabled)
+                        showOptionsMenu = false
+                    },
+                    trailingIcon = {
+                        if (uiState.isScreenCaptureProtectionEnabled) {
+                            Icon(Icons.Default.Check, contentDescription = stringResource(R.string.content_desc_enabled))
+                        }
+                    }
+                )
 
                 DropdownMenuItem(text = { Text(stringResource(R.string.options_external_file_behavior)) }, onClick = {
                     onExternalFileBehaviorClick()
                     showOptionsMenu = false
                 })
 
-                DropdownMenuItem(text = { Text("Use Strict File Filter") }, onClick = {
+                DropdownMenuItem(text = { Text(stringResource(R.string.options_use_strict_file_filter)) }, onClick = {
                     onStrictFilterToggleClick()
                     showOptionsMenu = false
                 }, trailingIcon = {
                     if (uiState.useStrictFileFilter) {
-                        Icon(Icons.Default.Check, contentDescription = "Enabled")
+                        Icon(Icons.Default.Check, contentDescription = stringResource(R.string.content_desc_enabled))
                     }
                 })
 
                 HorizontalDivider()
 
-                DropdownMenuItem(text = { Text("Language") }, onClick = {
+                DropdownMenuItem(text = { Text(stringResource(R.string.options_language)) }, onClick = {
                     onLanguageClick()
                     showOptionsMenu = false
                 })
+
+                DropdownMenuItem(
+                    text = { Text(if (hideReaderAiFeatures) "Show AI in reader" else "Hide AI in reader") },
+                    onClick = {
+                        onToggleHideReaderAi()
+                        hideReaderAiFeatures = !hideReaderAiFeatures
+                        showOptionsMenu = false
+                    },
+                    trailingIcon = {
+                        if (hideReaderAiFeatures) {
+                            Icon(Icons.Default.Check, contentDescription = stringResource(R.string.content_desc_enabled))
+                        }
+                    }
+                )
 
                 HorizontalDivider()
                 DropdownMenuItem(text = { Text(stringResource(R.string.options_clear_book_cache)) }, onClick = {
@@ -1090,8 +1160,18 @@ fun DefaultTopAppBar(
 
                 if (BuildConfig.DEBUG) {
                     HorizontalDivider()
-                    DropdownMenuItem(text = { Text("Test Panel ML Detection") }, onClick = {
+                    DropdownMenuItem(text = { Text(stringResource(R.string.options_test_panel_ml_detection)) }, onClick = {
                         onTestPanelDetectionClick()
+                        showOptionsMenu = false
+                    })
+
+                    DropdownMenuItem(text = { Text(stringResource(R.string.options_test_speech_bubble_ml_detection)) }, onClick = {
+                        onTestSpeechBubbleDetectionClick()
+                        showOptionsMenu = false
+                    })
+
+                    DropdownMenuItem(text = { Text(stringResource(R.string.options_export_logs_last_lines, 5000)) }, onClick = {
+                        onExportLogsClick()
                         showOptionsMenu = false
                     })
                 }
@@ -1123,6 +1203,7 @@ private fun AppDrawerContent(
     onUpgradeClick: () -> Unit,
     onSyncUpsellClick: () -> Unit,
     onFontsClick: () -> Unit,
+    onAiSettingsClick: () -> Unit,
     navController: NavHostController,
     onFolderSyncToggle: (Boolean) -> Unit
 ) {
@@ -1145,7 +1226,7 @@ private fun AppDrawerContent(
                             AsyncImage(
                                 model = ImageRequest.Builder(LocalContext.current).data(photoUrl)
                                     .crossfade(true).build(),
-                                contentDescription = "Profile picture",
+                                contentDescription = stringResource(R.string.content_desc_profile_picture),
                                 modifier = Modifier
                                     .size(80.dp)
                                     .clip(CircleShape),
@@ -1154,7 +1235,7 @@ private fun AppDrawerContent(
                         } else {
                             Icon(
                                 imageVector = Icons.Outlined.AccountCircle,
-                                contentDescription = "Profile",
+                                contentDescription = stringResource(R.string.content_desc_profile),
                                 modifier = Modifier.size(80.dp)
                             )
                         }
@@ -1171,9 +1252,9 @@ private fun AppDrawerContent(
                                 modifier = Modifier.padding(top = 8.dp)
                             ) {
                                 Row(modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-                                    Icon(Icons.Default.FormatListNumbered, contentDescription = "Credits", modifier = Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onTertiaryContainer)
+                                    Icon(Icons.Default.FormatListNumbered, contentDescription = stringResource(R.string.credits_tab), modifier = Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onTertiaryContainer)
                                     Spacer(modifier = Modifier.width(4.dp))
-                                    Text("${uiState.credits} Credits", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onTertiaryContainer)
+                                    Text(stringResource(R.string.credits_count, uiState.credits), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onTertiaryContainer)
                                 }
                             }
                         }
@@ -1221,7 +1302,7 @@ private fun AppDrawerContent(
                                 if (!uiState.isProUser) {
                                     Icon(
                                         imageVector = Icons.Default.VerifiedUser,
-                                        contentDescription = "Pro Feature",
+                                        contentDescription = stringResource(R.string.content_desc_pro_feature),
                                         modifier = Modifier.size(20.dp),
                                         tint = MaterialTheme.colorScheme.primary
                                     )
@@ -1276,7 +1357,7 @@ private fun AppDrawerContent(
                 ) {
                     AsyncImage(
                         model = R.mipmap.ic_launcher,
-                        contentDescription = "App Icon",
+                        contentDescription = stringResource(R.string.content_desc_app_icon),
                         modifier = Modifier.size(64.dp)
                     )
                     Spacer(modifier = Modifier.height(8.dp))
@@ -1292,6 +1373,26 @@ private fun AppDrawerContent(
                 onClick = onFontsClick,
                 modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)
             )
+
+            if (isOss && !BuildConfig.IS_OFFLINE) {
+                NavigationDrawerItem(
+                    icon = { Icon(painterResource(id = R.drawable.ai), contentDescription = null) },
+                    label = { Text("AI keys and models") },
+                    selected = false,
+                    onClick = onAiSettingsClick,
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)
+                )
+            }
+
+            if (isOss) {
+                NavigationDrawerItem(
+                    icon = { Icon(Icons.Outlined.FavoriteBorder, contentDescription = null) },
+                    label = { Text(stringResource(R.string.drawer_support_project)) },
+                    selected = false,
+                    onClick = { navController.navigate(AppDestinations.SUPPORT_PROJECT_SCREEN_ROUTE) },
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)
+                )
+            }
 
             NavigationDrawerItem(
                 icon = { Icon(painterResource(id = R.drawable.feedback), contentDescription = null) },
@@ -1449,7 +1550,7 @@ fun DeviceManagementScreen(
                                     .padding(horizontal = 16.dp, vertical = 12.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Icon(Icons.Default.PhoneAndroid, contentDescription = "Device")
+                                Icon(Icons.Default.PhoneAndroid, contentDescription = stringResource(R.string.content_desc_device))
                                 Spacer(modifier = Modifier.width(16.dp))
                                 Column(modifier = Modifier.weight(1f)) {
                                     Text(device.deviceName, fontWeight = FontWeight.SemiBold)
@@ -1661,9 +1762,9 @@ fun CloseAllTabsDialog(onConfirm: () -> Unit, onDismiss: () -> Unit) {
 fun StrictFilterConfirmationDialog(onConfirm: () -> Unit, onDismiss: () -> Unit) {
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Enable Strict File Filter") },
-        text = { Text("If you enable this, some supported file types like AZW3, CB7, and FB2 might not show up depending on your file manager.\n\nAre you sure you want to enable this filter?") },
-        confirmButton = { TextButton(onClick = onConfirm) { Text("Enable") } },
+        title = { Text(stringResource(R.string.dialog_strict_file_filter_title)) },
+        text = { Text(stringResource(R.string.dialog_strict_file_filter_desc)) },
+        confirmButton = { TextButton(onClick = onConfirm) { Text(stringResource(R.string.action_enable)) } },
         dismissButton = { TextButton(onClick = onDismiss) { Text(stringResource(R.string.action_cancel)) } }
     )
 }
@@ -1674,7 +1775,8 @@ fun AppThemeBottomSheet(
     uiState: ReaderScreenState,
     onThemeModeChanged: (AppThemeMode) -> Unit,
     onContrastOptionChanged: (AppContrastOption) -> Unit,
-    onTextDimFactorChanged: (Float) -> Unit,
+    onTextDimFactorLightChanged: (Float) -> Unit,
+    onTextDimFactorDarkChanged: (Float) -> Unit,
     onSeedColorChanged: (Color?) -> Unit,
     onCustomThemeAdded: (CustomAppTheme) -> Unit,
     onCustomThemeDeleted: (String) -> Unit,
@@ -1696,13 +1798,13 @@ fun AppThemeBottomSheet(
                 .padding(bottom = 24.dp)
         ) {
             Text(
-                text = "App Theme",
+                text = stringResource(R.string.app_theme_title),
                 style = MaterialTheme.typography.titleLarge,
                 fontWeight = FontWeight.Bold,
                 modifier = Modifier.padding(bottom = 16.dp)
             )
 
-            Text("Appearance", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
+            Text(stringResource(R.string.app_theme_appearance), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
             Spacer(Modifier.height(8.dp))
             Row(modifier = Modifier.fillMaxWidth().height(48.dp).background(MaterialTheme.colorScheme.surfaceContainerHigh, androidx.compose.foundation.shape.RoundedCornerShape(24.dp)).padding(4.dp)) {
                 AppThemeMode.entries.forEach { mode ->
@@ -1713,14 +1815,14 @@ fun AppThemeBottomSheet(
                             .clickable { onThemeModeChanged(mode) },
                         contentAlignment = Alignment.Center
                     ) {
-                        Text(mode.displayName, color = if (isSelected) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
+                        Text(stringResource(mode.labelRes), color = if (isSelected) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
                     }
                 }
             }
 
             Spacer(Modifier.height(24.dp))
 
-            Text("Contrast", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
+            Text(stringResource(R.string.app_theme_contrast), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
             Spacer(Modifier.height(8.dp))
             Row(modifier = Modifier.fillMaxWidth().height(48.dp).background(MaterialTheme.colorScheme.surfaceContainerHigh, androidx.compose.foundation.shape.RoundedCornerShape(24.dp)).padding(4.dp)) {
                 AppContrastOption.entries.forEach { option ->
@@ -1731,61 +1833,106 @@ fun AppThemeBottomSheet(
                             .clickable { onContrastOptionChanged(option) },
                         contentAlignment = Alignment.Center
                     ) {
-                        Text(option.displayName, color = if (isSelected) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
+                        Text(stringResource(option.labelRes), color = if (isSelected) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
                     }
                 }
             }
 
             Spacer(Modifier.height(24.dp))
 
-            Text("Text Brightness", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
-            Spacer(Modifier.height(8.dp))
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(48.dp)
-                    .background(MaterialTheme.colorScheme.surfaceContainerHigh, androidx.compose.foundation.shape.RoundedCornerShape(24.dp))
-                    .padding(horizontal = 16.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text("A", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f))
-                androidx.compose.material3.Slider(
-                    value = uiState.appTextDimFactor,
-                    onValueChange = onTextDimFactorChanged,
-                    valueRange = 0.3f..1.0f,
-                    modifier = Modifier.weight(1f).padding(horizontal = 16.dp)
-                )
-                Text("A", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 1.0f))
+            if (uiState.appThemeMode == AppThemeMode.SYSTEM) {
+                Text("${stringResource(R.string.app_theme_text_brightness)} (Light)", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
+                Spacer(Modifier.height(8.dp))
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(48.dp)
+                        .background(MaterialTheme.colorScheme.surfaceContainerHigh, androidx.compose.foundation.shape.RoundedCornerShape(24.dp))
+                        .padding(horizontal = 16.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("A", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f))
+                    androidx.compose.material3.Slider(
+                        value = uiState.appTextDimFactorLight,
+                        onValueChange = onTextDimFactorLightChanged,
+                        valueRange = 0.3f..1.0f,
+                        modifier = Modifier.weight(1f).padding(horizontal = 16.dp)
+                    )
+                    Text("A", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 1.0f))
+                }
+
+                Spacer(Modifier.height(16.dp))
+
+                Text("${stringResource(R.string.app_theme_text_brightness)} (Dark)", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
+                Spacer(Modifier.height(8.dp))
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(48.dp)
+                        .background(MaterialTheme.colorScheme.surfaceContainerHigh, androidx.compose.foundation.shape.RoundedCornerShape(24.dp))
+                        .padding(horizontal = 16.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("A", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f))
+                    androidx.compose.material3.Slider(
+                        value = uiState.appTextDimFactorDark,
+                        onValueChange = onTextDimFactorDarkChanged,
+                        valueRange = 0.3f..1.0f,
+                        modifier = Modifier.weight(1f).padding(horizontal = 16.dp)
+                    )
+                    Text("A", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 1.0f))
+                }
+            } else {
+                Text(stringResource(R.string.app_theme_text_brightness), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
+                Spacer(Modifier.height(8.dp))
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(48.dp)
+                        .background(MaterialTheme.colorScheme.surfaceContainerHigh, androidx.compose.foundation.shape.RoundedCornerShape(24.dp))
+                        .padding(horizontal = 16.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("A", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f))
+                    androidx.compose.material3.Slider(
+                        value = if (uiState.appThemeMode == AppThemeMode.DARK) uiState.appTextDimFactorDark else uiState.appTextDimFactorLight,
+                        onValueChange = if (uiState.appThemeMode == AppThemeMode.DARK) onTextDimFactorDarkChanged else onTextDimFactorLightChanged,
+                        valueRange = 0.3f..1.0f,
+                        modifier = Modifier.weight(1f).padding(horizontal = 16.dp)
+                    )
+                    Text("A", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 1.0f))
+                }
             }
 
             Spacer(Modifier.height(24.dp))
 
-            Text("Color Scheme", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
+            Text(stringResource(R.string.app_theme_color_scheme), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
             Spacer(Modifier.height(8.dp))
+            val presets = listOf(
+                R.string.app_theme_preset_ocean to Color(0xFF00668B),
+                R.string.app_theme_preset_mint to Color(0xFF006C4C),
+                R.string.app_theme_preset_rose to Color(0xFF9C4146),
+                R.string.app_theme_preset_sepia to Color(0xFF705D49),
+                R.string.app_theme_preset_amethyst to Color(0xFF9B59B6),
+                R.string.app_theme_preset_amber to Color(0xFFFFC107),
+                R.string.app_theme_preset_sapphire to Color(0xFF0F52BA)
+            )
+
             LazyRow(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 item {
                     ThemeSwatch(
                         color = MaterialTheme.colorScheme.primary,
                         isSelected = uiState.appSeedColor == null,
-                        label = "Dynamic",
+                        label = stringResource(R.string.app_theme_dynamic),
                         onClick = { onSeedColorChanged(null) }
                     )
                 }
-                val presets = listOf(
-                    "Ocean" to Color(0xFF00668B),
-                    "Mint" to Color(0xFF006C4C),
-                    "Rose" to Color(0xFF9C4146),
-                    "Sepia" to Color(0xFF705D49),
-                    "Amethyst" to Color(0xFF9B59B6),
-                    "Amber" to Color(0xFFFFC107),
-                    "Sapphire" to Color(0xFF0F52BA)
-                )
                 items(presets.size) { i ->
-                    val (label, color) = presets[i]
+                    val (labelRes, color) = presets[i]
                     ThemeSwatch(
                         color = color,
                         isSelected = uiState.appSeedColor == color,
-                        label = label,
+                        label = stringResource(labelRes),
                         onClick = { onSeedColorChanged(color) }
                     )
                 }
@@ -1794,15 +1941,15 @@ fun AppThemeBottomSheet(
             Spacer(Modifier.height(24.dp))
 
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                Text("My Themes", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
+                Text(stringResource(R.string.theme_my_themes), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
                 IconButton(onClick = { showCreateDialog = true }, modifier = Modifier.size(24.dp)) {
-                    Icon(Icons.Default.Add, contentDescription = "Add Custom Theme", tint = MaterialTheme.colorScheme.primary)
+                    Icon(Icons.Default.Add, contentDescription = stringResource(R.string.content_desc_add_custom_theme), tint = MaterialTheme.colorScheme.primary)
                 }
             }
             Spacer(Modifier.height(8.dp))
 
             if (uiState.customAppThemes.isEmpty()) {
-                Text("No custom themes yet.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(stringResource(R.string.theme_no_custom), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             } else {
                 LazyRow(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     items(uiState.customAppThemes) { theme ->
@@ -1855,7 +2002,7 @@ fun ThemeSwatch(
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(text = label, style = MaterialTheme.typography.labelSmall, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.widthIn(max = 64.dp))
             if (onDelete != null) {
-                Icon(Icons.Default.Close, contentDescription = "Delete", modifier = Modifier.size(16.dp).clickable { onDelete() }, tint = MaterialTheme.colorScheme.error)
+                Icon(Icons.Default.Close, contentDescription = stringResource(R.string.action_delete), modifier = Modifier.size(16.dp).clickable { onDelete() }, tint = MaterialTheme.colorScheme.error)
             }
         }
     }
@@ -1869,6 +2016,7 @@ fun CreateAppThemeDialog(
     onSave: (String, Color) -> Unit
 ) {
     var name by remember { mutableStateOf("") }
+    val context = LocalContext.current
 
     val initialHsv = remember(initialColor) {
         val hsv = FloatArray(3)
@@ -1913,7 +2061,7 @@ fun CreateAppThemeDialog(
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
                 Text(
-                    text = "Create App Theme",
+                    text = stringResource(R.string.app_theme_create_title),
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.SemiBold,
                     color = Color.White
@@ -1924,7 +2072,7 @@ fun CreateAppThemeDialog(
                 androidx.compose.material3.OutlinedTextField(
                     value = name,
                     onValueChange = { name = it },
-                    label = { Text("Theme Name") },
+                    label = { Text(stringResource(R.string.theme_name)) },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
                     colors = androidx.compose.material3.OutlinedTextFieldDefaults.colors(
@@ -1972,7 +2120,7 @@ fun CreateAppThemeDialog(
                         modifier = Modifier.weight(1.6f),
                         horizontalAlignment = Alignment.CenterHorizontally
                     ) {
-                        Text("HEX", color = Color.Gray, fontSize = 12.sp, maxLines = 1)
+                        Text(stringResource(R.string.theme_color_hex), color = Color.Gray, fontSize = 12.sp, maxLines = 1)
                         Spacer(Modifier.height(4.dp))
                         HexInput(color = currentColor, onHexChanged = { updateFromColor(it) })
                     }
@@ -1981,15 +2129,15 @@ fun CreateAppThemeDialog(
                         modifier = Modifier.weight(2.4f),
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
-                        RgbInputColumn(label = "R", value = currentColor.red,
+                        RgbInputColumn(label = stringResource(R.string.color_r), value = currentColor.red,
                             onValueChange = { r -> updateFromColor(currentColor.copy(red = r)) },
                             modifier = Modifier.weight(1f)
                         )
-                        RgbInputColumn(label = "G", value = currentColor.green,
+                        RgbInputColumn(label = stringResource(R.string.color_g), value = currentColor.green,
                             onValueChange = { g -> updateFromColor(currentColor.copy(green = g)) },
                             modifier = Modifier.weight(1f)
                         )
-                        RgbInputColumn(label = "B", value = currentColor.blue,
+                        RgbInputColumn(label = stringResource(R.string.color_b), value = currentColor.blue,
                             onValueChange = { b -> updateFromColor(currentColor.copy(blue = b)) },
                             modifier = Modifier.weight(1f)
                         )
@@ -2004,14 +2152,14 @@ fun CreateAppThemeDialog(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     TextButton(onClick = onDismiss) {
-                        Text("Cancel", color = Color.Gray)
+                        Text(stringResource(R.string.action_cancel), color = Color.Gray)
                     }
                     Spacer(Modifier.width(8.dp))
                     androidx.compose.material3.Button(
-                        onClick = { onSave(name.ifBlank { "Custom Theme" }, currentColor) },
+                        onClick = { onSave(name.ifBlank { context.getString(R.string.app_theme_custom_default_name) }, currentColor) },
                         colors = ButtonDefaults.buttonColors(containerColor = currentColor)
                     ) {
-                        Text("Save", color = if (currentColor.luminance() > 0.5f) Color.Black else Color.White, fontWeight = FontWeight.Bold)
+                        Text(stringResource(R.string.action_save), color = if (currentColor.luminance() > 0.5f) Color.Black else Color.White, fontWeight = FontWeight.Bold)
                     }
                 }
             }
@@ -2025,18 +2173,20 @@ fun LanguageSelectionDialog(onDismiss: () -> Unit) {
     val currentTag = if (!currentLocales.isEmpty) currentLocales.get(0)?.language ?: "en" else "en"
 
     val languages = listOf(
-        "en" to "English (Default)",
-        "ar" to "العربية (Arabic)",
-        "de" to "Deutsch (German)",
-        "tr" to "Türkçe (Turkish)"
+        "en" to R.string.language_english_default,
+        "ar" to R.string.language_arabic,
+        "de" to R.string.language_german,
+        "tr" to R.string.language_turkish,
+        "fr" to R.string.language_french,
+        "ru" to R.string.language_russian
     )
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Language") },
+        title = { Text(stringResource(R.string.options_language)) },
         text = {
             Column {
-                languages.forEach { (tag, name) ->
+                languages.forEach { (tag, nameRes) ->
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -2051,7 +2201,7 @@ fun LanguageSelectionDialog(onDismiss: () -> Unit) {
                     ) {
                         RadioButton(selected = currentTag == tag, onClick = null)
                         Spacer(modifier = Modifier.width(16.dp))
-                        Text(name)
+                        Text(stringResource(nameRes))
                     }
                 }
             }

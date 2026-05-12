@@ -35,16 +35,33 @@ import kotlinx.coroutines.withContext
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import org.jsoup.Jsoup
+import org.jsoup.nodes.Document
+import org.jsoup.safety.Safelist
 import org.zwobble.mammoth.DocumentConverter
 import timber.log.Timber
 import java.io.File
 import java.io.FileOutputStream
 import java.io.InputStream
 import java.util.UUID
+import java.util.zip.ZipFile
 
 class SingleFileImporter(private val context: Context) {
 
     private val jsonSerializer = Json { ignoreUnknownKeys = true; encodeDefaults = true }
+
+    companion object {
+        private const val MAX_DOCX_ARCHIVE_BYTES = 64L * 1024L * 1024L
+        private const val MAX_DOCX_XML_BYTES = 48L * 1024L * 1024L
+    }
+
+    private val htmlSafelist = Safelist.relaxed()
+        .addTags("article", "aside", "details", "div", "figcaption", "figure", "footer", "header", "main", "section", "summary")
+        .addAttributes(":all", "class", "dir", "id", "lang", "title")
+        .addAttributes("a", "name", "target")
+        .addProtocols("a", "href", "http", "https", "mailto", "tel", "#")
+        .addProtocols("img", "src", "http", "https", "data", "file", "content")
+
+    private val htmlOutputSettings = Document.OutputSettings().prettyPrint(false)
 
     suspend fun importSingleFile(
         inputStream: InputStream,
@@ -55,8 +72,9 @@ class SingleFileImporter(private val context: Context) {
     ): EpubBook {
 
         val lowerHint = originalBookNameHint.lowercase()
-        val isCsv = lowerHint.endsWith(".csv") || lowerHint.endsWith(".tsv")
-        val isCodeOrData = listOf(".json", ".xml", ".log", ".java", ".kt", ".py", ".js", ".cpp", ".c", ".cs", ".rb", ".go").any { lowerHint.endsWith(it) }
+        val isCsv = lowerHint.endsWith(".csv") || lowerHint.endsWith(".tsv") ||
+            lowerHint.endsWith(".csv.txt") || lowerHint.endsWith(".tsv.txt")
+        val isCodeOrData = com.aryan.reader.isCodeOrDataFileName(originalBookNameHint)
 
         if (type == FileType.HTML && (isCsv || isCodeOrData)) {
             return parseDynamicContentToHtml(inputStream, originalBookNameHint, bookId, parseContent, isCsv)
@@ -83,7 +101,7 @@ class SingleFileImporter(private val context: Context) {
 
         try {
             FileOutputStream(tempFile).bufferedWriter().use { writer ->
-                writer.write("<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"UTF-8\">\n<title>${originalBookNameHint}</title>\n")
+                writer.write("<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"UTF-8\">\n<title>${generatedHtmlTitle(originalBookNameHint)}</title>\n")
 
                 if (isCsv) {
                     writer.write("<style>\ntable { border-collapse: collapse; width: 100%; font-family: sans-serif; }\nth, td { border: 1px solid currentColor; padding: 8px; }\n</style>\n")
@@ -93,7 +111,7 @@ class SingleFileImporter(private val context: Context) {
                     writer.write("</head>\n<body>\n<pre><code>\n")
                 }
 
-                val delimiter = if (originalBookNameHint.lowercase().endsWith(".tsv")) '\t' else ','
+                val delimiter = if (originalBookNameHint.lowercase().let { it.endsWith(".tsv") || it.endsWith(".tsv.txt") }) '\t' else ','
 
                 inputStream.bufferedReader().use { reader ->
                     var line = reader.readLine()
@@ -104,14 +122,19 @@ class SingleFileImporter(private val context: Context) {
                             var inQuotes = false
 
                             for (char in line) {
-                                if (char == '\"') {
-                                    inQuotes = !inQuotes
-                                } else if (char == delimiter && !inQuotes) {
-                                    val escaped = current.toString().replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-                                    writer.write("<td>$escaped</td>")
-                                    current.clear()
-                                } else {
-                                    current.append(char)
+                                when (char) {
+                                    '\"' -> {
+                                        inQuotes = !inQuotes
+                                    }
+                                    delimiter if !inQuotes -> {
+                                        val escaped =
+                                            current.toString().replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                                        writer.write("<td>$escaped</td>")
+                                        current.clear()
+                                    }
+                                    else -> {
+                                        current.append(char)
+                                    }
                                 }
                             }
                             val escapedFinal = current.toString().replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -166,22 +189,20 @@ class SingleFileImporter(private val context: Context) {
             )
         }
 
-        File(context.cacheDir, "imported_file_$bookId").deleteRecursively()
-
-        val extractionDir = File(context.cacheDir, "imported_file_$bookId").apply {
-            if (!exists()) mkdirs()
-        }
+        val extractionDir = ImportedFileCache.ensureActiveBookDir(context, bookId)
         val metadataFile = File(extractionDir, "book_metadata.json")
 
         if (metadataFile.exists()) {
             try {
                 val cachedBook = jsonSerializer.decodeFromString<EpubBook>(metadataFile.readText())
+                    .copy(extractionBasePath = extractionDir.absolutePath)
                 Timber.tag("FileOpenPerf").d("[MD] Loaded from cache instantly | bookId=$bookId")
                 return@withContext cachedBook
             } catch (e: Exception) {
                 Timber.e(e, "Failed to load cached MD, parsing again")
             }
         }
+        ImportedFileCache.resetActiveBookDir(context, bookId)
 
         val parseStart = System.currentTimeMillis()
         Timber.tag("FileOpenPerf").d("[MD] parseMarkdown START | file=$originalBookNameHint")
@@ -234,7 +255,7 @@ class SingleFileImporter(private val context: Context) {
                 val chapterTitle = "Page $pageNum"
 
                 val document = parser.parse(rawText)
-                val htmlBody = renderer.render(document)
+                val htmlBody = sanitizeHtmlFragment(renderer.render(document))
 
                 val fileName = "page_$pageNum.html"
                 val file = File(extractionDir, fileName)
@@ -304,22 +325,20 @@ class SingleFileImporter(private val context: Context) {
             )
         }
 
-        File(context.cacheDir, "imported_file_$bookId").deleteRecursively()
-
-        val extractionDir = File(context.cacheDir, "imported_file_$bookId").apply {
-            if (!exists()) mkdirs()
-        }
+        val extractionDir = ImportedFileCache.ensureActiveBookDir(context, bookId)
         val metadataFile = File(extractionDir, "book_metadata.json")
 
         if (metadataFile.exists()) {
             try {
                 val cachedBook = jsonSerializer.decodeFromString<EpubBook>(metadataFile.readText())
+                    .copy(extractionBasePath = extractionDir.absolutePath)
                 Timber.tag("FileOpenPerf").d("[TXT] Loaded from cache instantly | bookId=$bookId")
                 return@withContext cachedBook
             } catch (e: Exception) {
                 Timber.e(e, "Failed to load cached TXT, parsing again")
             }
         }
+        ImportedFileCache.resetActiveBookDir(context, bookId)
 
         val parseStart = System.currentTimeMillis()
         Timber.tag("FileOpenPerf").d("[TXT] parsePlainText START | file=$originalBookNameHint")
@@ -469,22 +488,20 @@ class SingleFileImporter(private val context: Context) {
             )
         }
 
-        File(context.cacheDir, "imported_file_$bookId").deleteRecursively()
-
-        val extractionDir = File(context.cacheDir, "imported_file_$bookId").apply {
-            if (!exists()) mkdirs()
-        }
+        val extractionDir = ImportedFileCache.ensureActiveBookDir(context, bookId)
         val metadataFile = File(extractionDir, "book_metadata.json")
 
         if (metadataFile.exists()) {
             try {
                 val cachedBook = jsonSerializer.decodeFromString<EpubBook>(metadataFile.readText())
+                    .copy(extractionBasePath = extractionDir.absolutePath)
                 Timber.tag("FileOpenPerf").d("[HTML] Loaded from cache instantly | bookId=$bookId")
                 return@withContext cachedBook
             } catch (e: Exception) {
                 Timber.e(e, "Failed to load cached HTML, parsing again")
             }
         }
+        ImportedFileCache.resetActiveBookDir(context, bookId)
 
         val parseStart = System.currentTimeMillis()
         Timber.tag("FileOpenPerf").d("[HTML] parseHtml START | file=$originalBookNameHint")
@@ -496,29 +513,34 @@ class SingleFileImporter(private val context: Context) {
         val chapters = mutableListOf<EpubChapter>()
 
         inputStream.bufferedReader().use { reader ->
+            var inScript = false
             var inStyle = false
             var inBody = false
             var pageNum = 1
+            val headBuilder = java.lang.StringBuilder()
             val currentChapterBuilder = java.lang.StringBuilder()
 
             var line: String?
             while (reader.readLine().also { line = it } != null) {
                 val trimmed = line!!.trim()
 
+                if (inScript) {
+                    if (trimmed.contains("</script", ignoreCase = true)) {
+                        inScript = false
+                    }
+                    continue
+                }
+                if (trimmed.startsWith("<script", ignoreCase = true)) {
+                    if (!trimmed.contains("</script", ignoreCase = true)) {
+                        inScript = true
+                    }
+                    continue
+                }
+
                 if (!inBody) {
-                    if (trimmed.startsWith("<title", ignoreCase = true)) {
-                        val t = trimmed.substringAfter(">").substringBefore("</title>")
-                        if (t.isNotBlank()) title = t
-                    }
-                    val authorMatch = Regex("<meta[^>]+name=\"author\"[^>]+content=\"([^\"]+)\"").find(
-                        line
-                    )
-                        ?: Regex("<meta[^>]+property=\"article:author\"[^>]+content=\"([^\"]+)\"").find(
-                            line
-                        )
-                    if (authorMatch != null) {
-                        author = authorMatch.groupValues[1]
-                    }
+                    headBuilder.append(line).append('\n')
+                    extractHtmlTitle(headBuilder.toString())?.let { title = it }
+                    extractHtmlAuthor(headBuilder.toString())?.let { author = it }
 
                     if (trimmed.startsWith("<style", ignoreCase = true)) {
                         inStyle = true
@@ -551,7 +573,7 @@ class SingleFileImporter(private val context: Context) {
                     }
 
                     if (trimmed.startsWith("<p") || trimmed.startsWith("<div") ||
-                        trimmed.startsWith("<h") || trimmed.startsWith("<section") ||
+                        trimmed.startsWithHtmlHeadingTag() || trimmed.startsWith("<section") ||
                         trimmed.contains("<page-break>") ||
                         (trimmed.isNotBlank() && !trimmed.startsWith("<") && !trimmed.startsWith("<!"))) {
                         inBody = true
@@ -621,6 +643,58 @@ class SingleFileImporter(private val context: Context) {
         return@withContext book
     }
 
+    private fun String.startsWithHtmlHeadingTag(): Boolean {
+        return length >= 3 &&
+            this[0] == '<' &&
+            this[1].lowercaseChar() == 'h' &&
+            this[2] in '1'..'6'
+    }
+
+    private fun generatedHtmlTitle(originalBookNameHint: String): String {
+        if (!originalBookNameHint.endsWith(".txt", ignoreCase = true)) return originalBookNameHint
+
+        val innerName = originalBookNameHint.dropLast(4)
+        return if (innerName.contains('.') && com.aryan.reader.isCodeOrDataFileName(innerName)) {
+            innerName
+        } else {
+            originalBookNameHint
+        }
+    }
+
+    private fun extractHtmlTitle(line: String): String? {
+        val match = Regex(
+            pattern = "<\\s*title\\b[^>]*>(.*?)<\\s*/\\s*title\\s*>",
+            options = setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
+        ).find(line) ?: return null
+
+        return Jsoup.parse(match.groupValues[1]).text().takeIf { it.isNotBlank() }
+    }
+
+    private fun extractHtmlAuthor(line: String): String? {
+        val metaTag = Regex(
+            pattern = "<\\s*meta\\b[^>]*>",
+            options = setOf(RegexOption.IGNORE_CASE)
+        ).find(line)?.value ?: return null
+
+        val name = Regex(
+            pattern = "\\b(?:name|property)\\s*=\\s*['\"]([^'\"]+)['\"]",
+            options = setOf(RegexOption.IGNORE_CASE)
+        ).find(metaTag)?.groupValues?.get(1) ?: return null
+
+        if (!name.equals("author", ignoreCase = true) && !name.equals("article:author", ignoreCase = true)) {
+            return null
+        }
+
+        return Regex(
+            pattern = "\\bcontent\\s*=\\s*['\"]([^'\"]+)['\"]",
+            options = setOf(RegexOption.IGNORE_CASE)
+        ).find(metaTag)?.groupValues?.get(1)?.takeIf { it.isNotBlank() }
+    }
+
+    private fun sanitizeHtmlFragment(html: String): String {
+        return Jsoup.clean(html, "", htmlSafelist, htmlOutputSettings)
+    }
+
     private suspend fun parseDocx(
         inputStream: InputStream,
         originalBookNameHint: String,
@@ -643,35 +717,47 @@ class SingleFileImporter(private val context: Context) {
             )
         }
 
-        File(context.cacheDir, "imported_file_$bookId").deleteRecursively()
-
-        val extractionDir = File(context.cacheDir, "imported_file_$bookId").apply {
-            if (!exists()) mkdirs()
-        }
+        val extractionDir = ImportedFileCache.ensureActiveBookDir(context, bookId)
         val metadataFile = File(extractionDir, "book_metadata.json")
 
         if (metadataFile.exists()) {
             try {
                 val cachedBook = jsonSerializer.decodeFromString<EpubBook>(metadataFile.readText())
+                    .copy(extractionBasePath = extractionDir.absolutePath)
                 Timber.tag("FileOpenPerf").d("[DOCX] Loaded from cache instantly | bookId=$bookId")
                 return@withContext cachedBook
             } catch (e: Exception) {
                 Timber.e(e, "Failed to load cached DOCX, parsing again")
             }
         }
+        ImportedFileCache.resetActiveBookDir(context, bookId)
 
         val parseStart = System.currentTimeMillis()
         Timber.tag("FileOpenPerf").d("[DOCX] parseDocx START | file=$originalBookNameHint")
 
-        val htmlContent = inputStream.use { stream ->
-            val converter = DocumentConverter()
-            converter.convertToHtml(stream).value ?: ""
-        }
-
-        Timber.tag("FileOpenPerf").d("[DOCX] parseDocx: mammoth conversion done | elapsed=${System.currentTimeMillis() - parseStart}ms")
-
+        val sourceDocxFile = File(context.cacheDir, "temp_docx_source_${UUID.randomUUID()}.docx")
         val tempFile = File(context.cacheDir, "temp_docx_${UUID.randomUUID()}.html")
         try {
+            inputStream.use { stream ->
+                FileOutputStream(sourceDocxFile).use { output ->
+                    stream.copyTo(output)
+                }
+            }
+
+            validateDocxForImport(sourceDocxFile, originalBookNameHint)
+
+            val htmlContent = sourceDocxFile.inputStream().use { stream ->
+                try {
+                    val converter = DocumentConverter()
+                    converter.convertToHtml(stream).value ?: ""
+                } catch (oom: OutOfMemoryError) {
+                    Timber.e(oom, "DOCX conversion ran out of memory for $originalBookNameHint")
+                    throw IllegalStateException("This DOCX file is too large to open safely on this device.")
+                }
+            }
+
+            Timber.tag("FileOpenPerf").d("[DOCX] parseDocx: mammoth conversion done | elapsed=${System.currentTimeMillis() - parseStart}ms")
+
             FileOutputStream(tempFile).bufferedWriter().use { writer ->
                 val title = originalBookNameHint.substringBeforeLast(".")
                 writer.write("<!DOCTYPE html>\n<html>\n<head>\n<title>$title</title>\n</head>\n<body>\n")
@@ -683,8 +769,37 @@ class SingleFileImporter(private val context: Context) {
                 return@withContext parseHtml(tempStream, originalBookNameHint, bookId, parseContent)
             }
         } finally {
+            if (sourceDocxFile.exists()) {
+                sourceDocxFile.delete()
+            }
             if (tempFile.exists()) {
                 tempFile.delete()
+            }
+        }
+    }
+
+    private fun validateDocxForImport(sourceDocxFile: File, originalBookNameHint: String) {
+        val archiveBytes = sourceDocxFile.length()
+        if (archiveBytes > MAX_DOCX_ARCHIVE_BYTES) {
+            throw IllegalStateException("This DOCX file is too large to open safely on this device.")
+        }
+
+        ZipFile(sourceDocxFile).use { zip ->
+            var totalXmlBytes = 0L
+            val entries = zip.entries()
+            while (entries.hasMoreElements()) {
+                val entry = entries.nextElement()
+                if (entry.isDirectory) continue
+                if (entry.name.endsWith(".xml", ignoreCase = true)) {
+                    val entrySize = entry.size
+                    if (entrySize > 0) {
+                        totalXmlBytes += entrySize
+                    }
+                    if (totalXmlBytes > MAX_DOCX_XML_BYTES) {
+                        Timber.w("DOCX XML payload too large for import: file=$originalBookNameHint xmlBytes=$totalXmlBytes")
+                        throw IllegalStateException("This DOCX file is too large to open safely on this device.")
+                    }
+                }
             }
         }
     }
@@ -700,8 +815,9 @@ class SingleFileImporter(private val context: Context) {
         val chapterTitle = if (pageNum > 1 || bodyContent.contains("<page-break")) "Page $pageNum" else title
         val fileName = "page_$pageNum.html"
         val file = File(extractionDir, fileName)
+        val sanitizedBodyContent = sanitizeHtmlFragment(bodyContent)
 
-        val fullHtml = "<!DOCTYPE html>\n<html xmlns=\"http://www.w3.org/1999/xhtml\">\n<head>\n<title>${title.replace("\"", "&quot;")}</title>\n<style>${cssStyle}</style>\n</head>\n<body>\n${bodyContent.trim()}\n</body>\n</html>"
+        val fullHtml = "<!DOCTYPE html>\n<html xmlns=\"http://www.w3.org/1999/xhtml\">\n<head>\n<title>${title.replace("\"", "&quot;")}</title>\n<style>${cssStyle}</style>\n</head>\n<body>\n${sanitizedBodyContent.trim()}\n</body>\n</html>"
 
         file.writeText(fullHtml)
 

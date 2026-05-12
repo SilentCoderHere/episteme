@@ -4,8 +4,15 @@
 package com.aryan.reader
 
 import android.content.Context
+import android.graphics.BitmapFactory
+import android.net.Uri
+import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyProperties
 import android.speech.tts.TextToSpeech
 import android.speech.tts.Voice
+import android.util.Base64
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.BorderStroke
@@ -19,6 +26,7 @@ import androidx.compose.foundation.gestures.drag
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
@@ -35,8 +43,12 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -76,7 +88,9 @@ import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.PlainTooltip
 import androidx.compose.material3.RichTooltip
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
@@ -117,6 +131,7 @@ import androidx.compose.ui.graphics.ImageShader
 import androidx.compose.ui.graphics.ShaderBrush
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.TileMode
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.toArgb
@@ -126,7 +141,6 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.res.imageResource
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.AnnotatedString
@@ -182,9 +196,16 @@ import org.commonmark.parser.Parser
 import org.json.JSONArray
 import org.json.JSONObject
 import timber.log.Timber
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
+import java.security.KeyStore
+import java.util.Locale
+import javax.crypto.Cipher
+import javax.crypto.KeyGenerator
+import javax.crypto.SecretKey
+import javax.crypto.spec.GCMParameterSpec
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
@@ -198,6 +219,232 @@ const val recapEndpoint = "/recap"
 const val recapUrl = aiServerBasePath + recapEndpoint
 
 const val PREF_NATIVE_TTS_VOICE = "native_tts_voice_name"
+private const val AI_PREFS_NAME = "ai_byok_prefs"
+private const val PREF_AI_HIDE_READER_FEATURES = "hide_reader_ai_features"
+private const val PREF_AI_GEMINI_KEY = "gemini_key"
+private const val PREF_AI_GROQ_KEY = "groq_key"
+private const val PREF_AI_USE_ONE_MODEL = "use_one_model"
+private const val PREF_AI_MODEL_ALL = "model_all"
+private const val PREF_AI_MODEL_DEFINE = "model_define"
+private const val PREF_AI_MODEL_SUMMARIZE = "model_summarize"
+private const val PREF_AI_MODEL_RECAP = "model_recap"
+private const val PREF_AI_TTS_MODEL = "tts_model"
+private const val PREF_AI_MODEL_EMPTY_MIGRATION_DONE = "model_empty_migration_done"
+private const val AI_KEYSTORE_ALIAS = "reader_ai_byok_key_v1"
+private const val ENCRYPTION_PREFIX = "v1:"
+const val GEMINI_CLOUD_TTS_MODEL = "gemini-3.1-flash-live-preview"
+const val GEMINI_CLOUD_TTS_MODEL_ID = "gemini:$GEMINI_CLOUD_TTS_MODEL"
+
+enum class AiFeature { DEFINE, SUMMARIZE, RECAP }
+
+private fun AiFeature.displayName(): String {
+    return when (this) {
+        AiFeature.DEFINE -> "Smart dictionary"
+        AiFeature.SUMMARIZE -> "Summaries"
+        AiFeature.RECAP -> "Recaps"
+    }
+}
+
+data class AiModelOption(
+    val provider: String,
+    val name: String,
+    val label: String = "${provider.replaceFirstChar { it.titlecase(Locale.ROOT) }} - $name"
+) {
+    val id: String = "$provider:$name"
+}
+
+data class AiByokSettings(
+    val geminiKey: String = "",
+    val groqKey: String = "",
+    val useOneModel: Boolean = true,
+    val modelForAll: String = "",
+    val defineModel: String = "",
+    val summarizeModel: String = "",
+    val recapModel: String = "",
+    val ttsModel: String = ""
+)
+
+val aiByokModelOptions = listOf(
+    AiModelOption("groq", "qwen/qwen3-32b"),
+    AiModelOption("groq", "llama-3.3-70b-versatile"),
+    AiModelOption("groq", "llama-3.1-8b-instant"),
+    AiModelOption("gemini", "gemma-4-26b-a4b-it"),
+    AiModelOption("gemini", "gemma-4-31b-it"),
+    AiModelOption("gemini", "gemini-flash-lite-latest"),
+    AiModelOption("gemini", "gemini-2.5-flash-lite"),
+    AiModelOption("gemini", "gemini-3.1-flash-lite-preview")
+)
+
+private fun Context.aiPrefs() = getSharedPreferences(AI_PREFS_NAME, Context.MODE_PRIVATE)
+
+private fun getAiSecretKey(): SecretKey {
+    val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+    (keyStore.getKey(AI_KEYSTORE_ALIAS, null) as? SecretKey)?.let { return it }
+
+    val keyGenerator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")
+    val keySpec = KeyGenParameterSpec.Builder(
+        AI_KEYSTORE_ALIAS,
+        KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
+    )
+        .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+        .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+        .setRandomizedEncryptionRequired(true)
+        .build()
+    keyGenerator.init(keySpec)
+    return keyGenerator.generateKey()
+}
+
+private fun encryptAiSecret(value: String): String {
+    if (value.isBlank()) return ""
+    val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+    cipher.init(Cipher.ENCRYPT_MODE, getAiSecretKey())
+    val encrypted = cipher.doFinal(value.toByteArray(Charsets.UTF_8))
+    val combined = cipher.iv + encrypted
+    return ENCRYPTION_PREFIX + Base64.encodeToString(combined, Base64.NO_WRAP)
+}
+
+private fun decryptAiSecret(value: String?): String {
+    if (value.isNullOrBlank()) return ""
+    if (!value.startsWith(ENCRYPTION_PREFIX)) return value
+    return try {
+        val combined = Base64.decode(value.removePrefix(ENCRYPTION_PREFIX), Base64.NO_WRAP)
+        val iv = combined.copyOfRange(0, 12)
+        val encrypted = combined.copyOfRange(12, combined.size)
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.DECRYPT_MODE, getAiSecretKey(), GCMParameterSpec(128, iv))
+        String(cipher.doFinal(encrypted), Charsets.UTF_8)
+    } catch (e: Exception) {
+        Timber.e(e, "Failed to decrypt AI key")
+        ""
+    }
+}
+
+private fun maskedAiSecret(value: String): String {
+    val trimmed = value.trim()
+    return when {
+        trimmed.isBlank() -> ""
+        trimmed.length <= 6 -> "***"
+        else -> "${trimmed.take(3)}...${trimmed.takeLast(3)}"
+    }
+}
+
+fun loadAiByokSettings(context: Context): AiByokSettings {
+    val prefs = context.aiPrefs()
+    if (!prefs.getBoolean(PREF_AI_MODEL_EMPTY_MIGRATION_DONE, false)) {
+        prefs.edit {
+            if (prefs.getString(PREF_AI_MODEL_ALL, "") == "gemini:gemini-flash-lite-latest") putString(PREF_AI_MODEL_ALL, "")
+            if (prefs.getString(PREF_AI_MODEL_DEFINE, "") == "groq:qwen/qwen3-32b") putString(PREF_AI_MODEL_DEFINE, "")
+            if (prefs.getString(PREF_AI_MODEL_SUMMARIZE, "") == "gemini:gemini-flash-lite-latest") putString(PREF_AI_MODEL_SUMMARIZE, "")
+            if (prefs.getString(PREF_AI_MODEL_RECAP, "") == "gemini:gemini-flash-lite-latest") putString(PREF_AI_MODEL_RECAP, "")
+            putBoolean(PREF_AI_MODEL_EMPTY_MIGRATION_DONE, true)
+        }
+    }
+    val settings = AiByokSettings(
+        geminiKey = decryptAiSecret(prefs.getString(PREF_AI_GEMINI_KEY, "")),
+        groqKey = decryptAiSecret(prefs.getString(PREF_AI_GROQ_KEY, "")),
+        useOneModel = prefs.getBoolean(PREF_AI_USE_ONE_MODEL, true),
+        modelForAll = prefs.getString(PREF_AI_MODEL_ALL, "") ?: "",
+        defineModel = prefs.getString(PREF_AI_MODEL_DEFINE, "") ?: "",
+        summarizeModel = prefs.getString(PREF_AI_MODEL_SUMMARIZE, "") ?: "",
+        recapModel = prefs.getString(PREF_AI_MODEL_RECAP, "") ?: "",
+        ttsModel = prefs.getString(PREF_AI_TTS_MODEL, "") ?: ""
+    )
+    val geminiStored = prefs.getString(PREF_AI_GEMINI_KEY, "").orEmpty()
+    val groqStored = prefs.getString(PREF_AI_GROQ_KEY, "").orEmpty()
+    if ((geminiStored.isNotBlank() && !geminiStored.startsWith(ENCRYPTION_PREFIX)) ||
+        (groqStored.isNotBlank() && !groqStored.startsWith(ENCRYPTION_PREFIX))
+    ) {
+        saveAiByokSettings(context, settings)
+    }
+    return settings
+}
+
+fun saveAiByokSettings(context: Context, settings: AiByokSettings) {
+    context.aiPrefs().edit {
+        putString(PREF_AI_GEMINI_KEY, encryptAiSecret(settings.geminiKey.trim()))
+        putString(PREF_AI_GROQ_KEY, encryptAiSecret(settings.groqKey.trim()))
+        putBoolean(PREF_AI_USE_ONE_MODEL, settings.useOneModel)
+        putString(PREF_AI_MODEL_ALL, settings.modelForAll)
+        putString(PREF_AI_MODEL_DEFINE, settings.defineModel)
+        putString(PREF_AI_MODEL_SUMMARIZE, settings.summarizeModel)
+        putString(PREF_AI_MODEL_RECAP, settings.recapModel)
+        putString(PREF_AI_TTS_MODEL, settings.ttsModel)
+    }
+}
+
+fun saveAiByokKey(context: Context, provider: String, key: String) {
+    val current = loadAiByokSettings(context)
+    val updated = when (provider) {
+        "gemini" -> current.copy(geminiKey = key)
+        "groq" -> current.copy(groqKey = key)
+        else -> current
+    }
+    saveAiByokSettings(context, updated)
+}
+
+fun deleteAiByokKey(context: Context, provider: String) {
+    saveAiByokKey(context, provider, "")
+}
+
+fun maskedAiByokKey(context: Context, provider: String): String {
+    val settings = loadAiByokSettings(context)
+    return maskedAiSecret(
+        when (provider) {
+            "gemini" -> settings.geminiKey
+            "groq" -> settings.groqKey
+            else -> ""
+        }
+    )
+}
+
+fun loadHideReaderAiFeatures(context: Context): Boolean {
+    return context.aiPrefs().getBoolean(PREF_AI_HIDE_READER_FEATURES, false)
+}
+
+fun saveHideReaderAiFeatures(context: Context, hidden: Boolean) {
+    context.aiPrefs().edit { putBoolean(PREF_AI_HIDE_READER_FEATURES, hidden) }
+}
+
+fun hasAiByokKey(context: Context): Boolean {
+    val settings = loadAiByokSettings(context)
+    return settings.geminiKey.isNotBlank() || settings.groqKey.isNotBlank()
+}
+
+@Suppress("KotlinConstantConditions")
+fun areReaderAiFeaturesEnabled(context: Context): Boolean {
+    if (loadHideReaderAiFeatures(context)) return false
+    if (BuildConfig.FLAVOR != "oss") return true
+    return !BuildConfig.IS_OFFLINE && hasAiByokKey(context)
+}
+
+@Suppress("KotlinConstantConditions")
+fun isByokCloudTtsAvailable(context: Context): Boolean {
+    val settings = loadAiByokSettings(context)
+    return BuildConfig.FLAVOR == "oss" &&
+            !BuildConfig.IS_OFFLINE &&
+            settings.geminiKey.isNotBlank() &&
+            settings.ttsModel == GEMINI_CLOUD_TTS_MODEL_ID
+}
+
+private fun AiByokSettings.modelIdFor(feature: AiFeature): String {
+    return if (useOneModel) modelForAll else when (feature) {
+        AiFeature.DEFINE -> defineModel
+        AiFeature.SUMMARIZE -> summarizeModel
+        AiFeature.RECAP -> recapModel
+    }
+}
+
+fun aiModelById(id: String): AiModelOption? {
+    return aiByokModelOptions.firstOrNull { it.id == id }
+}
+
+private fun AiByokSettings.apiKeyFor(provider: String): String {
+    return when (provider) {
+        "gemini" -> geminiKey
+        "groq" -> groqKey
+        else -> ""
+    }.trim()
+}
 
 data class SearchResult(
     val locationInSource: Int,
@@ -852,6 +1099,28 @@ suspend fun fetchAiDefinition(
     }
     Timber.d("Fetching AI definition for: '$text'")
 
+    @Suppress("KotlinConstantConditions")
+    if (BuildConfig.FLAVOR == "oss") {
+        if (BuildConfig.IS_OFFLINE) {
+            onError(context.getString(R.string.error_network_check_connection))
+            onFinish()
+            return
+        }
+        val systemInstruction = "You are an AI-powered dictionary. Your goal is to provide a concise and easy-to-understand definition for the given word, phrase or paragraphs. Keep the explanation brief. Respond only with the definition text, without any preamble. Do not send your thoughts, only the final definition you arrived on. no emoji."
+        callByokTextAi(
+            context = context,
+            feature = AiFeature.DEFINE,
+            systemInstruction = systemInstruction,
+            userPrompt = "Define: \"$text\"",
+            temperature = 0.1,
+            maxTokens = 256,
+            onUpdate = onUpdate,
+            onError = onError
+        )
+        onFinish()
+        return
+    }
+
     withContext(Dispatchers.IO) {
         var connection: HttpURLConnection? = null
         try {
@@ -922,6 +1191,330 @@ suspend fun fetchAiDefinition(
 
 fun countWords(text: String): Int {
     return text.trim().split(Regex("\\s+")).filter { it.isNotBlank() }.size
+}
+
+private fun streamGeminiAiResponse(
+    connection: HttpURLConnection,
+    onUpdate: (String) -> Unit,
+    onError: (String) -> Unit
+): Boolean {
+    var hasReceivedData = false
+    connection.inputStream.bufferedReader(Charsets.UTF_8).use { reader ->
+        var buffer = ""
+        var line: String?
+        while (reader.readLine().also { line = it } != null) {
+            buffer += line
+            while (true) {
+                val start = buffer.indexOf('{')
+                if (start == -1) {
+                    buffer = ""
+                    break
+                }
+                var braceCount = 0
+                var end = -1
+                charLoop@ for (i in start until buffer.length) {
+                    when (buffer[i]) {
+                        '{' -> braceCount++
+                        '}' -> {
+                            braceCount--
+                            if (braceCount == 0) {
+                                end = i
+                                break@charLoop
+                            }
+                        }
+                    }
+                }
+                if (end == -1) break
+                val jsonString = buffer.substring(start, end + 1)
+                buffer = buffer.substring(end + 1)
+                try {
+                    val jsonResponse = JSONObject(jsonString)
+                    jsonResponse.optJSONArray("candidates")
+                        ?.optJSONObject(0)
+                        ?.optJSONObject("content")
+                        ?.optJSONArray("parts")
+                        ?.optJSONObject(0)
+                        ?.optString("text")
+                        ?.takeIf { it.isNotEmpty() }
+                        ?.let {
+                            onUpdate(it)
+                            hasReceivedData = true
+                        }
+                    if (jsonResponse.optJSONArray("candidates")?.optJSONObject(0)?.optString("finishReason") == "SAFETY") {
+                        onError("Blocked for safety reasons.")
+                    }
+                } catch (e: Exception) {
+                    Timber.w(e, "Could not parse Gemini BYOK stream object")
+                }
+            }
+        }
+    }
+    return hasReceivedData
+}
+
+private fun streamGroqAiResponse(
+    connection: HttpURLConnection,
+    onUpdate: (String) -> Unit,
+    onError: (String) -> Unit
+): Boolean {
+    var hasReceivedData = false
+    var inThink = false
+    var thinkBuffer = ""
+
+    fun cleanChunk(text: String): String {
+        thinkBuffer += text
+        val out = StringBuilder()
+        while (true) {
+            if (inThink) {
+                val end = thinkBuffer.indexOf("</think>")
+                if (end == -1) {
+                    if (thinkBuffer.length > 7) thinkBuffer = thinkBuffer.takeLast(7)
+                    break
+                }
+                inThink = false
+                thinkBuffer = thinkBuffer.substring(end + 8)
+            } else {
+                val start = thinkBuffer.indexOf("<think>")
+                if (start == -1) {
+                    if (thinkBuffer.length > 6) {
+                        out.append(thinkBuffer.dropLast(6))
+                        thinkBuffer = thinkBuffer.takeLast(6)
+                    }
+                    break
+                }
+                out.append(thinkBuffer.substring(0, start))
+                inThink = true
+                thinkBuffer = thinkBuffer.substring(start + 7)
+            }
+        }
+        return out.toString()
+    }
+
+    connection.inputStream.bufferedReader(Charsets.UTF_8).use { reader ->
+        var line: String?
+        while (reader.readLine().also { line = it } != null) {
+            val trimmed = line!!.trim()
+            if (!trimmed.startsWith("data: ")) continue
+            val data = trimmed.removePrefix("data: ").trim()
+            if (data == "[DONE]") continue
+            try {
+                val chunk = JSONObject(data)
+                    .optJSONArray("choices")
+                    ?.optJSONObject(0)
+                    ?.optJSONObject("delta")
+                    ?.optString("content")
+                    .orEmpty()
+                val cleaned = cleanChunk(chunk)
+                if (cleaned.isNotEmpty()) {
+                    onUpdate(cleaned)
+                    hasReceivedData = true
+                }
+            } catch (e: Exception) {
+                Timber.w(e, "Could not parse Groq BYOK stream line")
+            }
+        }
+    }
+    if (!inThink && thinkBuffer.isNotBlank()) {
+        onUpdate(thinkBuffer)
+        hasReceivedData = true
+    }
+    return hasReceivedData
+}
+
+private fun buildGroqPayload(
+    model: String,
+    systemInstruction: String,
+    userPrompt: String,
+    temperature: Double,
+    maxTokens: Int
+): JSONObject {
+    return JSONObject().apply {
+        put("model", model)
+        put("messages", JSONArray().apply {
+            put(JSONObject().apply {
+                put("role", "system")
+                put("content", systemInstruction)
+            })
+            put(JSONObject().apply {
+                put("role", "user")
+                put("content", userPrompt)
+            })
+        })
+        put("temperature", temperature)
+        put("top_p", 0.95)
+        put("max_tokens", maxTokens)
+        put("stream", true)
+        if (model.contains("qwen")) put("reasoning_effort", "none")
+    }
+}
+
+suspend fun callByokTextAi(
+    context: Context,
+    feature: AiFeature,
+    systemInstruction: String,
+    userPrompt: String,
+    temperature: Double,
+    maxTokens: Int,
+    onUpdate: (String) -> Unit,
+    onError: (String) -> Unit
+): Boolean = withContext(Dispatchers.IO) {
+    val settings = loadAiByokSettings(context)
+    val model = aiModelById(settings.modelIdFor(feature))
+    if (model == null) {
+        onError("Choose a model for ${feature.displayName()} in AI key and model settings.")
+        return@withContext false
+    }
+    val apiKey = settings.apiKeyFor(model.provider)
+    if (apiKey.isBlank()) {
+        onError("Add a ${model.provider.replaceFirstChar { it.titlecase(Locale.ROOT) }} API key in AI key and model settings.")
+        return@withContext false
+    }
+
+    var connection: HttpURLConnection? = null
+    try {
+        val url = if (model.provider == "groq") {
+            URL("https://api.groq.com/openai/v1/chat/completions")
+        } else {
+            URL("https://generativelanguage.googleapis.com/v1beta/models/${model.name}:streamGenerateContent?key=$apiKey")
+        }
+        connection = url.openConnection() as HttpURLConnection
+        connection.requestMethod = "POST"
+        connection.setRequestProperty("Content-Type", "application/json; charset=UTF-8")
+        connection.setRequestProperty("Accept", "application/json")
+        if (model.provider == "groq") {
+            connection.setRequestProperty("Authorization", "Bearer $apiKey")
+        }
+        connection.connectTimeout = 15000
+        connection.readTimeout = 120000
+        connection.doOutput = true
+        connection.doInput = true
+
+        val payload = if (model.provider == "groq") {
+            buildGroqPayload(model.name, systemInstruction, userPrompt, temperature, maxTokens)
+        } else {
+            JSONObject().apply {
+                put("contents", JSONArray().put(JSONObject().apply {
+                    put("parts", JSONArray().put(JSONObject().apply { put("text", userPrompt) }))
+                }))
+                put("systemInstruction", JSONObject().apply {
+                    put("parts", JSONArray().put(JSONObject().apply { put("text", systemInstruction) }))
+                })
+                put("generationConfig", JSONObject().apply {
+                    put("temperature", temperature)
+                    put("topP", 0.95)
+                    put("topK", 40)
+                    put("maxOutputTokens", maxTokens)
+                    put("response_mime_type", "text/plain")
+                    if (feature == AiFeature.DEFINE && model.name.startsWith("gemini")) {
+                        put("thinkingConfig", JSONObject().apply {
+                            put("thinkingBudget", 0)
+                        })
+                    }
+                })
+            }
+        }
+        connection.outputStream.use { it.write(payload.toString().toByteArray(Charsets.UTF_8)) }
+
+        val responseCode = connection.responseCode
+        if (responseCode == HttpURLConnection.HTTP_OK) {
+            val hasData = if (model.provider == "groq") {
+                streamGroqAiResponse(connection, onUpdate, onError)
+            } else {
+                streamGeminiAiResponse(connection, onUpdate, onError)
+            }
+            if (!hasData) onError("The AI provider returned an empty response.")
+            hasData
+        } else {
+            val errorBody = try { connection.errorStream?.bufferedReader()?.use { it.readText() } } catch (_: Exception) { null }
+            onError("AI provider error: $responseCode. ${errorBody.orEmpty().take(300)}")
+            false
+        }
+    } catch (e: Exception) {
+        Timber.e(e, "BYOK AI request failed")
+        onError(context.getString(R.string.error_network_check_connection))
+        false
+    } finally {
+        connection?.disconnect()
+    }
+}
+
+suspend fun callByokGeminiInlineAi(
+    context: Context,
+    feature: AiFeature,
+    mimeType: String,
+    base64Data: String,
+    systemInstruction: String,
+    temperature: Double,
+    maxTokens: Int,
+    onUpdate: (String) -> Unit,
+    onError: (String) -> Unit
+): Boolean = withContext(Dispatchers.IO) {
+    val settings = loadAiByokSettings(context)
+    val model = aiModelById(settings.modelIdFor(feature))
+    if (model == null) {
+        onError("Choose a model for ${feature.displayName()} in AI key and model settings.")
+        return@withContext false
+    }
+    if (model.provider != "gemini") {
+        onError("This summary needs a Gemini model because the selected Groq models do not support PDF/image input.")
+        return@withContext false
+    }
+    val apiKey = settings.geminiKey.trim()
+    if (apiKey.isBlank()) {
+        onError("Add a Gemini API key in AI key and model settings.")
+        return@withContext false
+    }
+
+    var connection: HttpURLConnection? = null
+    try {
+        val url = URL("https://generativelanguage.googleapis.com/v1beta/models/${model.name}:streamGenerateContent?key=$apiKey")
+        connection = url.openConnection() as HttpURLConnection
+        connection.requestMethod = "POST"
+        connection.setRequestProperty("Content-Type", "application/json; charset=UTF-8")
+        connection.setRequestProperty("Accept", "application/json")
+        connection.connectTimeout = 15000
+        connection.readTimeout = 180000
+        connection.doOutput = true
+        connection.doInput = true
+
+        val payload = JSONObject().apply {
+            put("contents", JSONArray().put(JSONObject().apply {
+                put("parts", JSONArray().put(JSONObject().apply {
+                    put("inlineData", JSONObject().apply {
+                        put("mime_type", mimeType)
+                        put("data", base64Data)
+                    })
+                }))
+            }))
+            put("systemInstruction", JSONObject().apply {
+                put("parts", JSONArray().put(JSONObject().apply { put("text", systemInstruction) }))
+            })
+            put("generationConfig", JSONObject().apply {
+                put("temperature", temperature)
+                put("topP", 0.95)
+                put("topK", 40)
+                put("maxOutputTokens", maxTokens)
+                put("response_mime_type", "text/plain")
+            })
+        }
+        connection.outputStream.use { it.write(payload.toString().toByteArray(Charsets.UTF_8)) }
+        val responseCode = connection.responseCode
+        if (responseCode == HttpURLConnection.HTTP_OK) {
+            val hasData = streamGeminiAiResponse(connection, onUpdate, onError)
+            if (!hasData) onError("The AI provider returned an empty response.")
+            hasData
+        } else {
+            val errorBody = try { connection.errorStream?.bufferedReader()?.use { it.readText() } } catch (_: Exception) { null }
+            onError("AI provider error: $responseCode. ${errorBody.orEmpty().take(300)}")
+            false
+        }
+    } catch (e: Exception) {
+        Timber.e(e, "BYOK inline AI request failed")
+        onError(context.getString(R.string.error_network_check_connection))
+        false
+    } finally {
+        connection?.disconnect()
+    }
 }
 
 object MarkdownParser {
@@ -1002,6 +1595,41 @@ suspend fun fetchRecap(
 ) {
     if (pastSummaries.isEmpty() && currentText.isBlank()) {
         onError(context.getString(R.string.error_not_enough_context))
+        onFinish()
+        return
+    }
+
+    @Suppress("KotlinConstantConditions")
+    if (BuildConfig.FLAVOR == "oss") {
+        if (BuildConfig.IS_OFFLINE) {
+            onError(context.getString(R.string.error_network_recap))
+            onFinish()
+            return
+        }
+        val systemInstruction = "You are a sophisticated reading assistant. You have to create a recap. Synthesize the provided past context and current chapter text into a cohesive summary of the reading session so far. Conclude exactly where the user is positioned currently. Do not add a preamble. Also Avoid including or mentioning text from administrative or boilerplate sections such as the introduction, copyright pages, preface, or table of contents; focus strictly on the core story or informative content. If the the book has multiple different short stories that came before then summarize them too, its a recap of the whole book up to this point."
+        val promptContext = buildString {
+            append("--- PREVIOUS CONTEXT (Summaries of read chapters) ---\n")
+            if (pastSummaries.isEmpty()) {
+                append("(None - User is in the first chapter)\n")
+            } else {
+                pastSummaries.forEachIndexed { index, summary ->
+                    append("Chapter ${index + 1}: $summary\n\n")
+                }
+            }
+            append("\n--- CURRENT SESSION (Text read in current chapter) ---\n")
+            append(currentText)
+            append("\n\nBased strictly on the above, provide a recap of the content read so far.")
+        }
+        callByokTextAi(
+            context = context,
+            feature = AiFeature.RECAP,
+            systemInstruction = systemInstruction,
+            userPrompt = promptContext,
+            temperature = 0.3,
+            maxTokens = 4096,
+            onUpdate = onUpdate,
+            onError = onError
+        )
         onFinish()
         return
     }
@@ -1091,10 +1719,12 @@ fun TtsSettingsSheet(
     if (!isVisible) return
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
 
-    val isOss = BuildConfig.FLAVOR == "oss"
-    var selectedTabIndex by remember(currentMode) { mutableIntStateOf(if (currentMode == TtsPlaybackManager.TtsMode.CLOUD && !isOss) 0 else 1) }
-
     val context = LocalContext.current
+    val isOss = BuildConfig.FLAVOR == "oss"
+    val isOssCloudAvailable = isByokCloudTtsAvailable(context)
+    var selectedTabIndex by remember(currentMode, isOssCloudAvailable) {
+        mutableIntStateOf(if (currentMode == TtsPlaybackManager.TtsMode.CLOUD && (!isOss || isOssCloudAvailable)) 0 else 1)
+    }
     val scope = rememberCoroutineScope()
     val samplePlayer = remember(context, scope) {
         SpeakerSamplePlayer(context, scope, getAuthToken = getAuthToken)
@@ -1121,14 +1751,17 @@ fun TtsSettingsSheet(
                 }
             }
 
-            if (isOss) {
+            if (isOss && !isOssCloudAvailable) {
                 Spacer(Modifier.height(16.dp))
                 DeviceVoicesTab(isTtsActive, context, TtsPlaybackManager.TtsMode.BASE)
             } else {
-                Text("Active TTS Engine", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
+                Text(stringResource(R.string.tts_active_engine), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
                 Spacer(Modifier.height(8.dp))
                 Row(modifier = Modifier.fillMaxWidth().height(48.dp).background(MaterialTheme.colorScheme.surfaceContainerHigh, RoundedCornerShape(24.dp)).padding(4.dp)) {
-                    val modes = listOf(TtsPlaybackManager.TtsMode.CLOUD to "Cloud AI", TtsPlaybackManager.TtsMode.BASE to "Device Native")
+                    val modes = listOf(
+                        TtsPlaybackManager.TtsMode.CLOUD to stringResource(R.string.tts_mode_cloud_ai),
+                        TtsPlaybackManager.TtsMode.BASE to stringResource(R.string.tts_mode_device_native)
+                    )
                     modes.forEach { (mode, title) ->
                         val isSelected = currentMode == mode
                         Box(
@@ -1149,9 +1782,9 @@ fun TtsSettingsSheet(
                 Spacer(Modifier.height(16.dp))
 
                 TabRow(selectedTabIndex = selectedTabIndex, containerColor = Color.Transparent, divider = {}) {
-                    Tab(selected = selectedTabIndex == 0, onClick = { selectedTabIndex = 0 }, text = { Text("Cloud Voices", maxLines = 1, overflow = TextOverflow.Ellipsis) })
-                    Tab(selected = selectedTabIndex == 1, onClick = { selectedTabIndex = 1 }, text = { Text("Device Voices", maxLines = 1, overflow = TextOverflow.Ellipsis) })
-                    Tab(selected = selectedTabIndex == 2, onClick = { selectedTabIndex = 2 }, text = { Text("Cloud Cache", maxLines = 1, overflow = TextOverflow.Ellipsis) })
+                    Tab(selected = selectedTabIndex == 0, onClick = { selectedTabIndex = 0 }, text = { Text(stringResource(R.string.tts_tab_cloud_voices), maxLines = 1, overflow = TextOverflow.Ellipsis) })
+                    Tab(selected = selectedTabIndex == 1, onClick = { selectedTabIndex = 1 }, text = { Text(stringResource(R.string.tts_tab_device_voices), maxLines = 1, overflow = TextOverflow.Ellipsis) })
+                    Tab(selected = selectedTabIndex == 2, onClick = { selectedTabIndex = 2 }, text = { Text(stringResource(R.string.tts_tab_cloud_cache), maxLines = 1, overflow = TextOverflow.Ellipsis) })
                 }
 
                 Spacer(Modifier.height(16.dp))
@@ -1179,10 +1812,10 @@ fun AiVoicesTab(
     val isCloudMode = currentMode == TtsPlaybackManager.TtsMode.CLOUD
 
     Row(modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-        Text("Select High-Quality Cloud Voice", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
+        Text(stringResource(R.string.tts_select_cloud_voice), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
         if (samplePlayer.cachedSpeakers.isNotEmpty()) {
             TextButton(onClick = { samplePlayer.clearSamples() }, modifier = Modifier.heightIn(min = 24.dp)) {
-                Text("Clear Samples", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelMedium)
+                Text(stringResource(R.string.tts_clear_samples), color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelMedium)
             }
         }
     }
@@ -1243,7 +1876,8 @@ fun DeviceVoicesTab(
     var allVoices by remember { mutableStateOf<List<Voice>>(emptyList()) }
     var isTtsLoading by remember { mutableStateOf(true) }
 
-    var selectedLanguage by remember { mutableStateOf("All") }
+    val allLanguagesLabel = stringResource(R.string.filter_all)
+    var selectedLanguage by remember { mutableStateOf(allLanguagesLabel) }
     var languageMenuExpanded by remember { mutableStateOf(false) }
 
     DisposableEffect(Unit) {
@@ -1263,13 +1897,13 @@ fun DeviceVoicesTab(
     }
 
     val languages = remember(allVoices) {
-        val list = listOf("All") + allVoices.map { it.locale.displayLanguage }.filter { it.isNotBlank() }.distinct().sorted()
+        val list = listOf(allLanguagesLabel) + allVoices.map { it.locale.displayLanguage }.filter { it.isNotBlank() }.distinct().sorted()
         Timber.tag("TTS_DIAGNOSE").d("Languages list updated: size=${list.size}, items=$list")
         list
     }
 
     val filteredVoices = remember(allVoices, selectedLanguage) {
-        if (selectedLanguage == "All") allVoices
+        if (selectedLanguage == allLanguagesLabel) allVoices
         else allVoices.filter { it.locale.displayLanguage == selectedLanguage }
     }
 
@@ -1284,6 +1918,21 @@ fun DeviceVoicesTab(
             .clickable(enabled = !isTtsActive && isBaseMode) {
                 savedVoiceName = null
                 saveNativeVoice(context, null)
+                ttsEngine?.apply {
+                    try {
+                        val defaultLocale = Locale.getDefault()
+                        language = defaultLocale
+                        val fallbackVoice =
+                            defaultVoice ?: voices.firstOrNull { voice ->
+                                voice.locale == defaultLocale && !voice.isNetworkConnectionRequired
+                            } ?: voices.firstOrNull { voice ->
+                                voice.locale == defaultLocale
+                            }
+                        fallbackVoice?.let { voice = it }
+                    } catch (e: Exception) {
+                        Timber.tag("TTS_DIAGNOSE").w(e, "Failed to reset preview engine to system default voice")
+                    }
+                }
             }
     ) {
         Row(modifier = Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -1294,8 +1943,8 @@ fun DeviceVoicesTab(
             )
             Spacer(Modifier.width(16.dp))
             Column(modifier = Modifier.weight(1f)) {
-                Text("System Default Voice", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-                Text("Uses device settings", style = MaterialTheme.typography.bodySmall)
+                Text(stringResource(R.string.tts_system_default_voice), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                Text(stringResource(R.string.tts_uses_device_settings), style = MaterialTheme.typography.bodySmall)
             }
             if (isBaseMode && savedVoiceName == null) Icon(Icons.Default.Check, null, tint = MaterialTheme.colorScheme.primary)
         }
@@ -1310,7 +1959,7 @@ fun DeviceVoicesTab(
             value = selectedLanguage,
             onValueChange = {},
             readOnly = true,
-            label = { Text("Language Filter") },
+            label = { Text(stringResource(R.string.tts_language_filter)) },
             trailingIcon = { androidx.compose.material3.ExposedDropdownMenuDefaults.TrailingIcon(expanded = languageMenuExpanded) },
             colors = androidx.compose.material3.ExposedDropdownMenuDefaults.outlinedTextFieldColors(),
             modifier = Modifier.fillMaxWidth().menuAnchor(),
@@ -1343,7 +1992,7 @@ fun DeviceVoicesTab(
 
             ListItem(
                 headlineContent = { Text(voice.locale.displayName, fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal) },
-                supportingContent = { Text(if (voice.isNetworkConnectionRequired) "Online" else "Offline") },
+                supportingContent = { Text(if (voice.isNetworkConnectionRequired) stringResource(R.string.tts_online) else stringResource(R.string.tts_offline)) },
                 leadingContent = {
                     if (isSelected) {
                         Icon(Icons.Default.Check, null, tint = MaterialTheme.colorScheme.primary)
@@ -1361,12 +2010,12 @@ fun DeviceVoicesTab(
                         enabled = !isTtsActive,
                         onClick = {
                             ttsEngine?.apply {
-                                language = voice.locale
-                                speak("This is a voice sample.", TextToSpeech.QUEUE_FLUSH, null, "sample_${voice.name}")
+                                this.voice = voice
+                                speak(context.getString(R.string.tts_voice_sample_generic), TextToSpeech.QUEUE_FLUSH, null, "sample_${voice.name}")
                             }
                         }
                     ) {
-                        Icon(Icons.Default.PlayArrow, contentDescription = "Play Sample", tint = MaterialTheme.colorScheme.primary)
+                        Icon(Icons.Default.PlayArrow, contentDescription = stringResource(R.string.tts_play_sample), tint = MaterialTheme.colorScheme.primary)
                     }
                 }
             )
@@ -1399,7 +2048,7 @@ fun TtsCacheTab(bookTitle: String, context: Context, currentSpeakerId: String) {
 
     Column(modifier = Modifier.fillMaxWidth()) {
         Row(modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-            Text("Cloud TTS Cache", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
+            Text(stringResource(R.string.tts_tab_cloud_cache), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
             Surface(color = MaterialTheme.colorScheme.secondaryContainer, shape = RoundedCornerShape(8.dp)) {
                 Text(formatBytes(totalSize), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSecondaryContainer, modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp))
             }
@@ -1415,7 +2064,7 @@ fun TtsCacheTab(bookTitle: String, context: Context, currentSpeakerId: String) {
                     value = selectedSpeakerFilter,
                     onValueChange = {},
                     readOnly = true,
-                    label = { Text("Voice Filter") },
+                    label = { Text(stringResource(R.string.tts_voice_filter)) },
                     trailingIcon = { androidx.compose.material3.ExposedDropdownMenuDefaults.TrailingIcon(expanded = filterMenuExpanded) },
                     colors = androidx.compose.material3.ExposedDropdownMenuDefaults.outlinedTextFieldColors(),
                     modifier = Modifier.fillMaxWidth().menuAnchor()
@@ -1443,7 +2092,7 @@ fun TtsCacheTab(bookTitle: String, context: Context, currentSpeakerId: String) {
 
         if (chapters.isEmpty()) {
             Box(modifier = Modifier.fillMaxWidth().height(150.dp), contentAlignment = Alignment.Center) {
-                Text("No audio cached for this voice.", style = MaterialTheme.typography.bodyMedium)
+                Text(stringResource(R.string.tts_no_audio_cached_for_voice), style = MaterialTheme.typography.bodyMedium)
             }
         } else {
             LazyColumn(modifier = Modifier.fillMaxWidth().heightIn(max = 240.dp).border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(12.dp))) {
@@ -1451,7 +2100,16 @@ fun TtsCacheTab(bookTitle: String, context: Context, currentSpeakerId: String) {
                     val chapter = chapters[index]
                     ListItem(
                         headlineContent = {
-                            Text("${chapter.chapterTitle} (${chapter.chunkCount} chunks)", fontWeight = FontWeight.Medium)
+                            Text(
+                                "${chapter.chapterTitle} ${
+                                    context.resources.getQuantityString(
+                                        R.plurals.tts_cache_chunk_count_parenthetical,
+                                        chapter.chunkCount,
+                                        chapter.chunkCount
+                                    )
+                                }",
+                                fontWeight = FontWeight.Medium
+                            )
                         },
                         supportingContent = { Text(formatBytes(chapter.sizeBytes)) },
                         trailingContent = {
@@ -1459,7 +2117,7 @@ fun TtsCacheTab(bookTitle: String, context: Context, currentSpeakerId: String) {
                                 cacheManager.deleteSpecificFiles(chapter.matchingFiles, chapter.directory)
                                 chapters = cacheManager.getChapterCaches(bookTitle, selectedSpeakerFilter)
                             }) {
-                                Icon(Icons.Default.Delete, contentDescription = "Delete", tint = MaterialTheme.colorScheme.error)
+                                Icon(Icons.Default.Delete, contentDescription = stringResource(R.string.action_delete), tint = MaterialTheme.colorScheme.error)
                             }
                         }
                     )
@@ -1479,7 +2137,7 @@ fun TtsCacheTab(bookTitle: String, context: Context, currentSpeakerId: String) {
             ) {
                 Icon(Icons.Default.Delete, contentDescription = null)
                 Spacer(Modifier.width(8.dp))
-                Text("Clear Cache for $selectedSpeakerFilter")
+                Text(stringResource(R.string.tts_clear_cache_for_voice, selectedSpeakerFilter))
             }
         }
     }
@@ -1778,11 +2436,117 @@ fun ColorComparePill(
     }
 }
 
-enum class ReaderTexture(val id: String, val resId: Int, val displayName: String) {
-    PAPER("paper", R.drawable.texture_paper, "Paper"),
-    CANVAS("canvas", R.drawable.texture_canvas, "Canvas"),
-    EINK("eink", R.drawable.texture_eink, "E-Ink"),
-    SLATE("slate", R.drawable.texture_slate, "Slate")
+enum class ReaderTexture(val id: String, val displayName: String, val assetPath: String? = null, val resId: Int? = null) {
+    NATURAL_WHITE("asset:ep_naturalwhite.webp", "Natural White", "textures/ep_naturalwhite.webp"),
+    NATURAL_BLACK("asset:ep_naturalblack.webp", "Natural Black", "textures/ep_naturalblack.webp"),
+    LIGHT_VENEER("asset:light-veneer.webp", "Light Veneer", "textures/light-veneer.webp"),
+    RETINA_WOOD("asset:retina_wood.webp", "Retina Wood", "textures/retina_wood.webp"),
+    GREY_WASH("asset:grey_wash_wall.webp", "Grey Wash", "textures/grey_wash_wall.webp"),
+    CLASSY_FABRIC("asset:classy_fabric.webp", "Classy Fabric", "textures/classy_fabric.webp"),
+    RETRO_INTRO("asset:retro_intro.webp", "Retro Intro", "textures/retro_intro.webp"),
+    PAPER("paper", "Paper", resId = R.drawable.texture_paper),
+    CANVAS("canvas", "Canvas", resId = R.drawable.texture_canvas),
+    EINK("eink", "E-Ink", resId = R.drawable.texture_eink),
+    SLATE("slate", "Slate", resId = R.drawable.texture_slate)
+}
+
+private const val TEXTURE_FILE_PREFIX = "file:"
+private const val READER_TEXTURE_DIR = "reader_textures"
+
+fun readerTextureDisplayName(textureId: String?): String {
+    if (textureId == null) return "None"
+    return ReaderTexture.entries.find { it.id == textureId }?.displayName
+        ?: File(textureId.removePrefix(TEXTURE_FILE_PREFIX)).nameWithoutExtension.ifBlank { "Custom Image" }
+}
+
+fun importReaderTexture(context: Context, uri: Uri): String? {
+    return try {
+        val extension = context.contentResolver.getType(uri)
+            ?.substringAfterLast('/')
+            ?.lowercase(Locale.ROOT)
+            ?.let {
+                when (it) {
+                    "jpeg", "jpg" -> "jpg"
+                    "png", "webp", "gif", "bmp" -> it
+                    else -> null
+                }
+            } ?: uri.lastPathSegment
+            ?.substringAfterLast('.', "")
+            ?.lowercase(Locale.ROOT)
+            ?.takeIf { it in setOf("jpg", "jpeg", "png", "webp", "gif", "bmp") }
+            ?: "img"
+        val dir = File(context.filesDir, READER_TEXTURE_DIR).apply { mkdirs() }
+        val output = File(dir, "texture_${System.currentTimeMillis()}.$extension")
+        context.contentResolver.openInputStream(uri)?.use { input ->
+            output.outputStream().use { out -> input.copyTo(out) }
+        } ?: return null
+        TEXTURE_FILE_PREFIX + output.absolutePath
+    } catch (e: Exception) {
+        Timber.e(e, "Failed to import reader texture")
+        null
+    }
+}
+
+fun loadReaderTextureBitmap(context: Context, textureId: String?): ImageBitmap? {
+    if (textureId == null) return null
+    return try {
+        val bitmap = if (textureId.startsWith(TEXTURE_FILE_PREFIX)) {
+            BitmapFactory.decodeFile(textureId.removePrefix(TEXTURE_FILE_PREFIX))
+        } else {
+            val texture = ReaderTexture.entries.find { it.id == textureId } ?: return null
+            when {
+                texture.assetPath != null -> context.assets.open(texture.assetPath).use(BitmapFactory::decodeStream)
+                texture.resId != null -> BitmapFactory.decodeResource(context.resources, texture.resId)
+                else -> null
+            }
+        }
+        bitmap?.asImageBitmap()
+    } catch (e: Exception) {
+        Timber.e(e, "Failed to load reader texture bitmap: $textureId")
+        null
+    }
+}
+
+fun getReaderTextureDataUri(context: Context, textureId: String?): String? {
+    if (textureId == null) return null
+    return try {
+        var mimeType = "image/png"
+        val bytes = if (textureId.startsWith(TEXTURE_FILE_PREFIX)) {
+            val file = File(textureId.removePrefix(TEXTURE_FILE_PREFIX))
+            mimeType = imageMimeTypeForExtension(file.extension)
+            file.readBytes()
+        } else {
+            val texture = ReaderTexture.entries.find { it.id == textureId } ?: return null
+            when {
+                texture.assetPath != null -> {
+                    mimeType = imageMimeTypeForExtension(texture.assetPath.substringAfterLast('.', "png"))
+                    context.assets.open(texture.assetPath).use { it.readBytes() }
+                }
+                texture.resId != null -> {
+                    val bitmap = BitmapFactory.decodeResource(context.resources, texture.resId)
+                    ByteArrayOutputStream().use { out ->
+                        bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, out)
+                        out.toByteArray()
+                    }
+                }
+                else -> null
+            }
+        } ?: return null
+        "data:$mimeType;base64," + Base64.encodeToString(bytes, Base64.NO_WRAP)
+    } catch (e: Exception) {
+        Timber.e(e, "Failed to encode reader texture: $textureId")
+        null
+    }
+}
+
+private fun imageMimeTypeForExtension(extension: String): String {
+    return when (extension.lowercase(Locale.ROOT)) {
+        "jpg", "jpeg" -> "image/jpeg"
+        "webp" -> "image/webp"
+        "gif" -> "image/gif"
+        "bmp" -> "image/bmp"
+        else -> "image/png"
+    }
 }
 
 data class ReaderTheme(
@@ -1801,7 +2565,13 @@ val BuiltInThemes = listOf(
     ReaderTheme("dark", "Dark", Color(0xFF121212), Color(0xFFE0E0E0), true),
     ReaderTheme("sepia", "Sepia", Color(0xFFFBF0D9), Color(0xFF5F4B32), false),
     ReaderTheme("slate", "Slate", Color(0xFF2E3440), Color(0xFFECEFF4), true),
-    ReaderTheme("oled", "OLED", Color(0xFF000000), Color(0xFFB0B0B0), true)
+    ReaderTheme("oled", "OLED", Color(0xFF000000), Color(0xFFB0B0B0), true),
+    ReaderTheme("natural_white_texture", "Natural White", Color(0xFFF7F1E5), Color(0xFF1D1B18), false, textureId = ReaderTexture.NATURAL_WHITE.id),
+    ReaderTheme("retina_texture", "Retina", Color(0xFFF1E4CD), Color(0xFF2A2119), false, textureId = ReaderTexture.RETINA_WOOD.id),
+    ReaderTheme("veneer_texture", "Veneer", Color(0xFFF4E7CF), Color(0xFF2A2119), false, textureId = ReaderTexture.LIGHT_VENEER.id),
+    ReaderTheme("grey_wash_texture", "Grey Wash", Color(0xFF202124), Color(0xFFFFFFFF), true, textureId = ReaderTexture.GREY_WASH.id),
+    ReaderTheme("fabric_texture", "Fabric", Color(0xFF262626), Color(0xFFE8E2D8), true, textureId = ReaderTexture.CLASSY_FABRIC.id),
+    ReaderTheme("retro_texture", "Retro", Color(0xFFF6ECD8), Color(0xFF2F2118), false, textureId = ReaderTexture.RETRO_INTRO.id)
 )
 
 fun saveReaderThemeId(context: Context, themeId: String) {
@@ -1812,6 +2582,28 @@ fun saveReaderThemeId(context: Context, themeId: String) {
 fun loadReaderThemeId(context: Context): String {
     val prefs = context.getSharedPreferences("reader_prefs", Context.MODE_PRIVATE)
     return prefs.getString(PREF_READER_THEME, "system") ?: "system"
+}
+
+const val PREF_GLOBAL_TEXTURE_TRANSPARENCY = "global_texture_transparency"
+
+fun saveGlobalTextureTransparency(context: Context, transparency: Float) {
+    val prefs = context.getSharedPreferences("reader_prefs", Context.MODE_PRIVATE)
+    prefs.edit { putFloat(PREF_GLOBAL_TEXTURE_TRANSPARENCY, transparency) }
+}
+
+fun loadGlobalTextureTransparency(context: Context): Float {
+    val prefs = context.getSharedPreferences("reader_prefs", Context.MODE_PRIVATE)
+    return prefs.getFloat(PREF_GLOBAL_TEXTURE_TRANSPARENCY, 0f)
+}
+
+fun getImportedTextures(context: Context): List<String> {
+    return try {
+        val dir = File(context.filesDir, READER_TEXTURE_DIR)
+        if (!dir.exists()) emptyList()
+        else dir.listFiles()?.map { TEXTURE_FILE_PREFIX + it.absolutePath } ?: emptyList()
+    } catch (_: Exception) {
+        emptyList()
+    }
 }
 
 const val PREF_EXCLUDE_IMAGES = "exclude_images"
@@ -1885,13 +2677,22 @@ fun ReaderThemePanel(
     showExcludeImagesOption: Boolean = false,
     customThemes: List<ReaderTheme>,
     builtInThemes: List<ReaderTheme> = BuiltInThemes,
+    globalTextureTransparency: Float,
+    onGlobalTextureTransparencyChange: (Float) -> Unit,
     onThemeSelected: (String) -> Unit,
     onCustomThemesUpdated: (List<ReaderTheme>) -> Unit,
     onDismiss: () -> Unit
 ) {
     if (!isVisible) return
     var showBuilder by remember { mutableStateOf(false) }
+    var builderIsTextured by remember { mutableStateOf(false) }
     var editingTheme by remember { mutableStateOf<ReaderTheme?>(null) }
+    var selectedTabIndex by remember { mutableIntStateOf(if (builtInThemes.find { it.id == currentThemeId }?.textureId != null || customThemes.find { it.id == currentThemeId }?.textureId != null) 1 else 0) }
+
+    val plainBuiltInThemes = builtInThemes.filter { it.textureId == null }
+    val texturedBuiltInThemes = builtInThemes.filter { it.textureId != null }
+    val plainCustomThemes = customThemes.filter { it.textureId == null }
+    val texturedCustomThemes = customThemes.filter { it.textureId != null }
 
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
 
@@ -1905,6 +2706,8 @@ fun ReaderThemePanel(
             if (isBuilding) {
                 ThemeBuilderView(
                     initialTheme = editingTheme,
+                    isTexturedMode = builderIsTextured,
+                    globalTextureAlpha = 1f - globalTextureTransparency,
                     onSave = { newTheme ->
                         val updatedList = if (editingTheme != null) {
                             customThemes.map { if (it.id == newTheme.id) newTheme else it }
@@ -1922,67 +2725,112 @@ fun ReaderThemePanel(
                     }
                 )
             } else {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .fillMaxHeight(0.65f)
-                        .padding(16.dp)
-                        .padding(bottom = 16.dp)
-                ) {
-                    Text(stringResource(R.string.reading_themes),
+                Column(modifier = Modifier.fillMaxWidth().fillMaxHeight(0.85f).padding(horizontal = 16.dp)) {
+                    Text(
+                        text = stringResource(R.string.reading_themes),
                         style = MaterialTheme.typography.titleLarge,
                         fontWeight = FontWeight.Bold,
-                        modifier = Modifier.padding(bottom = 16.dp)
+                        modifier = Modifier.padding(bottom = 16.dp, top = 8.dp)
                     )
 
-                    if (showExcludeImagesOption) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.SpaceBetween
-                        ) {
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text("Preserve Image Colors", style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.SemiBold)
-                                Text("Keep original image colors when theme changes", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+                    TabRow(selectedTabIndex = selectedTabIndex, containerColor = Color.Transparent, divider = {}) {
+                        Tab(selected = selectedTabIndex == 0, onClick = { selectedTabIndex = 0 }) {
+                            Text("Solid Colors", modifier = Modifier.padding(12.dp))
+                        }
+                        Tab(selected = selectedTabIndex == 1, onClick = { selectedTabIndex = 1 }) {
+                            Text("Textured", modifier = Modifier.padding(12.dp))
+                        }
+                    }
+
+                    Spacer(Modifier.height(16.dp))
+
+                    if (selectedTabIndex == 1) {
+                        Column(modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) {
+                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                Text("Texture Transparency", style = MaterialTheme.typography.labelMedium)
+                                Text("${(globalTextureTransparency * 100).roundToInt()}%", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
                             }
-                            androidx.compose.material3.Switch(
-                                checked = excludeImages,
-                                onCheckedChange = onExcludeImagesChange
+                            Slider(
+                                value = globalTextureTransparency,
+                                onValueChange = onGlobalTextureTransparencyChange,
+                                valueRange = 0f..1f
                             )
                         }
                     }
 
-                    Text(stringResource(R.string.theme_presets), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
-                    Spacer(Modifier.height(8.dp))
-                    ThemeGrid(themes = builtInThemes, currentThemeId = currentThemeId, onThemeSelected = onThemeSelected)
+                    val activeListBuiltIn = if (selectedTabIndex == 0) plainBuiltInThemes else texturedBuiltInThemes
+                    val activeListCustom = if (selectedTabIndex == 0) plainCustomThemes else texturedCustomThemes
 
-                    Spacer(Modifier.height(24.dp))
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
+                    LazyVerticalGrid(
+                        columns = GridCells.Fixed(3),
+                        modifier = Modifier.fillMaxWidth().weight(1f),
+                        contentPadding = PaddingValues(bottom = 24.dp),
+                        horizontalArrangement = Arrangement.spacedBy(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(16.dp)
                     ) {
-                        Text(stringResource(R.string.theme_my_themes), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
-                        IconButton(onClick = { editingTheme = null; showBuilder = true }, modifier = Modifier.size(24.dp)) {
-                            Icon(Icons.Default.Add, contentDescription = "Create Theme", tint = MaterialTheme.colorScheme.primary)
-                        }
-                    }
-                    Spacer(Modifier.height(8.dp))
-
-                    if (customThemes.isEmpty()) {
-                        Text(stringResource(R.string.theme_no_custom), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    } else {
-                        ThemeGrid(
-                            themes = customThemes,
-                            currentThemeId = currentThemeId,
-                            onThemeSelected = onThemeSelected,
-                            onEdit = { editingTheme = it; showBuilder = true },
-                            onDelete = { themeToDelete ->
-                                val updated = customThemes.filter { it.id != themeToDelete.id }
-                                onCustomThemesUpdated(updated)
-                                if (currentThemeId == themeToDelete.id) onThemeSelected("system")
+                        if (showExcludeImagesOption) {
+                            item(span = { GridItemSpan(maxLineSpan) }) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(stringResource(R.string.theme_preserve_image_colors), style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.SemiBold)
+                                        Text(stringResource(R.string.theme_preserve_image_colors_desc), style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+                                    }
+                                    Switch(checked = excludeImages, onCheckedChange = onExcludeImagesChange)
+                                }
                             }
-                        )
+                        }
+
+                        item(span = { GridItemSpan(maxLineSpan) }) {
+                            Text(stringResource(R.string.theme_presets), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
+                        }
+
+                        items(activeListBuiltIn) { theme ->
+                            ThemeGridItem(
+                                theme = theme,
+                                currentThemeId = currentThemeId,
+                                context = LocalContext.current,
+                                globalTextureAlpha = 1f - globalTextureTransparency,
+                                onThemeSelected = onThemeSelected,
+                                onEdit = null,
+                                onDelete = null
+                            )
+                        }
+
+                        item(span = { GridItemSpan(maxLineSpan) }) {
+                            Spacer(Modifier.height(8.dp))
+                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                                Text(stringResource(R.string.theme_my_themes), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
+                                IconButton(onClick = { editingTheme = null; builderIsTextured = selectedTabIndex == 1; showBuilder = true }) {
+                                    Icon(Icons.Default.Add, contentDescription = "New Theme", tint = MaterialTheme.colorScheme.primary)
+                                }
+                            }
+                        }
+
+                        if (activeListCustom.isEmpty()) {
+                            item(span = { GridItemSpan(maxLineSpan) }) {
+                                Text(stringResource(R.string.theme_no_custom), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                        } else {
+                            items(activeListCustom) { theme ->
+                                ThemeGridItem(
+                                    theme = theme,
+                                    currentThemeId = currentThemeId,
+                                    context = LocalContext.current,
+                                    globalTextureAlpha = 1f - globalTextureTransparency,
+                                    onThemeSelected = onThemeSelected,
+                                    onEdit = { editingTheme = it; builderIsTextured = selectedTabIndex == 1; showBuilder = true },
+                                    onDelete = { themeToDelete ->
+                                        val updated = customThemes.filter { it.id != themeToDelete.id }
+                                        onCustomThemesUpdated(updated)
+                                        if (currentThemeId == themeToDelete.id) onThemeSelected("system")
+                                    }
+                                )
+                            }
+                        }
                     }
                 }
             }
@@ -1991,57 +2839,48 @@ fun ReaderThemePanel(
 }
 
 @Composable
-fun ThemeGrid(
-    themes: List<ReaderTheme>,
+private fun ThemeGridItem(
+    theme: ReaderTheme,
     currentThemeId: String,
+    context: Context,
+    globalTextureAlpha: Float,
     onThemeSelected: (String) -> Unit,
-    onEdit: ((ReaderTheme) -> Unit)? = null,
-    onDelete: ((ReaderTheme) -> Unit)? = null
+    onEdit: ((ReaderTheme) -> Unit)?,
+    onDelete: ((ReaderTheme) -> Unit)?,
+    modifier: Modifier = Modifier
 ) {
-    LazyVerticalGrid(
-        columns = GridCells.Adaptive(minSize = 80.dp),
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-        verticalArrangement = Arrangement.spacedBy(16.dp)
-    ) {
-        items(themes.size) { index ->
-            val theme = themes[index]
-            val isSelected = currentThemeId == theme.id
-            val bgColor = if (theme.id == "system") MaterialTheme.colorScheme.surfaceVariant else theme.backgroundColor
-            val textColor = if (theme.id == "system") MaterialTheme.colorScheme.onSurfaceVariant else theme.textColor
-            val borderColor = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant
+    val isSelected = currentThemeId == theme.id
+    val bgColor = if (theme.id == "system") MaterialTheme.colorScheme.surfaceVariant else theme.backgroundColor
+    val textColor = if (theme.id == "system") MaterialTheme.colorScheme.onSurfaceVariant else theme.textColor
+    val borderColor = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant
+    val textureBitmap = remember(theme.textureId) { loadReaderTextureBitmap(context, theme.textureId) }
 
-            Column(
-                horizontalAlignment = Alignment.CenterHorizontally,
-            ) {
-                Box(
-                    modifier = Modifier
-                        .size(56.dp)
-                        .background(bgColor, CircleShape)
-                        .border(if (isSelected) 3.dp else 1.dp, borderColor, CircleShape)
-                        .clickable { onThemeSelected(theme.id) },
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text(text = "Aa", color = textColor, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold)
-                }
-                Spacer(modifier = Modifier.height(8.dp))
-                Text(text = theme.name, style = MaterialTheme.typography.labelSmall, color = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface, maxLines = 1, overflow = TextOverflow.Ellipsis)
-
-                if (theme.isCustom && onEdit != null && onDelete != null) {
-                    Spacer(modifier = Modifier.height(6.dp))
-                    Surface(
-                        shape = RoundedCornerShape(16.dp),
-                        color = MaterialTheme.colorScheme.surfaceVariant,
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp),
-                            horizontalArrangement = Arrangement.Center,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Icon(Icons.Default.Edit, "Edit", Modifier.size(28.dp).clip(CircleShape).clickable { onEdit(theme) }.padding(6.dp), tint = MaterialTheme.colorScheme.primary)
-                            Spacer(Modifier.width(4.dp))
-                            Icon(Icons.Default.Delete, "Delete", Modifier.size(28.dp).clip(CircleShape).clickable { onDelete(theme) }.padding(6.dp), tint = MaterialTheme.colorScheme.error)
-                        }
+    Column(modifier = modifier, horizontalAlignment = Alignment.CenterHorizontally) {
+        Box(
+            modifier = Modifier
+                .size(56.dp)
+                .background(bgColor, CircleShape)
+                .then(textureBitmap?.let { bitmap ->
+                    Modifier.drawBehind {
+                        drawRect(ShaderBrush(ImageShader(bitmap, TileMode.Repeated, TileMode.Repeated)), blendMode = BlendMode.SrcOver, alpha = globalTextureAlpha)
                     }
+                } ?: Modifier)
+                .border(if (isSelected) 3.dp else 1.dp, borderColor, CircleShape)
+                .clickable { onThemeSelected(theme.id) },
+            contentAlignment = Alignment.Center
+        ) {
+            Text(text = "Aa", color = textColor, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold)
+        }
+        Spacer(modifier = Modifier.height(8.dp))
+        Text(text = theme.name, style = MaterialTheme.typography.labelSmall, color = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface, maxLines = 1, overflow = TextOverflow.Ellipsis)
+
+        if (theme.isCustom && onEdit != null && onDelete != null) {
+            Spacer(modifier = Modifier.height(6.dp))
+            Surface(shape = RoundedCornerShape(16.dp), color = MaterialTheme.colorScheme.surfaceVariant) {
+                Row(modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp), horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.Edit, "Edit", Modifier.size(28.dp).clip(CircleShape).clickable { onEdit(theme) }.padding(6.dp), tint = MaterialTheme.colorScheme.primary)
+                    Spacer(Modifier.width(4.dp))
+                    Icon(Icons.Default.Delete, "Delete", Modifier.size(28.dp).clip(CircleShape).clickable { onDelete(theme) }.padding(6.dp), tint = MaterialTheme.colorScheme.error)
                 }
             }
         }
@@ -2051,25 +2890,31 @@ fun ThemeGrid(
 @Composable
 fun ThemeBuilderView(
     initialTheme: ReaderTheme?,
+    isTexturedMode: Boolean,
+    globalTextureAlpha: Float,
     onSave: (ReaderTheme) -> Unit,
     onCancel: () -> Unit
 ) {
-    var name by remember { mutableStateOf(initialTheme?.name ?: "Custom Theme") }
+    val context = LocalContext.current
+    var name by remember { mutableStateOf(initialTheme?.name ?: if (isTexturedMode) "Custom Textured" else "Custom Solid") }
     var bgColor by remember { mutableStateOf(initialTheme?.backgroundColor ?: Color(0xFFF5F5F5)) }
     var txtColor by remember { mutableStateOf(initialTheme?.textColor ?: Color(0xFF111111)) }
-    var textureId by remember { mutableStateOf(initialTheme?.textureId) }
-
     var editingColorType by remember { mutableStateOf<String?>(null) }
+
+    var importedTextures by remember { mutableStateOf(getImportedTextures(context)) }
+    var textureId by remember { mutableStateOf(initialTheme?.textureId ?: importedTextures.firstOrNull()) }
+
+    val texturePickerLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        uri?.let { importReaderTexture(context, it) }?.let { newId ->
+            importedTextures = getImportedTextures(context)
+            textureId = newId
+        }
+    }
 
     val contrast = calculateContrastRatio(bgColor, txtColor)
     val isDark = bgColor.luminance() < 0.5f
 
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .fillMaxHeight(0.85f)
-            .padding(16.dp)
-    ) {
+    Column(modifier = Modifier.fillMaxWidth().fillMaxHeight(0.85f).padding(16.dp)) {
         Text(
             text = stringResource(if (initialTheme == null) R.string.theme_new else R.string.theme_edit),
             fontWeight = FontWeight.Bold,
@@ -2095,62 +2940,45 @@ fun ThemeBuilderView(
                 color = bgColor,
                 border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
             ) {
-                val context = LocalContext.current
+                val textureBitmap = remember(textureId) { loadReaderTextureBitmap(context, textureId) }
                 Box(modifier = Modifier.fillMaxSize().run {
-                    val texRes = ReaderTexture.entries.find { it.id == textureId }?.resId
-                    if (texRes != null) {
-                        val bmp = ImageBitmap.imageResource(context.resources, texRes)
+                    if (isTexturedMode && textureBitmap != null) {
                         this.drawBehind {
-                            drawRect(ShaderBrush(ImageShader(bmp, TileMode.Repeated, TileMode.Repeated)), blendMode = BlendMode.Multiply, alpha = 0.5f)
+                            drawRect(ShaderBrush(ImageShader(textureBitmap, TileMode.Repeated, TileMode.Repeated)), blendMode = BlendMode.SrcOver, alpha = globalTextureAlpha)
                         }
                     } else this
                 }) {
                     Column(Modifier.padding(16.dp).fillMaxWidth()) {
-                        Text(text = stringResource(R.string.theme_preview_quote),
-                            color = txtColor,
-                            style = MaterialTheme.typography.titleMedium
-                        )
+                        Text(text = stringResource(R.string.theme_preview_quote), color = txtColor, style = MaterialTheme.typography.titleMedium)
                         Spacer(Modifier.height(8.dp))
-                        Text(text = stringResource(R.string.theme_preview_author),
-                            color = txtColor,
-                            style = MaterialTheme.typography.bodyMedium,
-                            modifier = Modifier.fillMaxWidth(),
-                            textAlign = TextAlign.End
-                        )
+                        Text(text = stringResource(R.string.theme_preview_author), color = txtColor, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.fillMaxWidth(), textAlign = TextAlign.End)
                     }
                 }
             }
 
-            // Animated Contrast Warning
             AnimatedVisibility(visible = contrast < 4.5f) {
-                Text(stringResource(R.string.theme_low_contrast_warning),
-                    color = MaterialTheme.colorScheme.error,
-                    style = MaterialTheme.typography.labelSmall,
-                    modifier = Modifier.padding(bottom = 8.dp)
-                )
+                Text(stringResource(R.string.theme_low_contrast_warning), color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall, modifier = Modifier.padding(bottom = 8.dp))
             }
 
             Spacer(Modifier.height(16.dp))
 
-            // Sleek Color Swatches
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-                ColorSwatchItem(
-                    label = stringResource(R.string.theme_page_color),
-                    color = bgColor,
-                    onClick = { editingColorType = "bg" },
-                    modifier = Modifier.weight(1f)
-                )
-                ColorSwatchItem(
-                    label = stringResource(R.string.theme_text_color),
-                    color = txtColor,
-                    onClick = { editingColorType = "text" },
-                    modifier = Modifier.weight(1f)
+                ColorSwatchItem(label = stringResource(R.string.theme_page_color), color = bgColor, onClick = { editingColorType = "bg" }, modifier = Modifier.weight(1f))
+                ColorSwatchItem(label = stringResource(R.string.theme_text_color), color = txtColor, onClick = { editingColorType = "text" }, modifier = Modifier.weight(1f))
+            }
+
+            if (isTexturedMode) {
+                Spacer(Modifier.height(24.dp))
+                CustomTexturePickerSection(
+                    importedTextures = importedTextures,
+                    selectedTextureId = textureId,
+                    onTextureSelected = { textureId = it },
+                    onImportTexture = { texturePickerLauncher.launch(arrayOf("image/png", "image/jpeg", "image/webp", "image/gif", "image/bmp")) }
                 )
             }
             Spacer(Modifier.height(16.dp))
         }
 
-        // Action Buttons at the bottom for better visibility
         Row(
             modifier = Modifier.fillMaxWidth().padding(top = 16.dp),
             horizontalArrangement = Arrangement.End,
@@ -2161,7 +2989,7 @@ fun ThemeBuilderView(
             }
             Spacer(Modifier.width(8.dp))
             Button(onClick = {
-                onSave(ReaderTheme(id = initialTheme?.id ?: System.currentTimeMillis().toString(), name = name, backgroundColor = bgColor, textColor = txtColor, isDark = isDark, textureId = textureId, isCustom = true))
+                onSave(ReaderTheme(id = initialTheme?.id ?: System.currentTimeMillis().toString(), name = name, backgroundColor = bgColor, textColor = txtColor, isDark = isDark, textureId = if (isTexturedMode) textureId else null, isCustom = true))
             }) {
                 Text(stringResource(R.string.action_save), color = MaterialTheme.colorScheme.onPrimary)
             }
@@ -2176,10 +3004,165 @@ fun ThemeBuilderView(
             textColor = txtColor,
             editingColorType = type,
             onDismiss = { editingColorType = null },
-            onColorChanged = { newColor ->
-                if (type == "bg") bgColor = newColor else txtColor = newColor
-            }
+            onColorChanged = { newColor -> if (type == "bg") bgColor = newColor else txtColor = newColor }
         )
+    }
+}
+
+@Composable
+private fun CustomTexturePickerSection(
+    importedTextures: List<String>,
+    selectedTextureId: String?,
+    onTextureSelected: (String?) -> Unit,
+    onImportTexture: () -> Unit
+) {
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Text("Select Custom Texture", style = MaterialTheme.typography.labelMedium, modifier = Modifier.padding(bottom = 8.dp))
+
+        LazyRow(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
+            item {
+                Surface(
+                    onClick = onImportTexture,
+                    modifier = Modifier.size(72.dp),
+                    shape = RoundedCornerShape(12.dp),
+                    color = MaterialTheme.colorScheme.surfaceVariant,
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+                ) {
+                    Column(modifier = Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
+                        Icon(Icons.Default.Add, contentDescription = "Import", tint = MaterialTheme.colorScheme.primary)
+                        Text("Import", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
+                    }
+                }
+            }
+            items(importedTextures) { tex ->
+                val isSelected = tex == selectedTextureId
+                val context = LocalContext.current
+                val bitmap = remember(tex) { loadReaderTextureBitmap(context, tex) }
+
+                Surface(
+                    onClick = { onTextureSelected(tex) },
+                    modifier = Modifier.size(72.dp),
+                    shape = RoundedCornerShape(12.dp),
+                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = if (isSelected) 0.95f else 0.45f),
+                    border = BorderStroke(if (isSelected) 2.dp else 1.dp, if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant)
+                ) {
+                    Box(
+                        modifier = Modifier.fillMaxSize().then(bitmap?.let {
+                            Modifier.drawBehind { drawRect(ShaderBrush(ImageShader(it, TileMode.Repeated, TileMode.Repeated)), blendMode = BlendMode.SrcOver, alpha = 0.6f) }
+                        } ?: Modifier),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        if (isSelected) Icon(Icons.Default.Check, null, tint = MaterialTheme.colorScheme.primary)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun TexturePickerSection(
+    selectedTextureId: String?,
+    selectedTextureAlpha: Float,
+    onTextureSelected: (String?) -> Unit,
+    onTextureAlphaChange: (Float) -> Unit,
+    onImportTexture: () -> Unit
+) {
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Text(stringResource(R.string.theme_texture), style = MaterialTheme.typography.labelMedium, modifier = Modifier.padding(bottom = 8.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+            TextureChoice(
+                label = stringResource(R.string.theme_texture_none),
+                textureId = null,
+                selectedTextureId = selectedTextureId,
+                onTextureSelected = onTextureSelected,
+                modifier = Modifier.weight(1f)
+            )
+            TextureChoice(
+                label = stringResource(R.string.theme_texture_upload),
+                textureId = selectedTextureId?.takeIf { it.startsWith(TEXTURE_FILE_PREFIX) },
+                selectedTextureId = selectedTextureId,
+                onTextureSelected = { onImportTexture() },
+                isUpload = true,
+                modifier = Modifier.weight(1f)
+            )
+        }
+        Spacer(Modifier.height(8.dp))
+        ReaderTexture.entries.filter { it.assetPath != null }.chunked(2).forEach { rowTextures ->
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) {
+                rowTextures.forEach { texture ->
+                    TextureChoice(
+                        label = texture.displayName,
+                        textureId = texture.id,
+                        selectedTextureId = selectedTextureId,
+                        onTextureSelected = onTextureSelected,
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+                if (rowTextures.size == 1) Spacer(Modifier.weight(1f))
+            }
+        }
+        AnimatedVisibility(visible = selectedTextureId != null) {
+            Column(modifier = Modifier.fillMaxWidth().padding(top = 4.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(stringResource(R.string.theme_texture_transparency), style = MaterialTheme.typography.labelMedium)
+                    Text("${((1f - selectedTextureAlpha) * 100).roundToInt()}%", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
+                }
+                Slider(
+                    value = 1f - selectedTextureAlpha,
+                    onValueChange = { onTextureAlphaChange((1f - it).coerceIn(0f, 1f)) },
+                    valueRange = 0f..1f
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun TextureChoice(
+    label: String,
+    textureId: String?,
+    selectedTextureId: String?,
+    onTextureSelected: (String?) -> Unit,
+    modifier: Modifier = Modifier,
+    isUpload: Boolean = false,
+) {
+    val context = LocalContext.current
+    val textureBitmap = remember(textureId) { loadReaderTextureBitmap(context, textureId) }
+    val selected = if (isUpload) selectedTextureId?.startsWith(TEXTURE_FILE_PREFIX) == true else selectedTextureId == textureId
+    Surface(
+        onClick = { onTextureSelected(textureId) },
+        modifier = modifier.height(52.dp),
+        shape = RoundedCornerShape(12.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = if (selected) 0.95f else 0.45f),
+        border = BorderStroke(if (selected) 2.dp else 1.dp, if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant)
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .then(textureBitmap?.let { bitmap ->
+                    Modifier.drawBehind {
+                        drawRect(ShaderBrush(ImageShader(bitmap, TileMode.Repeated, TileMode.Repeated)), blendMode = BlendMode.SrcOver, alpha = 0.6f)
+                    }
+                } ?: Modifier)
+                .padding(horizontal = 8.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            Text(
+                text = if (isUpload && selectedTextureId?.startsWith(TEXTURE_FILE_PREFIX) == true) {
+                    readerTextureDisplayName(selectedTextureId)
+                } else label,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurface,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                textAlign = TextAlign.Center
+            )
+        }
     }
 }
 
@@ -2446,7 +3429,7 @@ fun HighlightColorPickerDialog(
                         .padding(horizontal = 24.dp, vertical = 8.dp)
                 ) {
                     Text(
-                        text = "Customize Highlights",
+                        text = stringResource(R.string.highlight_customize_title),
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.SemiBold,
                         color = Color.White
@@ -2478,7 +3461,7 @@ fun HighlightColorPickerDialog(
                             if (isSelected) {
                                 Icon(
                                     imageVector = Icons.Default.Check,
-                                    contentDescription = "Selected",
+                                    contentDescription = stringResource(R.string.content_desc_selected),
                                     tint = if (slotColor.luminance() > 0.5f) Color.Black else Color.White
                                 )
                             }
@@ -2523,7 +3506,7 @@ fun HighlightColorPickerDialog(
                         modifier = Modifier.weight(1.6f),
                         horizontalAlignment = Alignment.CenterHorizontally
                     ) {
-                        Text("HEX", color = Color.Gray, fontSize = 12.sp, maxLines = 1)
+                        Text(stringResource(R.string.theme_color_hex), color = Color.Gray, fontSize = 12.sp, maxLines = 1)
                         Spacer(Modifier.height(4.dp))
                         HexInput(color = currentColor, onHexChanged = { updateFromColor(it) })
                     }
@@ -2532,15 +3515,15 @@ fun HighlightColorPickerDialog(
                         modifier = Modifier.weight(2.4f),
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
-                        RgbInputColumn(label = "R", value = currentColor.red,
+                        RgbInputColumn(label = stringResource(R.string.color_r), value = currentColor.red,
                             onValueChange = { r -> updateFromColor(currentColor.copy(red = r)) },
                             modifier = Modifier.weight(1f)
                         )
-                        RgbInputColumn(label = "G", value = currentColor.green,
+                        RgbInputColumn(label = stringResource(R.string.color_g), value = currentColor.green,
                             onValueChange = { g -> updateFromColor(currentColor.copy(green = g)) },
                             modifier = Modifier.weight(1f)
                         )
-                        RgbInputColumn(label = "B", value = currentColor.blue,
+                        RgbInputColumn(label = stringResource(R.string.color_b), value = currentColor.blue,
                             onValueChange = { b -> updateFromColor(currentColor.copy(blue = b)) },
                             modifier = Modifier.weight(1f)
                         )
@@ -2555,11 +3538,11 @@ fun HighlightColorPickerDialog(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     TextButton(onClick = { updateFromColor(selectedSlot.color) }) {
-                        Text("Reset", color = Color(0xFFFF5252))
+                        Text(stringResource(R.string.action_reset), color = Color(0xFFFF5252))
                     }
                     Row {
                         TextButton(onClick = onDismiss) {
-                            Text("Cancel", color = Color.Gray)
+                            Text(stringResource(R.string.action_cancel), color = Color.Gray)
                         }
                         Spacer(Modifier.width(8.dp))
                         Button(
@@ -2568,7 +3551,7 @@ fun HighlightColorPickerDialog(
                                 containerColor = Color.White
                             )
                         ) {
-                            Text("Save", color = Color.Black, fontWeight = FontWeight.Bold)
+                            Text(stringResource(R.string.action_save), color = Color.Black, fontWeight = FontWeight.Bold)
                         }
                     }
                 }
@@ -2631,7 +3614,7 @@ fun AiHubBottomSheet(
             ) {
                 Box(modifier = Modifier.weight(1f))
                 Text(
-                    text = "AI Features",
+                    text = stringResource(R.string.ai_features_title),
                     style = MaterialTheme.typography.headlineSmall,
                     fontWeight = FontWeight.Bold,
                     textAlign = TextAlign.Center,
@@ -2655,9 +3638,12 @@ fun AiHubBottomSheet(
                 }
             }
 
-            val tabs = mutableListOf("Summary")
-            if (onGenerateRecap != null) tabs.add("Recap")
-            if (summaryCacheManager != null) tabs.add("Cache")
+            val summaryTab = stringResource(R.string.ai_tab_summary)
+            val recapTab = stringResource(R.string.ai_tab_recap)
+            val cacheTab = stringResource(R.string.ai_tab_cache)
+            val tabs = mutableListOf(summaryTab)
+            if (onGenerateRecap != null) tabs.add(recapTab)
+            if (summaryCacheManager != null) tabs.add(cacheTab)
 
             TabRow(selectedTabIndex = selectedTabIndex, modifier = Modifier.padding(bottom = 16.dp)) {
                 tabs.forEachIndexed { index, title ->
@@ -2667,11 +3653,11 @@ fun AiHubBottomSheet(
                 }
             }
 
-            val activeTab = tabs.getOrNull(selectedTabIndex) ?: "Summary"
+            val activeTab = tabs.getOrNull(selectedTabIndex) ?: summaryTab
             var cacheRefreshTrigger by remember { mutableIntStateOf(0) }
 
             when (activeTab) {
-                "Summary" -> {
+                summaryTab -> {
                     val cachedSummary = remember(currentChapterIndex, cacheRefreshTrigger) { summaryCacheManager?.getSummary(bookTitle, currentChapterIndex) }
                     val effectiveResult = summarizationResult ?: if (cachedSummary != null) SummarizationResult(summary = cachedSummary, isCacheHit = true) else null
 
@@ -2680,7 +3666,7 @@ fun AiHubBottomSheet(
                             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                                 Icon(painterResource(R.drawable.summarize), contentDescription = null, modifier = Modifier.size(48.dp), tint = MaterialTheme.colorScheme.primary)
                                 Spacer(Modifier.height(16.dp))
-                                Text("No summary for ${chapterTitle.lowercase()} yet.", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                Text(stringResource(R.string.ai_no_summary_for_chapter, chapterTitle.lowercase()), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                 Spacer(Modifier.height(16.dp))
                                 Button(
                                     onClick = { onGenerateSummary(false) },
@@ -2688,7 +3674,7 @@ fun AiHubBottomSheet(
                                 ) {
                                     Icon(painterResource(R.drawable.ai), contentDescription = null, modifier = Modifier.size(18.dp))
                                     Spacer(Modifier.width(8.dp))
-                                    Text("Generate Summary for $chapterTitle")
+                                    Text(stringResource(R.string.ai_generate_summary_for_chapter, chapterTitle))
                                 }
                             }
                         }
@@ -2705,14 +3691,14 @@ fun AiHubBottomSheet(
                         )
                     }
                 }
-                "Recap" -> {
+                recapTab -> {
                     // Recap Tab
                     if (recapResult == null && !isRecapLoading) {
                         Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                                 Icon(painterResource(R.drawable.ai), contentDescription = null, modifier = Modifier.size(48.dp), tint = MaterialTheme.colorScheme.primary)
                                 Spacer(Modifier.height(16.dp))
-                                Text("Get a recap of the story up to your current position.", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center)
+                                Text(stringResource(R.string.ai_recap_desc), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center)
                                 Spacer(Modifier.height(16.dp))
                                 Button(
                                     onClick = { onGenerateRecap?.invoke() },
@@ -2720,13 +3706,13 @@ fun AiHubBottomSheet(
                                 ) {
                                     Icon(painterResource(R.drawable.ai), contentDescription = null, modifier = Modifier.size(18.dp))
                                     Spacer(Modifier.width(8.dp))
-                                    Text("Generate Story Recap")
+                                    Text(stringResource(R.string.ai_generate_story_recap))
                                 }
                             }
                         }
                     } else {
                         AiResultContentView(
-                            title = "Story Recap",
+                            title = stringResource(R.string.ai_story_recap),
                             result = recapResult,
                             isLoading = isRecapLoading,
                             isMainTtsActive = isMainTtsActive,
@@ -2738,7 +3724,7 @@ fun AiHubBottomSheet(
                         )
                     }
                 }
-                "Cache" -> {
+                cacheTab -> {
                     if (summaryCacheManager != null) {
                         ManageCacheTab(bookTitle, summaryCacheManager, onCacheChanged = {
                             cacheRefreshTrigger++
@@ -2779,7 +3765,8 @@ fun AiResultContentView(
                 modifier = Modifier.weight(1f).padding(end = 8.dp)
             )
 
-            if (result != null && (!result.summary.isNullOrBlank() || isLoading)) {
+            val showUsageBadge = result?.isCacheHit == true || (BuildConfig.FLAVOR != "oss" && (result?.cost != null || isLoading))
+            if (result != null && showUsageBadge && (!result.summary.isNullOrBlank() || isLoading)) {
                 Surface(
                     color = if (result.isCacheHit || (result.cost == 0.0 && result.freeRemaining != null)) Color(
                         0xFF4CAF50
@@ -2788,15 +3775,17 @@ fun AiResultContentView(
                 ) {
                     Text(
                         text = if (result.isCacheHit) {
-                            "⚡ Cache Hit • Free"
+                            stringResource(R.string.ai_cache_hit_free)
                         } else if (result.cost != null) {
                             if (result.cost == 0.0 && result.freeRemaining != null) {
-                                "✨ Generated • Free (${result.freeRemaining}/10 left)"
+                                stringResource(R.string.ai_generated_free_remaining,
+                                    result.freeRemaining
+                                )
                             } else {
-                                "✨ Generated • Cost: ${result.cost} credits"
+                                stringResource(R.string.ai_generated_cost, result.cost.toString())
                             }
                         } else {
-                            "✨ Generating... • Cost: Calculating"
+                            stringResource(R.string.ai_generating_cost_calculating)
                         },
                         style = MaterialTheme.typography.labelSmall,
                         color = if (result.isCacheHit || (result.cost == 0.0 && result.freeRemaining != null)) Color(
@@ -2812,7 +3801,7 @@ fun AiResultContentView(
             Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     CircularProgressIndicator()
-                    Text("Thinking...", modifier = Modifier.padding(start = 12.dp), style = MaterialTheme.typography.bodyLarge)
+                    Text(stringResource(R.string.ai_thinking), modifier = Modifier.padding(start = 12.dp), style = MaterialTheme.typography.bodyLarge)
                 }
             }
         } else if (result != null) {
@@ -2840,7 +3829,7 @@ fun AiResultContentView(
                         IconButton(onClick = onClear) {
                             Icon(
                                 imageVector = Icons.Default.Delete,
-                                contentDescription = "Clear",
+                                contentDescription = stringResource(R.string.action_clear),
                                 tint = MaterialTheme.colorScheme.error
                             )
                         }
@@ -2849,7 +3838,7 @@ fun AiResultContentView(
 
                     if (onRegenerate != null) {
                         TextButton(onClick = onRegenerate) {
-                            Text("Regenerate")
+                            Text(stringResource(R.string.ai_regenerate))
                         }
                     }
 
@@ -2865,7 +3854,7 @@ fun AiResultContentView(
                                         ttsController.start(
                                             chunks = chunks,
                                             bookTitle = title,
-                                            chapterTitle = "AI Output",
+                                            chapterTitle = context.getString(R.string.ai_output_title),
                                             coverImageUri = null,
                                             ttsMode = loadTtsMode(context),
                                             playbackSource = "POPUP",
@@ -2879,7 +3868,7 @@ fun AiResultContentView(
                     ) {
                         Icon(
                             imageVector = if (isTtsSessionActive) Icons.Default.Stop else Icons.Default.PlayArrow,
-                            contentDescription = "Read Aloud"
+                            contentDescription = stringResource(R.string.action_read_aloud)
                         )
                     }
                     IconButton(onClick = {
@@ -2887,7 +3876,7 @@ fun AiResultContentView(
                     }) {
                         Icon(
                             imageVector = Icons.Default.ContentCopy,
-                            contentDescription = "Copy"
+                            contentDescription = stringResource(R.string.action_copy)
                         )
                     }
                 }
@@ -2948,7 +3937,7 @@ fun ManageCacheTab(bookTitle: String, summaryCacheManager: SummaryCacheManager, 
 
     if (cachedItems.isEmpty()) {
         Box(modifier = Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
-            Text("No cached summaries for this book.", style = MaterialTheme.typography.bodyMedium)
+            Text(stringResource(R.string.ai_no_cached_summaries), style = MaterialTheme.typography.bodyMedium)
         }
     } else {
         Column(modifier = Modifier.fillMaxSize()) {
@@ -2974,7 +3963,7 @@ fun ManageCacheTab(bookTitle: String, summaryCacheManager: SummaryCacheManager, 
                                 }) {
                                     Icon(
                                         imageVector = Icons.Default.Delete,
-                                        contentDescription = "Delete",
+                                        contentDescription = stringResource(R.string.action_delete),
                                         tint = MaterialTheme.colorScheme.error
                                     )
                                 }
@@ -3000,7 +3989,7 @@ fun ManageCacheTab(bookTitle: String, summaryCacheManager: SummaryCacheManager, 
                 },
                 modifier = Modifier.align(Alignment.End)
             ) {
-                Text("Clear All", color = MaterialTheme.colorScheme.error)
+                Text(stringResource(R.string.clear_all), color = MaterialTheme.colorScheme.error)
             }
         }
     }

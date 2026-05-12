@@ -29,12 +29,15 @@ class OdtParser(private val context: Context) {
         bookId: String,
         originalBookNameHint: String,
         isFlat: Boolean,
-        parseContent: Boolean = true
+        parseContent: Boolean = true,
+        extractionDirOverride: File? = null
     ): EpubBook = withContext(Dispatchers.IO) {
-        File(context.cacheDir, "imported_file_$bookId").deleteRecursively()
-        val extractionDir = File(context.cacheDir, "imported_file_$bookId").apply {
-            if (!exists()) mkdirs()
-        }
+        val extractionDir = extractionDirOverride?.let(ImportedFileCache::prepareDirectory)
+            ?: if (parseContent) {
+                ImportedFileCache.prepareActiveBookDir(context, bookId)
+            } else {
+                ImportedFileCache.createTemporaryBookDir(context, bookId, "metadata")
+            }
 
         val mathJaxFileName = "tex-mml-chtml.js"
         val mathJaxFile = File(extractionDir, mathJaxFileName)

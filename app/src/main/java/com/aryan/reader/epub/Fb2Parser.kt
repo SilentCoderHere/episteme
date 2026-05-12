@@ -20,13 +20,15 @@ class Fb2Parser(private val context: Context) {
         inputStream: InputStream,
         bookId: String,
         originalBookNameHint: String,
-        parseContent: Boolean = true
+        parseContent: Boolean = true,
+        extractionDirOverride: File? = null
     ): EpubBook = withContext(Dispatchers.IO) {
-        File(context.cacheDir, "imported_file_$bookId").deleteRecursively()
-
-        val extractionDir = File(context.cacheDir, "imported_file_$bookId").apply {
-            if (!exists()) mkdirs()
-        }
+        val extractionDir = extractionDirOverride?.let(ImportedFileCache::prepareDirectory)
+            ?: if (parseContent) {
+                ImportedFileCache.prepareActiveBookDir(context, bookId)
+            } else {
+                ImportedFileCache.createTemporaryBookDir(context, bookId, "metadata")
+            }
 
         var streamToParse = inputStream
         try {

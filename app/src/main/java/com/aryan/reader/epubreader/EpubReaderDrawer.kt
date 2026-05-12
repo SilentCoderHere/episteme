@@ -123,7 +123,9 @@ fun VerticalScrollbar(
 
             if (viewportRatio >= 1f) return@derivedStateOf null
 
-            val thumbHeight = (viewportHeight * viewportRatio).coerceIn(80f, viewportHeight / 2)
+            val maxThumbHeight = viewportHeight / 2f
+            val minThumbHeight = minOf(80f, maxThumbHeight)
+            val thumbHeight = (viewportHeight * viewportRatio).coerceIn(minThumbHeight, maxThumbHeight)
 
             val firstItemIndex = listState.firstVisibleItemIndex
             val firstItemOffset = listState.firstVisibleItemScrollOffset
@@ -243,7 +245,7 @@ fun EpubReaderDrawerSheet(
                 Tab(
                     selected = drawerPagerState.currentPage == 2,
                     onClick = { drawerScope.launch { drawerPagerState.animateScrollToPage(2) } },
-                    text = { Text("Annotations") }
+                    text = { Text(stringResource(R.string.tab_annotations)) }
                 )
             }
 
@@ -408,13 +410,13 @@ private fun ChaptersList(
             horizontalArrangement = Arrangement.SpaceEvenly
         ) {
             TextButton(onClick = { expandedEntryIndices = effectiveToc.indices.toSet() }) {
-                Text("Expand All")
+                Text(stringResource(R.string.action_expand_all))
             }
             TextButton(onClick = { expandedEntryIndices = emptySet() }) {
-                Text("Collapse All")
+                Text(stringResource(R.string.action_collapse_all))
             }
             TextButton(onClick = onScrollToCurrent) {
-                Text("Locate")
+                Text(stringResource(R.string.action_locate))
             }
         }
 
@@ -789,7 +791,8 @@ private fun HighlightsList(
                                             color = MaterialTheme.colorScheme.onSurfaceVariant
                                         )
                                     }
-                                    if (!highlight.note.isNullOrBlank()) {
+                                    val note = highlight.note
+                                    if (!note.isNullOrBlank()) {
                                         Spacer(Modifier.height(8.dp))
                                         Surface(
                                             shape = RoundedCornerShape(8.dp),
@@ -797,7 +800,7 @@ private fun HighlightsList(
                                             modifier = Modifier.fillMaxWidth()
                                         ) {
                                             Text(
-                                                text = highlight.note,
+                                                text = note,
                                                 style = MaterialTheme.typography.bodySmall.copy(fontStyle = androidx.compose.ui.text.font.FontStyle.Italic),
                                                 modifier = Modifier.padding(12.dp),
                                                 color = MaterialTheme.colorScheme.onSurfaceVariant

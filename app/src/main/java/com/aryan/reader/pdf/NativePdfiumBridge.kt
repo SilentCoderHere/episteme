@@ -1,5 +1,7 @@
 package com.aryan.reader.pdf
 
+import com.aryan.reader.shared.pdf.PdfiumAnnotationSubtype
+
 object NativePdfiumBridge {
     init {
         System.loadLibrary("native-lib")
@@ -30,10 +32,42 @@ object NativePdfiumBridge {
     @JvmStatic external fun getAnnotSubtypeAtPoint(pagePtr: Long, x: Double, y: Double): Int
     @JvmStatic external fun getAnnotRectAtPoint(pagePtr: Long, x: Double, y: Double): FloatArray?
     @JvmStatic external fun checkActionSupport(): Boolean
+    @JvmStatic external fun exportAnnotatedPdf(
+        sourcePath: String,
+        destPath: String,
+        inkPageIndices: IntArray,
+        inkTypes: IntArray,
+        inkColors: IntArray,
+        inkStrokeWidths: FloatArray,
+        inkPointOffsets: IntArray,
+        inkPointCounts: IntArray,
+        inkPoints: FloatArray,
+        textPageIndices: IntArray,
+        textBounds: FloatArray,
+        textColors: IntArray,
+        textBackgroundColors: IntArray,
+        textFontSizes: FloatArray,
+        textFlags: IntArray,
+        textValues: Array<String>,
+        textFontPaths: Array<String>,
+        textFontNames: Array<String>,
+        rasterPageIndices: IntArray,
+        rasterBounds: FloatArray,
+        rasterWidths: IntArray,
+        rasterHeights: IntArray,
+        rasterPixelOffsets: IntArray,
+        rasterPixels: IntArray,
+        highlightPageIndices: IntArray,
+        highlightColors: IntArray,
+        highlightRectOffsets: IntArray,
+        highlightRectCounts: IntArray,
+        highlightRects: FloatArray,
+        highlightContents: Array<String>
+    ): Boolean
 
-    const val ANNOT_TEXT = 1         // Sticky Note
-    const val ANNOT_LINK = 2         // Link
-    const val ANNOT_HIGHLIGHT = 8    // Highlight
-    const val ANNOT_INK = 12         // Freehand drawing
-    const val ANNOT_WIDGET = 19
+    const val ANNOT_TEXT = PdfiumAnnotationSubtype.TEXT
+    const val ANNOT_LINK = PdfiumAnnotationSubtype.LINK
+    const val ANNOT_HIGHLIGHT = PdfiumAnnotationSubtype.HIGHLIGHT
+    const val ANNOT_INK = PdfiumAnnotationSubtype.INK
+    const val ANNOT_WIDGET = PdfiumAnnotationSubtype.WIDGET
 }

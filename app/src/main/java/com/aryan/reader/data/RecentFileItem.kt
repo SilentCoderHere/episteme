@@ -19,9 +19,7 @@
  */
 package com.aryan.reader.data
 
-import android.net.Uri
 import com.aryan.reader.FileType
-import androidx.core.net.toUri
 
 data class RecentFileItem(
     val bookId: String,
@@ -47,10 +45,13 @@ data class RecentFileItem(
     val isReflowPreferred: Boolean = false,
     val customName: String? = null,
     val highlightsJson: String? = null,
-    val fileSize: Long = 0L
-) {
-    fun getUri(): Uri? = uriString?.toUri()
-}
+    val fileSize: Long = 0L,
+    val seriesName: String? = null,
+    val seriesIndex: Double? = null,
+    val description: String? = null,
+    val folderTextMetadataParsed: Boolean = false,
+    val tags: List<TagEntity> = emptyList()
+)
 
 fun RecentFileEntity.toRecentFileItem(): RecentFileItem {
     return RecentFileItem(
@@ -77,7 +78,11 @@ fun RecentFileEntity.toRecentFileItem(): RecentFileItem {
         isReflowPreferred = this.isReflowPreferred,
         customName = this.customName,
         highlightsJson = this.highlights,
-        fileSize = this.fileSize
+        fileSize = this.fileSize,
+        seriesName = this.seriesName,
+        seriesIndex = this.seriesIndex,
+        description = this.description,
+        folderTextMetadataParsed = this.folderTextMetadataParsed
     )
 }
 
@@ -106,7 +111,11 @@ fun RecentFileItem.toRecentFileEntity(): RecentFileEntity {
         isReflowPreferred = this.isReflowPreferred,
         customName = this.customName,
         highlights = this.highlightsJson,
-        fileSize = this.fileSize
+        fileSize = this.fileSize,
+        seriesName = this.seriesName,
+        seriesIndex = this.seriesIndex,
+        description = this.description,
+        folderTextMetadataParsed = this.folderTextMetadataParsed
     )
 }
 
@@ -184,6 +193,9 @@ fun RecentFileSummary.toRecentFileItem(): RecentFileItem {
         isReflowPreferred = this.isReflowPreferred,
         customName = this.customName,
         highlightsJson = null,
-        fileSize = this.fileSize
+        fileSize = this.fileSize,
+        seriesName = this.seriesName,
+        seriesIndex = this.seriesIndex,
+        description = this.description
     )
 }

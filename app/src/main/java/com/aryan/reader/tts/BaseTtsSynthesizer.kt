@@ -34,6 +34,7 @@ import java.io.File
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -147,7 +148,35 @@ class BaseTtsSynthesizer(private val context: Context) {
         if (tts == null) return
 
         try {
-            val preferredVoiceName = loadNativeVoice(context) ?: return
+            val preferredVoiceName = loadNativeVoice(context)
+
+            if (preferredVoiceName.isNullOrBlank()) {
+                val defaultLocale = Locale.getDefault()
+                try {
+                    tts?.language = defaultLocale
+                } catch (e: Exception) {
+                    Timber.e(e, "BaseTts: Failed to restore default language")
+                }
+
+                val defaultVoice = try {
+                    tts?.defaultVoice ?: tts?.voices?.firstOrNull { voice ->
+                        voice.locale == defaultLocale && !voice.isNetworkConnectionRequired
+                    } ?: tts?.voices?.firstOrNull { voice ->
+                        voice.locale == defaultLocale
+                    }
+                } catch (e: Exception) {
+                    Timber.e(e, "BaseTts: Failed to query default voice")
+                    null
+                }
+
+                if (defaultVoice != null && tts?.voice?.name != defaultVoice.name) {
+                    Timber.d("BaseTts: Restoring system default voice to ${defaultVoice.name} (${defaultVoice.locale})")
+                    tts?.voice = defaultVoice
+                } else {
+                    Timber.d("BaseTts: Using engine default voice for locale $defaultLocale")
+                }
+                return
+            }
 
             if (tts?.voice?.name == preferredVoiceName) return
 
@@ -219,11 +248,16 @@ class BaseTtsSynthesizer(private val context: Context) {
 
                     try {
                         withTimeout(startTimeout) {
-                            startSignal.await()
+                            select {
+                                startSignal.onAwait { }
+                                resultDeferred.onAwait { }
+                            }
                         }
                     } catch (_: TimeoutCancellationException) {
-                        Timber.w("BaseTts: ZOMBIE DETECTED. onStart not received within ${startTimeout}ms.")
-                        throw ZombieEngineException()
+                        Timber.w(
+                            "BaseTts: onStart not received within ${startTimeout}ms for $utteranceId. " +
+                                "Continuing to wait for onDone because some engines omit or delay onStart for file synthesis."
+                        )
                     }
 
                     try {
@@ -268,5 +302,4 @@ class BaseTtsSynthesizer(private val context: Context) {
         Timber.d("TextToSpeech engine shut down.")
     }
 
-    private class ZombieEngineException : Exception("Engine failed to start")
 }

@@ -19,7 +19,7 @@
  */
 // EpubReaderScreen.kt
 @file:OptIn(ExperimentalSerializationApi::class) @file:Suppress("VariableNeverRead",
-    "UnusedVariable", "Unused", "SimplifyBooleanWithConstants"
+    "UnusedVariable", "Unused", "SimplifyBooleanWithConstants", "KotlinConstantConditions"
 )
 
 package com.aryan.reader.epubreader
@@ -35,6 +35,8 @@ import android.graphics.Bitmap
 import android.media.AudioManager
 import android.net.Uri
 import android.os.Build
+import android.view.RoundedCorner
+import android.view.View
 import android.webkit.WebView
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
@@ -119,9 +121,14 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.BiasAlignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageShader
+import androidx.compose.ui.graphics.ShaderBrush
+import androidx.compose.ui.graphics.TileMode
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
@@ -134,6 +141,7 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.core.content.edit
@@ -158,12 +166,19 @@ import com.aryan.reader.SearchResult
 import com.aryan.reader.SummarizationResult
 import com.aryan.reader.SummaryCacheManager
 import com.aryan.reader.TtsSettingsSheet
+import com.aryan.reader.TtsWordReplacementsSheet
+import com.aryan.reader.areReaderAiFeaturesEnabled
 import com.aryan.reader.countWords
+import com.aryan.reader.isByokCloudTtsAvailable
 import com.aryan.reader.data.CustomFontEntity
 import com.aryan.reader.epub.EpubBook
+import com.aryan.reader.epub.hasReadableExtractedContent
 import com.aryan.reader.fetchAiDefinition
 import com.aryan.reader.loadCustomThemes
+import com.aryan.reader.loadGlobalTextureTransparency
 import com.aryan.reader.loadReaderThemeId
+import com.aryan.reader.loadReaderTextureBitmap
+import com.aryan.reader.loadTtsReplacementPreferences
 import com.aryan.reader.paginatedreader.BookPaginator
 import com.aryan.reader.paginatedreader.CfiUtils
 import com.aryan.reader.paginatedreader.HeaderBlock
@@ -180,14 +195,18 @@ import com.aryan.reader.paginatedreader.data.BookCacheDatabase
 import com.aryan.reader.paginatedreader.semanticBlockModule
 import com.aryan.reader.rememberSearchState
 import com.aryan.reader.saveCustomThemes
+import com.aryan.reader.saveGlobalTextureTransparency
 import com.aryan.reader.saveReaderThemeId
+import com.aryan.reader.saveTtsReplacementPreferences
+import com.aryan.reader.shared.ReaderTtsReplacementPreferences
 import com.aryan.reader.tts.SpeakerSamplePlayer
 import com.aryan.reader.tts.TtsPlaybackManager
 import com.aryan.reader.tts.loadTtsMode
-import com.aryan.reader.tts.rememberTtsController
 import com.aryan.reader.tts.splitTextIntoChunks
+import com.aryan.reader.withTtsReplacements
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
@@ -218,6 +237,49 @@ private const val AUTO_SCROLL_LOCAL_MAX_PREFIX = "auto_scroll_local_max_"
 private const val MUSICIAN_MODE_KEY = "musician_mode_enabled"
 private const val KEEP_SCREEN_ON_KEY = "keep_screen_on_enabled"
 private const val HIDDEN_TOOLS_KEY = "hidden_reader_tools"
+private const val TOOL_ORDER_KEY = "reader_tool_order"
+private const val BOTTOM_TOOLS_KEY = "reader_bottom_tools"
+private const val TTS_LOCATE_REASON_INITIAL_RESTORE = "initial_restore"
+private const val TTS_LOCATE_REASON_LIFECYCLE_RESUME = "lifecycle_resume"
+private const val TTS_LOCATE_REASON_OVERLAY = "overlay"
+
+private const val TAG_LINK_NAV = "LINK_NAV"
+
+private fun View.bottomRoundedCornerRadiusPx(): Int {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return 0
+
+    val insets = rootWindowInsets ?: return 0
+    return max(
+        insets.getRoundedCorner(RoundedCorner.POSITION_BOTTOM_LEFT)?.radius ?: 0,
+        insets.getRoundedCorner(RoundedCorner.POSITION_BOTTOM_RIGHT)?.radius ?: 0
+    )
+}
+
+@Composable
+private fun rememberBottomRoundedCornerPadding(view: View): Dp {
+    val density = LocalDensity.current
+    val configuration = LocalConfiguration.current
+    var radiusPx by remember(view) { mutableIntStateOf(view.bottomRoundedCornerRadiusPx()) }
+
+    DisposableEffect(
+        view,
+        configuration.orientation,
+        configuration.screenWidthDp,
+        configuration.screenHeightDp
+    ) {
+        val listener = View.OnLayoutChangeListener { updatedView, _, _, _, _, _, _, _, _ ->
+            radiusPx = updatedView.bottomRoundedCornerRadiusPx()
+        }
+        view.addOnLayoutChangeListener(listener)
+        radiusPx = view.bottomRoundedCornerRadiusPx()
+
+        onDispose {
+            view.removeOnLayoutChangeListener(listener)
+        }
+    }
+
+    return with(density) { radiusPx.toDp() }
+}
 
 private fun saveHiddenTools(context: Context, hiddenTools: Set<String>) {
     val prefs = context.getSharedPreferences("reader_prefs", Context.MODE_PRIVATE)
@@ -227,6 +289,34 @@ private fun saveHiddenTools(context: Context, hiddenTools: Set<String>) {
 private fun loadHiddenTools(context: Context): Set<String> {
     val prefs = context.getSharedPreferences("reader_prefs", Context.MODE_PRIVATE)
     return prefs.getStringSet(HIDDEN_TOOLS_KEY, emptySet()) ?: emptySet()
+}
+
+private fun saveToolOrder(context: Context, toolOrder: List<ReaderTool>) {
+    val prefs = context.getSharedPreferences("reader_prefs", Context.MODE_PRIVATE)
+    prefs.edit { putString(TOOL_ORDER_KEY, toolOrder.joinToString(",") { it.name }) }
+}
+
+private fun loadToolOrder(context: Context): List<ReaderTool> {
+    val prefs = context.getSharedPreferences("reader_prefs", Context.MODE_PRIVATE)
+    val savedTools = prefs.getString(TOOL_ORDER_KEY, null)
+        ?.split(',')
+        ?.filter { it.isNotBlank() }
+        ?.mapNotNull { name -> ReaderTool.entries.firstOrNull { it.name == name } }
+        .orEmpty()
+    return (savedTools + ReaderTool.entries.filterNot { it in savedTools }).distinct()
+}
+
+private fun saveBottomTools(context: Context, bottomTools: Set<String>) {
+    val prefs = context.getSharedPreferences("reader_prefs", Context.MODE_PRIVATE)
+    prefs.edit { putStringSet(BOTTOM_TOOLS_KEY, bottomTools) }
+}
+
+private fun loadBottomTools(context: Context): Set<String> {
+    val prefs = context.getSharedPreferences("reader_prefs", Context.MODE_PRIVATE)
+    return prefs.getStringSet(
+        BOTTOM_TOOLS_KEY,
+        ReaderTool.entries.filter { it.category == "Bottom Bar" }.map { it.name }.toSet()
+    ) ?: ReaderTool.entries.filter { it.category == "Bottom Bar" }.map { it.name }.toSet()
 }
 
 private fun saveKeepScreenOn(context: Context, isEnabled: Boolean) {
@@ -333,7 +423,7 @@ private const val PREF_EXTERNAL_TRANSLATE_PKG = "external_translate_package"
 private const val PREF_EXTERNAL_SEARCH_PKG = "external_search_package"
 
 private fun loadUseOnlineDict(context: Context): Boolean {
-    @Suppress("KotlinConstantConditions") if (BuildConfig.FLAVOR == "oss") return false
+    @Suppress("KotlinConstantConditions") if (BuildConfig.FLAVOR == "oss" && BuildConfig.IS_OFFLINE) return false
     val prefs = context.getSharedPreferences("reader_prefs", Context.MODE_PRIVATE)
     return prefs.getBoolean(PREF_USE_ONLINE_DICT, true)
 }
@@ -376,6 +466,7 @@ private fun saveExternalSearchPackage(context: Context, packageName: String) {
 const val PREF_READER_THEME = "reader_theme_id"
 const val PREF_CUSTOM_THEMES = "custom_themes_json"
 
+@UnstableApi
 @RequiresApi(Build.VERSION_CODES.VANILLA_ICE_CREAM)
 @Composable
 fun EpubReaderScreen(
@@ -411,6 +502,48 @@ fun EpubReaderScreen(
         }
     } else null
 
+    val hasValidExtractionBasePath = remember(epubBook.extractionBasePath, epubBook.chapters) {
+        epubBook.hasReadableExtractedContent()
+    }
+    var requestedContentRecovery by remember(epubBook.extractionBasePath, uiState.selectedBookId) {
+        mutableStateOf(false)
+    }
+
+    LaunchedEffect(hasValidExtractionBasePath, uiState.selectedBookId, uiState.selectedEpubUri) {
+        if (!hasValidExtractionBasePath && !requestedContentRecovery && uiState.selectedEpubUri != null) {
+            requestedContentRecovery = true
+            viewModel.recoverSelectedEpubContent()
+        }
+    }
+
+    if (!hasValidExtractionBasePath) {
+        val isRecovering = uiState.isLoading || (requestedContentRecovery && uiState.errorMessage == null)
+        val message = uiState.errorMessage ?: if (isRecovering) {
+            "Recovering book content..."
+        } else {
+            "Book content not found. Reopen the book to recreate its cache."
+        }
+
+        Box(modifier = Modifier.fillMaxSize()) {
+            if (isRecovering) {
+                CircularProgressIndicator(modifier = Modifier.align(Alignment.Center))
+            }
+            Text(
+                text = message,
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(24.dp),
+                color = if (uiState.errorMessage != null) {
+                    MaterialTheme.colorScheme.error
+                } else {
+                    MaterialTheme.colorScheme.onSurfaceVariant
+                },
+                textAlign = TextAlign.Center
+            )
+        }
+        return
+    }
+
     EpubReaderHost(
         epubBook = epubBook,
         renderMode = renderMode,
@@ -443,6 +576,7 @@ fun EpubReaderScreen(
                 }
             }
         } else null,
+        stableBookId = uiState.selectedBookId,
         viewModel = viewModel
     )
 }
@@ -473,6 +607,7 @@ fun EpubReaderHost(
     onImportFont: (Uri) -> Unit,
     onToggleReflow: ((Int) -> Unit)? = null,
     onDeleteReflow: (() -> Unit)? = null,
+    stableBookId: String? = null,
     viewModel: MainViewModel
 ) {
     val view = LocalView.current
@@ -516,10 +651,10 @@ fun EpubReaderHost(
 
     var systemUiMode by remember { mutableStateOf(loadSystemUiMode(context)) }
     var pageInfoMode by remember { mutableStateOf(loadPageInfoMode(context)) }
+    var pageInfoPosition by remember { mutableStateOf(loadPageInfoPosition(context)) }
     var pullToTurnEnabled by remember { mutableStateOf(loadPullToTurn(context)) }
     var pullToTurnMultiplier by remember { mutableFloatStateOf(loadPullToTurnMultiplier(context)) }
     var showVisualOptionsSheet by remember { mutableStateOf(false) }
-    var removeEdgePadding by remember { mutableStateOf(loadRemoveEdgePadding(context)) }
 
     var volumeScrollEnabled by remember {
         mutableStateOf(loadVolumeScrollSetting(context))
@@ -536,16 +671,21 @@ fun EpubReaderHost(
     var currentTtsMode by remember {
         mutableStateOf(
             loadTtsMode(context).let {
-                if (BuildConfig.FLAVOR == "oss") TtsPlaybackManager.TtsMode.BASE else it
+                if (BuildConfig.FLAVOR == "oss" && !isByokCloudTtsAvailable(context)) TtsPlaybackManager.TtsMode.BASE else it
             }
         )
     }
 
-    val locatorConverter = remember(context) {
+    val readerCacheBookId = remember(stableBookId, epubBook.title, epubBook.fileName) {
+        stableBookId ?: if (epubBook.fileName.length > 20) epubBook.fileName else getBookIdForPrefs(epubBook.title)
+    }
+
+    val locatorConverter = remember(context, readerCacheBookId) {
         LocatorConverter(
             bookCacheDao = BookCacheDatabase.getDatabase(context).bookCacheDao(),
             proto = ProtoBuf { serializersModule = semanticBlockModule },
-            context = context
+            context = context,
+            stableBookId = readerCacheBookId
         )
     }
 
@@ -571,9 +711,7 @@ fun EpubReaderHost(
     var isAutoScrollCollapsed by remember { mutableStateOf(false) }
     var isTtsCollapsed by remember { mutableStateOf(false) }
 
-    val bookId = remember(epubBook.title, epubBook.fileName) {
-        if (epubBook.fileName.length > 20) epubBook.fileName else getBookIdForPrefs(epubBook.title)
-    }
+    val bookId = readerCacheBookId
     var isAutoScrollLocal by remember { mutableStateOf(loadAutoScrollLocalMode(context, bookId)) }
 
     val initialSettings = remember(isAutoScrollLocal) {
@@ -692,18 +830,19 @@ fun EpubReaderHost(
     }
 
     var hiddenTools by remember { mutableStateOf(loadHiddenTools(context)) }
+    var toolOrder by remember { mutableStateOf(loadToolOrder(context)) }
+    var bottomTools by remember { mutableStateOf(loadBottomTools(context)) }
     var showCustomizeToolsSheet by remember { mutableStateOf(false) }
 
     var showDictionaryUpsellDialog by remember { mutableStateOf(false) }
     var showSummarizationUpsellDialog by remember { mutableStateOf(false) }
 
     @Suppress("KotlinConstantConditions") val onDictionaryLookup = { word: String ->
-        val isOss = BuildConfig.FLAVOR == "oss"
-        val effectiveUseOnline = !isOss && useOnlineDictionary
+        val effectiveUseOnline = areReaderAiFeaturesEnabled(context) && useOnlineDictionary
 
         if (effectiveUseOnline) {
             val wordCount = countWords(word)
-            if (wordCount > 1 && !isProUser) {
+            if (BuildConfig.FLAVOR != "oss" && wordCount > 1 && !isProUser) {
                 showDictionaryUpsellDialog = true
             } else {
                 selectedTextForAi = word
@@ -767,8 +906,12 @@ fun EpubReaderHost(
     var currentRenderMode by remember(renderMode) { mutableStateOf(renderMode) }
     var chapterToLoadOnSwitch by remember { mutableStateOf<Int?>(null) }
     var lastKnownLocator by remember(initialLocator) { mutableStateOf(initialLocator) }
+    var paginatedReconfigurationAnchor by remember { mutableStateOf<Locator?>(null) }
+    var isPaginatedReconfigurationRestoring by remember { mutableStateOf(false) }
 
     val bottomPadding = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
+    val roundedCornerBottomPadding = rememberBottomRoundedCornerPadding(view)
+    val pageInfoCornerBottomPadding = roundedCornerBottomPadding.coerceAtMost(8.dp)
 
     var bookmarks by remember(epubBook.title) {
         mutableStateOf(
@@ -780,18 +923,7 @@ fun EpubReaderHost(
 
     LaunchedEffect(bookmarks) {
         Timber.d("Bookmarks changed, saving...")
-        val stringSet = bookmarks.map { bookmark ->
-            JSONObject().apply {
-                put("cfi", bookmark.cfi)
-                put("chapterTitle", bookmark.chapterTitle)
-                put("label", bookmark.label)
-                put("snippet", bookmark.snippet)
-                bookmark.pageInChapter?.let { put("pageInChapter", it) }
-                bookmark.totalPagesInChapter?.let { put("totalPagesInChapter", it) }
-                put("chapterIndex", bookmark.chapterIndex)
-            }.toString()
-        }
-        onBookmarksChanged(JSONArray(stringSet).toString())
+        onBookmarksChanged(bookmarksToJson(bookmarks))
     }
 
     var activeBookmarkInVerticalView by remember { mutableStateOf<Bookmark?>(null) }
@@ -819,6 +951,12 @@ fun EpubReaderHost(
     var ttsShouldStartOnChapterLoad by remember { mutableStateOf(false) }
     var userStoppedTts by remember { mutableStateOf(false) }
     var ttsChapterIndex by remember { mutableStateOf<Int?>(null) }
+    var pendingTtsLocateRequest by remember { mutableStateOf(false) }
+    var pendingTtsLocateReason by remember { mutableStateOf<String?>(null) }
+    var hasQueuedInitialTtsLocate by remember(epubBook.title) { mutableStateOf(false) }
+    var isDetachedFromVerticalTts by remember { mutableStateOf(false) }
+    var detachedVerticalTtsChunkKey by remember { mutableStateOf<String?>(null) }
+    var suppressNextVerticalTtsDetach by remember { mutableStateOf(false) }
 
     var searchHighlightTarget by remember { mutableStateOf<SearchResult?>(null) }
     var lastHighlightClickTime by remember { mutableLongStateOf(0L) }
@@ -851,8 +989,9 @@ fun EpubReaderHost(
     val paginatedPagerState = rememberPagerState(pageCount = {
         (paginator as? BookPaginator)?.totalPageCount ?: 0
     })
+    var isPagerInitialized by remember(initialLocator) { mutableStateOf(initialLocator == null) }
 
-    val ttsController = rememberTtsController()
+    val ttsController = viewModel.ttsController
     val ttsState by ttsController.ttsState.collectAsState()
 
     val totalBookLengthChars = remember(chapters) {
@@ -936,6 +1075,9 @@ fun EpubReaderHost(
     var currentFontSizeEm by remember(initialFormatSettings) { mutableFloatStateOf(initialFormatSettings.fontSize) }
     var currentLineHeight by remember(initialFormatSettings) { mutableFloatStateOf(initialFormatSettings.lineHeight) }
     var currentParagraphGap by remember(initialFormatSettings) { mutableFloatStateOf(initialFormatSettings.paragraphGap) }
+    var currentImageSize by remember(initialFormatSettings) { mutableFloatStateOf(initialFormatSettings.imageSize) }
+    var currentHorizontalMargin by remember(initialFormatSettings) { mutableFloatStateOf(initialFormatSettings.horizontalMargin) }
+    var currentVerticalMargin by remember(initialFormatSettings) { mutableFloatStateOf(initialFormatSettings.verticalMargin) }
     var currentTextAlign by remember(initialFormatSettings) { mutableStateOf(initialFormatSettings.textAlign) }
     var currentFontFamily by remember(initialFormatSettings) { mutableStateOf(initialFormatSettings.font) }
     var currentCustomFontPath by remember(initialFormatSettings) { mutableStateOf(initialFormatSettings.customPath) }
@@ -951,14 +1093,14 @@ fun EpubReaderHost(
     var showFontSelectionSheet by remember { mutableStateOf(false) }
     val fontSheetState = rememberModalBottomSheetState()
 
-    LaunchedEffect(currentFontSizeEm, currentLineHeight, currentParagraphGap, currentFontFamily, currentCustomFontPath, currentTextAlign, isFormatLocal) {
+    LaunchedEffect(currentFontSizeEm, currentLineHeight, currentParagraphGap, currentImageSize, currentHorizontalMargin, currentVerticalMargin, currentFontFamily, currentCustomFontPath, currentTextAlign, isFormatLocal) {
         if (isFormatLocal) {
             saveLocalReaderSettings(
-                context, bookId, currentFontSizeEm, currentLineHeight, currentParagraphGap, currentFontFamily, currentCustomFontPath, currentTextAlign
+                context, bookId, currentFontSizeEm, currentLineHeight, currentParagraphGap, currentImageSize, currentHorizontalMargin, currentVerticalMargin, currentFontFamily, currentCustomFontPath, currentTextAlign
             )
         } else {
             saveReaderSettings(
-                context, currentFontSizeEm, currentLineHeight, currentParagraphGap, currentFontFamily, currentCustomFontPath, currentTextAlign
+                context, currentFontSizeEm, currentLineHeight, currentParagraphGap, currentImageSize, currentHorizontalMargin, currentVerticalMargin, currentFontFamily, currentCustomFontPath, currentTextAlign
             )
         }
     }
@@ -1069,12 +1211,19 @@ fun EpubReaderHost(
 
     var showPermissionRationaleDialog by remember { mutableStateOf(false) }
     var showTtsSettingsSheet by remember { mutableStateOf(false) }
+    var showTtsReplacementsSheet by remember { mutableStateOf(false) }
     var showTtsControlsSheet by remember { mutableStateOf(false) }
     var showThemePanel by remember { mutableStateOf(false) }
     var showPaletteManager by remember { mutableStateOf(false) }
+    var ttsReplacementPreferences by remember { mutableStateOf(loadTtsReplacementPreferences(context)) }
+    val updateTtsReplacementPreferences: (ReaderTtsReplacementPreferences) -> Unit = { next ->
+        ttsReplacementPreferences = next
+        saveTtsReplacementPreferences(context, next)
+    }
 
     var currentThemeId by remember { mutableStateOf(loadReaderThemeId(context)) }
     var customThemes by remember { mutableStateOf(loadCustomThemes(context)) }
+    var globalTextureTransparency by remember { mutableFloatStateOf(loadGlobalTextureTransparency(context)) }
 
     val activeTheme = remember(currentThemeId, customThemes) {
         BuiltInThemes.find { it.id == currentThemeId }
@@ -1096,6 +1245,19 @@ fun EpubReaderHost(
         } else activeTheme.textColor
     }
     val activeTextureId = activeTheme.textureId
+    val activeTextureAlpha = 1f - globalTextureTransparency
+    val activeTextureBitmap = remember(activeTextureId) {
+        loadReaderTextureBitmap(context, activeTextureId)
+    }
+    val activeTextureModifier = activeTextureBitmap?.let { bitmap ->
+        Modifier.drawBehind {
+            drawRect(
+                brush = ShaderBrush(ImageShader(bitmap, TileMode.Repeated, TileMode.Repeated)),
+                blendMode = BlendMode.SrcOver,
+                alpha = activeTextureAlpha.coerceIn(0f, 1f)
+            )
+        }
+    } ?: Modifier
 
     val infoBarBgColor = remember(effectiveBg, isDarkTheme) {
         val overlayAlpha = if (isDarkTheme) 0.08f else 0.06f
@@ -1116,6 +1278,223 @@ fun EpubReaderHost(
         }
     }
 
+    fun isActiveReaderTtsForCurrentBook(): Boolean {
+        val isReaderSession = ttsState.playbackSource == "READER"
+        val hasReaderSessionState =
+            ttsState.isPlaying ||
+                ttsState.isLoading ||
+                ttsState.sessionFinished ||
+                ttsState.chapterIndex != null ||
+                !ttsState.currentWordSourceCfi.isNullOrBlank() ||
+                !ttsState.sourceCfi.isNullOrBlank() ||
+                !ttsState.currentText.isNullOrBlank()
+        val isSameBook = ttsState.bookTitle == null || ttsState.bookTitle == epubBook.title
+        return isReaderSession && hasReaderSessionState && isSameBook
+    }
+
+    fun getActiveTtsChapterIndex(): Int? = ttsState.chapterIndex ?: ttsChapterIndex
+
+    fun buildTtsDiagState(): String {
+        val sourceCfiPreview = ttsState.sourceCfi?.take(48)
+        val pendingCfiPreview = cfiToLoad?.take(48)
+        return "render=$currentRenderMode currentChapter=$currentChapterIndex activeTtsChapter=${getActiveTtsChapterIndex()} " +
+            "pendingLocate=$pendingTtsLocateRequest locateReason=$pendingTtsLocateReason detached=$isDetachedFromVerticalTts suppressDetach=$suppressNextVerticalTtsDetach " +
+            "chunkOverride=$chunkTargetOverride pendingCfi=$pendingCfiPreview ttsCfi=$sourceCfiPreview offset=${ttsState.startOffsetInSource}"
+    }
+
+    fun logTtsChapterDiag(message: String) {
+        Timber.tag("TTS_CHAPTER_CHANGE_DIAG").d("$message | ${buildTtsDiagState()}")
+    }
+
+    fun currentTtsChunkKey(): String? {
+        val cfi = ttsState.sourceCfi?.takeIf { it.isNotBlank() } ?: return null
+        val offset = ttsState.startOffsetInSource.takeIf { it >= 0 } ?: return null
+        return "$cfi@$offset"
+    }
+
+    fun queuePendingTtsLocate(reason: String) {
+        pendingTtsLocateReason = reason
+        pendingTtsLocateRequest = true
+    }
+
+    fun detachVerticalReaderFromTts(reason: String) {
+        logTtsChapterDiag("Detaching vertical reader from active TTS chapter. reason=$reason")
+        isDetachedFromVerticalTts = true
+        detachedVerticalTtsChunkKey = currentTtsChunkKey()
+        pendingTtsLocateRequest = false
+        pendingTtsLocateReason = null
+        isNavigatingToPosition = false
+        suppressNextVerticalTtsDetach = false
+    }
+
+    fun clearPendingTtsRelocationState(reason: String) {
+        logTtsChapterDiag("Clearing pending TTS relocation state. reason=$reason")
+        pendingTtsLocateRequest = false
+        pendingTtsLocateReason = null
+        chunkTargetOverride = null
+        cfiToLoad = null
+        fragmentToLoad = null
+        isNavigatingToPosition = false
+        suppressNextVerticalTtsDetach = false
+    }
+
+    suspend fun saveResolvedLocatorPosition(locator: Locator, cfiForWebView: String?) {
+        lastKnownLocator = locator
+
+        val chapterLengthChars = chapters.getOrNull(locator.chapterIndex)?.plainTextContent?.length?.toLong() ?: 0L
+        val exactOffset = locatorConverter.getTextOffset(epubBook, locator)?.coerceAtLeast(0) ?: 0
+        val boundedOffset = exactOffset.coerceAtMost(chapterLengthChars.toInt()).toLong()
+
+        val progress = if (totalBookLengthChars > 0) {
+            val completedCharsInPreviousChapters =
+                chapters.take(locator.chapterIndex).sumOf { it.plainTextContent.length.toLong() }
+            val totalCharsScrolled = completedCharsInPreviousChapters + boundedOffset
+            val calculatedProgress =
+                ((totalCharsScrolled.toDouble() / totalBookLengthChars.toDouble()) * 100.0).toFloat()
+            val isAtEndOfBook = locator.chapterIndex == chapters.lastIndex && chapterLengthChars > 0 && boundedOffset >= chapterLengthChars
+            if (isAtEndOfBook) 100f else calculatedProgress
+        } else {
+            0f
+        }
+
+        Timber.tag("TTS_LOCATE")
+            .d("Saving resolved locator position. chapter=${locator.chapterIndex}, block=${locator.blockIndex}, progress=$progress")
+        onSavePosition(locator, cfiForWebView, progress)
+    }
+
+    fun ensureVerticalChunksLoaded(targetChunk: Int) {
+        if (targetChunk >= loadedChunkCount) {
+            val chunksToInject = loadedChunkCount..targetChunk
+            chunksToInject.forEach { idx ->
+                val content = chapterChunks.getOrNull(idx) ?: return@forEach
+                webViewRefForTts?.evaluateJavascript(
+                    "javascript:window.virtualization.appendChunk($idx, '${escapeJsString(content)}');",
+                    null
+                )
+            }
+            loadUpToChunkIndex = targetChunk
+            loadedChunkCount = max(loadedChunkCount, targetChunk + 1)
+        } else {
+            chapterChunks.getOrNull(targetChunk)?.let { content ->
+                webViewRefForTts?.evaluateJavascript(
+                    "javascript:window.virtualization.appendChunk($targetChunk, '${escapeJsString(content)}');",
+                    null
+                )
+            }
+        }
+    }
+
+    suspend fun saveActiveTtsPosition(reason: String): Boolean {
+        if (!isActiveReaderTtsForCurrentBook()) return false
+
+        val chapterIndex = getActiveTtsChapterIndex() ?: return false
+        val sourceCfi = (ttsState.currentWordSourceCfi ?: ttsState.sourceCfi)?.takeIf { it.isNotBlank() } ?: return false
+        val locator = locatorConverter.getLocatorFromCfi(epubBook, chapterIndex, sourceCfi) ?: return false
+
+        logTtsChapterDiag("Persisting active TTS position. reason=$reason chapter=$chapterIndex cfi=${sourceCfi.take(48)}")
+        saveResolvedLocatorPosition(locator, sourceCfi)
+        return true
+    }
+
+    suspend fun navigateToActiveTtsPosition(reason: String): Boolean {
+        if (!isActiveReaderTtsForCurrentBook()) {
+            logTtsChapterDiag("navigateToActiveTtsPosition aborted: inactive reader TTS. reason=$reason")
+            return false
+        }
+
+        val chapterIndex = getActiveTtsChapterIndex() ?: run {
+            logTtsChapterDiag("navigateToActiveTtsPosition aborted: no active TTS chapter. reason=$reason")
+            return false
+        }
+        val sourceCfi = (ttsState.currentWordSourceCfi ?: ttsState.sourceCfi)?.takeIf { it.isNotBlank() } ?: run {
+            logTtsChapterDiag("navigateToActiveTtsPosition aborted: no active source CFI. reason=$reason")
+            return false
+        }
+        val sourceOffset =
+            ttsState.currentWordStartOffset.takeIf { it >= 0 }
+                ?: ttsState.startOffsetInSource.takeIf { it >= 0 }
+        val locator = locatorConverter.getLocatorFromCfi(epubBook, chapterIndex, sourceCfi) ?: run {
+            logTtsChapterDiag("navigateToActiveTtsPosition aborted: locator conversion failed. reason=$reason chapter=$chapterIndex cfi=${sourceCfi.take(48)}")
+            return false
+        }
+        val targetChunk = max(0, locator.blockIndex / 20)
+
+        saveResolvedLocatorPosition(locator, sourceCfi)
+        logTtsChapterDiag("Navigating to active TTS position. reason=$reason targetChapter=$chapterIndex targetChunk=$targetChunk sourceOffset=$sourceOffset")
+
+        when (currentRenderMode) {
+            RenderMode.VERTICAL_SCROLL -> {
+                isNavigatingToPosition = true
+                initialScrollTargetForChapter = null
+                isDetachedFromVerticalTts = false
+                detachedVerticalTtsChunkKey = null
+                suppressNextVerticalTtsDetach = true
+
+                if (chapterIndex != currentChapterIndex) {
+                    logTtsChapterDiag("Vertical locate switching chapters. reason=$reason from=$currentChapterIndex to=$chapterIndex targetChunk=$targetChunk")
+                    chunkTargetOverride = targetChunk
+                    cfiToLoad = sourceCfi
+                    currentScrollYPosition = 0
+                    currentScrollHeightValue = 0
+                    currentChapterIndex = chapterIndex
+                } else {
+                    if (webViewRefForTts == null) {
+                        logTtsChapterDiag("Vertical locate queued because WebView is null. reason=$reason targetChunk=$targetChunk")
+                        chunkTargetOverride = targetChunk
+                        cfiToLoad = sourceCfi
+                    } else {
+                        logTtsChapterDiag("Vertical locate in current chapter. reason=$reason targetChunk=$targetChunk usingHighlight=${ttsState.currentText?.isNotBlank() == true}")
+                        ensureVerticalChunksLoaded(targetChunk)
+                        val chunkText = ttsState.currentText?.takeIf { it.isNotBlank() }
+                        val chunkStartOffset = ttsState.startOffsetInSource.takeIf { it >= 0 }
+                        if (chunkText != null && chunkStartOffset != null) {
+                            webViewRefForTts?.evaluateJavascript(
+                                "javascript:window.highlightFromCfi('${escapeJsString(sourceCfi)}', '${escapeJsString(chunkText)}', $chunkStartOffset);",
+                                null
+                            )
+                        } else {
+                            webViewRefForTts?.evaluateJavascript(
+                                "javascript:window.scrollToCfi('${escapeJsString(sourceCfi)}');",
+                                null
+                            )
+                        }
+                        scope.launch {
+                            delay(3000L)
+                            if (isNavigatingToPosition) {
+                                isNavigatingToPosition = false
+                            }
+                        }
+                    }
+                }
+                return true
+            }
+
+            RenderMode.PAGINATED -> {
+                if (!isPagerInitialized) {
+                    logTtsChapterDiag("Paginated locate aborted: pager not initialized. reason=$reason")
+                    return false
+                }
+                val bookPaginator = paginator as? BookPaginator ?: run {
+                    logTtsChapterDiag("Paginated locate aborted: paginator unavailable. reason=$reason")
+                    return false
+                }
+                val pageIndex =
+                    sourceOffset?.let { bookPaginator.findPageForCfiAndOffset(chapterIndex, sourceCfi, it) }
+                        ?: bookPaginator.findPageForLocator(locator)
+                        ?: bookPaginator.chapterStartPageIndices[chapterIndex] ?: run {
+                            logTtsChapterDiag("Paginated locate aborted: page lookup failed. reason=$reason chapter=$chapterIndex")
+                            return false
+                        }
+
+                logTtsChapterDiag("Paginated locate scrolling to page=$pageIndex. reason=$reason")
+                isNavigatingToPosition = true
+                paginatedPagerState.scrollToPage(pageIndex)
+                isNavigatingToPosition = false
+                return true
+            }
+        }
+    }
+
     val onHighlightColorChange: (UserHighlight, HighlightColor) -> Unit = { targetHighlight, newColor ->
         val index = userHighlights.indexOfFirst { it.cfi == targetHighlight.cfi }
         if (index != -1) {
@@ -1129,7 +1508,7 @@ fun EpubReaderHost(
     }
 
     fun startTts() {
-        if (currentTtsMode == TtsPlaybackManager.TtsMode.CLOUD && credits <= 0) {
+        if (BuildConfig.FLAVOR != "oss" && currentTtsMode == TtsPlaybackManager.TtsMode.CLOUD && credits <= 0) {
             showInsufficientCreditsDialog = true
             return
         }
@@ -1164,10 +1543,12 @@ fun EpubReaderHost(
                             val coverUriString = coverImagePath?.let { Uri.fromFile(File(it)).toString() }
                             ttsChapterIndex = chapterIndex
                             ttsController.start(
-                                chunks = ttsChunks,
+                                chunks = ttsChunks.withTtsReplacements(ttsReplacementPreferences, bookId),
                                 bookTitle = epubBook.title,
                                 chapterTitle = chapterTitle,
                                 coverImageUri = coverUriString,
+                                chapterIndex = chapterIndex,
+                                totalChapters = chapters.size,
                                 ttsMode = currentTtsMode,
                                 playbackSource = "READER",
                                 authToken = token
@@ -1187,7 +1568,7 @@ fun EpubReaderHost(
     )
 
     fun startTtsFromSelectionPaginated(baseCfi: String, startOffset: Int) {
-        if (currentTtsMode == TtsPlaybackManager.TtsMode.CLOUD && credits <= 0) {
+        if (BuildConfig.FLAVOR != "oss" && currentTtsMode == TtsPlaybackManager.TtsMode.CLOUD && credits <= 0) {
             showInsufficientCreditsDialog = true
             return
         }
@@ -1215,7 +1596,11 @@ fun EpubReaderHost(
                     val relativeOffset = startOffset - target.startOffsetInSource
                     val safeRelativeOffset = relativeOffset.coerceIn(0, target.text.length)
                     val slicedText = target.text.substring(safeRelativeOffset)
-                    val newChunk = target.copy(text = slicedText, startOffsetInSource = startOffset)
+                    val newChunk = target.copy(
+                        text = slicedText,
+                        startOffsetInSource = startOffset,
+                        spokenText = slicedText,
+                    )
 
                     val remainingChunks = mutableListOf(newChunk)
                     remainingChunks.addAll(chunks.subList(foundIdx + 1, chunks.size))
@@ -1226,10 +1611,12 @@ fun EpubReaderHost(
                         val chapterTitle = chapters.getOrNull(chapterIndex)?.title
                         val coverUriString = coverImagePath?.let { Uri.fromFile(File(it)).toString() }
                         ttsController.start(
-                            chunks = remainingChunks,
+                            chunks = remainingChunks.withTtsReplacements(ttsReplacementPreferences, bookId),
                             bookTitle = epubBook.title,
                             chapterTitle = chapterTitle,
                             coverImageUri = coverUriString,
+                            chapterIndex = chapterIndex,
+                            totalChapters = chapters.size,
                             ttsMode = currentTtsMode,
                             playbackSource = "READER",
                             authToken = token
@@ -1269,6 +1656,8 @@ fun EpubReaderHost(
         ttsChapterIndex = ttsChapterIndex,
         onTtsChapterIndexChange = { newIndex -> ttsChapterIndex = newIndex },
         onNavigateToChapter = { nextIndex ->
+            Timber.tag(TAG_LINK_NAV)
+                .d("[CHAPTER-NAV] source=TTS_CHAPTER_CHANGE, from=$currentChapterIndex, to=$nextIndex")
             Timber.tag("TTS_CHAPTER_CHANGE_DIAG").d("TtsSessionObserver triggered onNavigateToChapter to: $nextIndex")
             initialScrollTargetForChapter = ChapterScrollPosition.START
             cfiToLoad = null
@@ -1285,12 +1674,15 @@ fun EpubReaderHost(
         currentTtsMode = currentTtsMode,
         getAuthToken = { viewModel.getAuthToken() },
         locatorConverter = locatorConverter,
-        epubBook = epubBook
+        epubBook = epubBook,
+        ttsReplacementPreferences = ttsReplacementPreferences,
+        ttsReplacementBookId = bookId
     )
 
     TtsHighlightHandler(
         ttsState = ttsState,
         currentRenderMode = currentRenderMode,
+        currentChapterIndex = currentChapterIndex,
         webViewRef = webViewRefForTts,
         paginator = paginator,
         pagerState = paginatedPagerState,
@@ -1304,18 +1696,6 @@ fun EpubReaderHost(
         currentChapterIndex = currentChapterIndex,
         focusRequester = searchFocusRequester
     )
-
-    if (epubBook.extractionBasePath.isBlank() || !File(epubBook.extractionBasePath).exists()) {
-        Timber.e("Extraction base path is blank or does not exist: ${epubBook.extractionBasePath}"
-        )
-        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            Text(
-                "Error: Book content not found. Path: ${epubBook.extractionBasePath}",
-                color = MaterialTheme.colorScheme.error
-            )
-        }
-        return
-    }
 
     val totalPagesInCurrentChapter = remember(currentScrollHeightValue, currentClientHeightValue) {
         if (currentClientHeightValue > 0) {
@@ -1355,12 +1735,170 @@ fun EpubReaderHost(
 
     val latestChapterIndex by rememberUpdatedState(currentChapterIndex)
 
+    LaunchedEffect(ttsState.bookTitle, ttsState.chapterIndex, ttsState.sourceCfi, ttsState.playbackSource) {
+        if (!hasQueuedInitialTtsLocate && isActiveReaderTtsForCurrentBook()) {
+            logTtsChapterDiag("Queueing initial TTS locate from active session restoration")
+            queuePendingTtsLocate(TTS_LOCATE_REASON_INITIAL_RESTORE)
+            hasQueuedInitialTtsLocate = true
+        }
+    }
+
+    LaunchedEffect(
+        pendingTtsLocateRequest,
+        pendingTtsLocateReason,
+        currentRenderMode,
+        webViewRefForTts,
+        paginator,
+        isPagerInitialized,
+        ttsState.bookTitle,
+        ttsState.chapterIndex,
+        ttsChapterIndex,
+        ttsState.sourceCfi,
+        loadedChunkCount,
+        chapterChunks.size,
+        isDetachedFromVerticalTts
+    ) {
+        if (!pendingTtsLocateRequest) return@LaunchedEffect
+        if (!isActiveReaderTtsForCurrentBook()) {
+            logTtsChapterDiag("Dropping pending TTS locate because session is no longer active for this book")
+            pendingTtsLocateRequest = false
+            pendingTtsLocateReason = null
+            return@LaunchedEffect
+        }
+
+        if (
+            currentRenderMode == RenderMode.VERTICAL_SCROLL &&
+            isDetachedFromVerticalTts &&
+            pendingTtsLocateReason != TTS_LOCATE_REASON_OVERLAY
+        ) {
+            logTtsChapterDiag("Dropping automatic TTS locate because the vertical reader is intentionally detached")
+            pendingTtsLocateRequest = false
+            pendingTtsLocateReason = null
+            return@LaunchedEffect
+        }
+
+        logTtsChapterDiag("Processing pending TTS locate request")
+        if (navigateToActiveTtsPosition("pending_request")) {
+            logTtsChapterDiag("Pending TTS locate request completed successfully")
+            pendingTtsLocateRequest = false
+            pendingTtsLocateReason = null
+        } else {
+            logTtsChapterDiag("Pending TTS locate request did not navigate yet")
+        }
+    }
+
+    LaunchedEffect(
+        currentRenderMode,
+        currentChapterIndex,
+        ttsState.playbackSource,
+        ttsState.chapterIndex,
+        ttsChapterIndex
+    ) {
+        if (currentRenderMode != RenderMode.VERTICAL_SCROLL) return@LaunchedEffect
+        if (!isActiveReaderTtsForCurrentBook()) {
+            logTtsChapterDiag("Vertical detach effect resetting because active reader TTS is unavailable")
+            isDetachedFromVerticalTts = false
+            detachedVerticalTtsChunkKey = null
+            suppressNextVerticalTtsDetach = false
+            return@LaunchedEffect
+        }
+
+        val activeTtsChapterIndex = getActiveTtsChapterIndex() ?: return@LaunchedEffect
+        if (currentChapterIndex == activeTtsChapterIndex) {
+            logTtsChapterDiag("Vertical detach effect cleared because reader is back on the active TTS chapter")
+            suppressNextVerticalTtsDetach = false
+            isDetachedFromVerticalTts = false
+            detachedVerticalTtsChunkKey = null
+            return@LaunchedEffect
+        }
+
+        if (suppressNextVerticalTtsDetach) {
+            val hasPendingProgrammaticNavigation =
+                isNavigatingToPosition || chunkTargetOverride != null || !cfiToLoad.isNullOrBlank()
+            if (hasPendingProgrammaticNavigation) {
+                logTtsChapterDiag("Vertical detach suppression consumed after programmatic TTS navigation")
+                suppressNextVerticalTtsDetach = false
+                return@LaunchedEffect
+            }
+
+            logTtsChapterDiag("Ignoring stale vertical detach suppression and honoring manual chapter movement")
+            suppressNextVerticalTtsDetach = false
+        }
+
+        if (!isDetachedFromVerticalTts) {
+            detachVerticalReaderFromTts("chapter_mismatch")
+        }
+    }
+
+    LaunchedEffect(
+        currentRenderMode,
+        isDetachedFromVerticalTts,
+        ttsState.sourceCfi,
+        ttsState.startOffsetInSource,
+        ttsState.chapterIndex,
+        ttsChapterIndex
+    ) {
+        if (currentRenderMode != RenderMode.VERTICAL_SCROLL) return@LaunchedEffect
+        if (!isDetachedFromVerticalTts) return@LaunchedEffect
+        if (!isActiveReaderTtsForCurrentBook()) return@LaunchedEffect
+
+        val currentChunkKey = currentTtsChunkKey() ?: return@LaunchedEffect
+        val detachedChunkKey = detachedVerticalTtsChunkKey
+
+        if (detachedChunkKey == null) {
+            logTtsChapterDiag("Detached vertical reader recorded first observed TTS chunk key")
+            detachedVerticalTtsChunkKey = currentChunkKey
+            return@LaunchedEffect
+        }
+
+        if (currentChunkKey == detachedChunkKey) {
+            logTtsChapterDiag("Detached vertical reader waiting for next TTS chunk boundary before rejoining")
+            return@LaunchedEffect
+        }
+
+        logTtsChapterDiag("Detached vertical reader detected next TTS chunk boundary and will try to rejoin")
+        if (navigateToActiveTtsPosition("chunk_follow")) {
+            logTtsChapterDiag("Detached vertical reader rejoined active TTS chapter successfully")
+            isDetachedFromVerticalTts = false
+            detachedVerticalTtsChunkKey = null
+        } else {
+            logTtsChapterDiag("Detached vertical reader failed to rejoin on this chunk boundary")
+        }
+    }
+
     val lifecycleOwner = LocalLifecycleOwner.current
-    DisposableEffect(lifecycleOwner, webViewRefForTts) {
+    val latestWebViewRefForTts by rememberUpdatedState(webViewRefForTts)
+    val latestIsActiveReaderTtsForCurrentBook by rememberUpdatedState(isActiveReaderTtsForCurrentBook())
+    val latestSaveActiveTtsPosition by rememberUpdatedState<suspend (String) -> Boolean>({ reason ->
+        saveActiveTtsPosition(reason)
+    })
+    val latestIsDetachedFromVerticalTts by rememberUpdatedState(isDetachedFromVerticalTts)
+    val latestCurrentRenderMode by rememberUpdatedState(currentRenderMode)
+    val latestQueueLifecycleTtsLocate by rememberUpdatedState({
+        if (latestCurrentRenderMode == RenderMode.VERTICAL_SCROLL && latestIsDetachedFromVerticalTts) {
+            logTtsChapterDiag("Lifecycle resume skipped automatic TTS locate because the vertical reader is detached")
+        } else {
+            logTtsChapterDiag("Lifecycle resume queued a TTS locate request")
+            queuePendingTtsLocate(TTS_LOCATE_REASON_LIFECYCLE_RESUME)
+        }
+    })
+
+    DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_PAUSE) {
-                Timber.d("ON_PAUSE detected. Requesting final CFI for robust save.")
-                webViewRefForTts?.evaluateJavascript("javascript:CfiBridge.onCfiExtracted(window.getCurrentCfi());", null)
+                if (latestIsActiveReaderTtsForCurrentBook) {
+                    scope.launch {
+                        if (!latestSaveActiveTtsPosition("lifecycle_pause")) {
+                            Timber.d("ON_PAUSE detected. Falling back to WebView CFI save.")
+                            latestWebViewRefForTts?.evaluateJavascript("javascript:CfiBridge.onCfiExtracted(window.getCurrentCfi());", null)
+                        }
+                    }
+                } else {
+                    Timber.d("ON_PAUSE detected. Requesting final CFI for robust save.")
+                    latestWebViewRefForTts?.evaluateJavascript("javascript:CfiBridge.onCfiExtracted(window.getCurrentCfi());", null)
+                }
+            } else if (event == Lifecycle.Event.ON_RESUME && latestIsActiveReaderTtsForCurrentBook) {
+                latestQueueLifecycleTtsLocate()
             }
         }
 
@@ -1479,7 +2017,6 @@ fun EpubReaderHost(
         systemUiMode = systemUiMode
     )
 
-    var isPagerInitialized by remember(initialLocator) { mutableStateOf(initialLocator == null) }
     LaunchedEffect(paginator, currentRenderMode, isPagerInitialized) {
         Timber.tag("ReflowPaginationDiag").d("EpubReaderScreen: Checking paginator init. currentRenderMode=$currentRenderMode, paginator=${paginator != null}, isPagerInitialized=$isPagerInitialized")
         if (currentRenderMode == RenderMode.PAGINATED && paginator != null && !isPagerInitialized) {
@@ -1522,8 +2059,26 @@ fun EpubReaderHost(
         }
     }
 
-    LaunchedEffect(paginatedPagerState.currentPage, paginator) {
-        if (currentRenderMode == RenderMode.PAGINATED && paginator != null && isPagerInitialized) {
+    LaunchedEffect(paginatedPagerState, paginator, currentRenderMode, isPagerInitialized, isPaginatedReconfigurationRestoring) {
+        if (currentRenderMode != RenderMode.PAGINATED || paginator == null || !isPagerInitialized) {
+            return@LaunchedEffect
+        }
+        snapshotFlow { paginatedPagerState.currentPage }
+            .collectLatest { page ->
+                if (!isPaginatedReconfigurationRestoring) {
+                    (paginator as? BookPaginator)?.getLocatorForPage(page)?.let { locator ->
+                        lastKnownLocator = locator
+                    }
+                }
+            }
+    }
+
+    LaunchedEffect(paginatedPagerState.currentPage, paginator, isPaginatedReconfigurationRestoring) {
+        if (currentRenderMode == RenderMode.PAGINATED &&
+            paginator != null &&
+            isPagerInitialized &&
+            !isPaginatedReconfigurationRestoring
+        ) {
             delay(1500L)
             val pageToSave = paginatedPagerState.currentPage
 
@@ -1555,10 +2110,7 @@ fun EpubReaderHost(
         }
     }
 
-    val pageInfoBottomPadding by animateDpAsState(
-        targetValue = if (showBars && pageInfoMode == PageInfoMode.SYNC) 45.dp else 0.dp,
-        label = "PageInfoBottomPadding"
-    )
+    val pageInfoBarHeight = PAGE_INFO_BAR_HEIGHT + pageInfoCornerBottomPadding
 
     val isPageInfoVisible = when (pageInfoMode) {
         PageInfoMode.DEFAULT -> !showBars
@@ -1644,12 +2196,21 @@ fun EpubReaderHost(
                 RenderMode.PAGINATED -> {
                     scope.launch {
                         val pageToSave = paginatedPagerState.currentPage
-                        val locator = (paginator as? BookPaginator)?.getLocatorForPage(pageToSave)
+                        val pageLocator = if (isPaginatedReconfigurationRestoring) {
+                            null
+                        } else {
+                            (paginator as? BookPaginator)?.getLocatorForPage(pageToSave)
+                        }
+                        val locator = pageLocator ?: paginatedReconfigurationAnchor ?: lastKnownLocator
                         val chapterIndex = paginator?.findChapterIndexForPage(pageToSave)
 
-                        if (locator != null && chapterIndex != null) {
+                        if (locator != null) {
                             val bookPaginator = paginator as? BookPaginator
-                            val progress = if (totalBookLengthChars > 0 && bookPaginator != null) {
+                            val progress = if (pageLocator == null || chapterIndex == null) {
+                                saveResolvedLocatorPosition(locator, null)
+                                onNavigateBack()
+                                return@launch
+                            } else if (totalBookLengthChars > 0 && bookPaginator != null) {
                                 val completedCharsInPreviousChapters = chapters.take(chapterIndex).sumOf { it.plainTextContent.length.toLong() }
                                 val currentPageInChapter = (bookPaginator.chapterStartPageIndices[chapterIndex] ?: 0).let { pageToSave - it }
                                 val charsScrolledInCurrentChapter = bookPaginator.getCharactersScrolledInChapter(chapterIndex, currentPageInChapter)
@@ -1666,7 +2227,7 @@ fun EpubReaderHost(
                             )
                             onSavePosition(locator, null, progress)
                         } else {
-                            Timber.w("Final save for paginated view failed. Locator or chapter index is null."
+                            Timber.w("Final save for paginated view failed. Locator is null."
                             )
                         }
                         onNavigateBack()
@@ -1785,18 +2346,84 @@ fun EpubReaderHost(
 
                         if (targetChapterIndex != -1) {
                             if (currentRenderMode == RenderMode.VERTICAL_SCROLL) {
+                                clearPendingTtsRelocationState("toc_entry_vertical")
                                 fragmentToLoad = entry.fragmentId
                                 if (targetChapterIndex != currentChapterIndex) {
+                                    Timber.tag(TAG_LINK_NAV)
+                                        .d("[CHAPTER-NAV] source=TOC_ENTRY, from=$currentChapterIndex, to=$targetChapterIndex, fragment='${entry.fragmentId}', label='${entry.label}'")
                                     initialScrollTargetForChapter = null
                                     currentScrollYPosition = 0
                                     currentScrollHeightValue = 0
                                     currentChapterIndex = targetChapterIndex
+                                    logTtsChapterDiag("Manual vertical chapter switch via TOC entry. targetChapter=$targetChapterIndex fragment=${entry.fragmentId}")
                                 } else {
                                     if (entry.fragmentId != null) {
-                                        webViewRefForTts?.evaluateJavascript(
-                                            "javascript:var el = document.getElementById('${entry.fragmentId}'); if(el) { el.scrollIntoView(); }",
-                                            null
-                                        )
+                                        val js = """
+                                            (function() {
+                                                var targetId = '${entry.fragmentId}';
+                                                var el = document.getElementById(targetId) || document.querySelector('[name="' + targetId + '"]');
+                                                if (el) {
+                                                    var targetScrollY = window.scrollY + el.getBoundingClientRect().top - (window.VIEWPORT_PADDING_TOP + 10);
+                                                    window.scrollTo({ top: targetScrollY, behavior: 'auto' });
+                                                    return -2;
+                                                }
+                                                if (window.virtualization && window.virtualization.chunksData) {
+                                                    for (var i = 0; i < window.virtualization.chunksData.length; i++) {
+                                                        var chunkHtml = window.virtualization.chunksData[i];
+                                                        if (chunkHtml && (chunkHtml.indexOf('id="' + targetId + '"') !== -1 || chunkHtml.indexOf('name="' + targetId + '"') !== -1 || chunkHtml.indexOf("id='" + targetId + "'") !== -1 || chunkHtml.indexOf("name='" + targetId + "'") !== -1)) {
+                                                            return i;
+                                                        }
+                                                    }
+                                                }
+                                                return -1;
+                                            })()
+                                        """.trimIndent()
+                                        webViewRefForTts?.evaluateJavascript(js) { result ->
+                                            val chunkIdx = result?.toIntOrNull() ?: -1
+                                            if (chunkIdx >= 0) {
+                                                if (chunkIdx >= loadedChunkCount) {
+                                                    val chunksToInject = (loadedChunkCount..chunkIdx)
+                                                    chunksToInject.forEach { idx ->
+                                                        val content = chapterChunks.getOrNull(idx)
+                                                        if (content != null) {
+                                                            val escaped = escapeJsString(content)
+                                                            webViewRefForTts?.evaluateJavascript(
+                                                                "javascript:window.virtualization.appendChunk($idx, '$escaped');",
+                                                                null
+                                                            )
+                                                        }
+                                                    }
+                                                    loadUpToChunkIndex = chunkIdx
+                                                    loadedChunkCount = max(loadedChunkCount, chunkIdx + 1)
+                                                }
+                                                val scrollJs = """
+                                                    (function() {
+                                                        var chunkIndex = $chunkIdx;
+                                                        var fragmentId = '${entry.fragmentId}';
+                                                        var chunkDiv = document.querySelector('.chunk-container[data-chunk-index="' + chunkIndex + '"]');
+                                                        if (chunkDiv) {
+                                                            if (chunkDiv.innerHTML === "" && window.virtualization && window.virtualization.chunksData[chunkIndex]) {
+                                                                chunkDiv.innerHTML = window.virtualization.chunksData[chunkIndex];
+                                                                chunkDiv.style.height = "";
+                                                            }
+                                                            setTimeout(function() {
+                                                                var el = document.getElementById(fragmentId) || document.querySelector('[name="' + fragmentId + '"]');
+                                                                if (el) {
+                                                                    var targetScrollY = window.scrollY + el.getBoundingClientRect().top - (window.VIEWPORT_PADDING_TOP + 10);
+                                                                    window.scrollTo({ top: targetScrollY, behavior: 'auto' });
+                                                                } else {
+                                                                    var targetScrollY = window.scrollY + chunkDiv.getBoundingClientRect().top - window.VIEWPORT_PADDING_TOP;
+                                                                    window.scrollTo({ top: targetScrollY, behavior: 'auto' });
+                                                                }
+                                                            }, 150);
+                                                        }
+                                                    })()
+                                                """.trimIndent()
+                                                webViewRefForTts?.evaluateJavascript(scrollJs, null)
+                                            } else if (chunkIdx == -1) {
+                                                webViewRefForTts?.evaluateJavascript("javascript:window.scrollTo(0,0);", null)
+                                            }
+                                        }
                                     } else {
                                         webViewRefForTts?.evaluateJavascript("javascript:window.scrollTo(0,0);", null)
                                     }
@@ -1810,6 +2437,8 @@ fun EpubReaderHost(
 
                                     bookPaginator.findPageForAnchor(targetChapterIndex, entry.fragmentId) { targetPage ->
                                         scope.launch {
+                                            Timber.tag(TAG_LINK_NAV)
+                                                .d("[CHAPTER-NAV] source=TOC_ENTRY_PAGINATED, from=$currentChapterIndex, to=$targetChapterIndex, page=$targetPage, anchor='${entry.fragmentId}', label='${entry.label}'")
                                             Timber.tag("TOC_NAV_DEBUG").d("Scrolling Pager to page: $targetPage")
                                             paginatedPagerState.scrollToPage(targetPage)
                                             isNavigatingByToc = false
@@ -1832,10 +2461,14 @@ fun EpubReaderHost(
                         when (currentRenderMode) {
                             RenderMode.VERTICAL_SCROLL -> {
                                 if (index != currentChapterIndex) {
+                                    clearPendingTtsRelocationState("sidebar_chapter_vertical")
+                                    Timber.tag(TAG_LINK_NAV)
+                                        .d("[CHAPTER-NAV] source=SIDEBAR_CHAPTER, from=$currentChapterIndex, to=$index")
                                     initialScrollTargetForChapter = ChapterScrollPosition.START
                                     currentScrollYPosition = 0
                                     currentScrollHeightValue = 0
                                     currentChapterIndex = index
+                                    logTtsChapterDiag("Manual vertical chapter switch via sidebar. targetChapter=$index")
                                     pullToNextProgress = 0f
                                     pullToPrevProgress = 0f
                                     if (showBars) showBars = false
@@ -1848,6 +2481,8 @@ fun EpubReaderHost(
                                     if (index != currentFromPager) {
                                         val targetPage = bookPaginator.chapterStartPageIndices[index]
                                         if (targetPage != null) {
+                                            Timber.tag(TAG_LINK_NAV)
+                                                .d("[CHAPTER-NAV] source=SIDEBAR_CHAPTER_PAGINATED, from=$currentFromPager, to=$index, page=$targetPage")
                                             paginatedPagerState.scrollToPage(targetPage)
                                             if (showBars) showBars = false
                                         }
@@ -1870,6 +2505,8 @@ fun EpubReaderHost(
                                 val targetChunk = locator?.let { it.blockIndex / 20 }
 
                                 if (bookmark.chapterIndex != currentChapterIndex) {
+                                    Timber.tag(TAG_LINK_NAV)
+                                        .d("[CHAPTER-NAV] source=BOOKMARK, from=$currentChapterIndex, to=${bookmark.chapterIndex}, cfi='${bookmark.cfi}', label='${bookmark.label}'")
                                     chunkTargetOverride = if (targetChunk != null && targetChunk >= 0) {
                                         targetChunk
                                     } else {
@@ -1979,6 +2616,8 @@ fun EpubReaderHost(
                                 val targetChunk = locator?.let { it.blockIndex / 20 }
 
                                 if (highlight.chapterIndex != currentChapterIndex) {
+                                    Timber.tag(TAG_LINK_NAV)
+                                        .d("[CHAPTER-NAV] source=HIGHLIGHT, from=$currentChapterIndex, to=${highlight.chapterIndex}, cfi='${highlight.cfi}'")
                                     chunkTargetOverride = if (targetChunk != null && targetChunk >= 0) targetChunk else 0
                                     currentScrollYPosition = 0
                                     currentScrollHeightValue = 0
@@ -2119,7 +2758,7 @@ fun EpubReaderHost(
         }
 
         val handleGenerateSummary: (Boolean) -> Unit = { force ->
-            if (!isProUser && credits <= 0) {
+            if (BuildConfig.FLAVOR != "oss" && !isProUser && credits <= 0) {
                 showInsufficientCreditsDialog = true
                 showAiHubSheet = false
             } else {
@@ -2176,6 +2815,7 @@ fun EpubReaderHost(
                                     val finalSummaryBuilder = StringBuilder()
                                     summarizeBookContent(
                                         content = text,
+                                        context = context,
                                         authToken = token,
                                         onUsageReceived = { cost, freeRemaining ->
                                             currentCost = cost
@@ -2238,7 +2878,7 @@ fun EpubReaderHost(
         }
 
         val handleGenerateRecap: () -> Unit = {
-            if (credits <= 0) {
+            if (BuildConfig.FLAVOR != "oss" && credits <= 0) {
                 showInsufficientCreditsDialog = true
                 showAiHubSheet = false
             } else {
@@ -2308,6 +2948,7 @@ fun EpubReaderHost(
                 modifier = Modifier
                     .fillMaxSize()
                     .background(effectiveBg)
+                    .then(activeTextureModifier)
                     .padding(top = effectiveTopPadding)
                     .focusRequester(containerFocusRequester)
                     .focusable()
@@ -2329,10 +2970,15 @@ fun EpubReaderHost(
                         },
                         onNavigateChapter = { offset, target ->
                             scope.launch {
+                                clearPendingTtsRelocationState("manual_chapter_change")
                                 initialScrollTargetForChapter = target
                                 currentScrollYPosition = 0
                                 currentScrollHeightValue = 0
                                 currentChapterIndex += offset
+                                logTtsChapterDiag(
+                                    "Manual vertical chapter switch via volume/button nav. " +
+                                        "offset=$offset target=$target newChapter=$currentChapterIndex"
+                                )
                             }
                         },
                         onNextPage = {
@@ -2362,19 +3008,15 @@ fun EpubReaderHost(
             ) {
                 when (currentRenderMode) {
                     RenderMode.VERTICAL_SCROLL -> {
-                        val contentBottomPadding = if (showBars || showFormatAdjustmentBars) {
-                            0.dp
-                        } else {
-                            if (pageInfoMode == PageInfoMode.DEFAULT) PAGE_INFO_BAR_HEIGHT else 0.dp
-                        }
-
-                        val horizontalPadding = if (removeEdgePadding) 0.dp else 16.dp
+                        val pageInfoReserve = if (pageInfoMode != PageInfoMode.HIDDEN) pageInfoBarHeight else 0.dp
+                        val contentTopPadding = if (pageInfoPosition == PageInfoPosition.TOP) pageInfoReserve else 0.dp
+                        val contentBottomPadding = if (pageInfoPosition == PageInfoPosition.BOTTOM) pageInfoReserve else 0.dp
 
                         Box(
                             modifier = Modifier
                                 .fillMaxSize()
+                                .padding(top = contentTopPadding)
                                 .padding(bottom = contentBottomPadding)
-                                .padding(top = 16.dp, start = horizontalPadding, end = horizontalPadding)
                                 .testTag("ReaderContainer")
                         ) {
                             if (chapters.isEmpty()) {
@@ -2554,6 +3196,7 @@ fun EpubReaderHost(
                                             onChapterInitiallyScrolled = {
                                                 val wasCfiScroll = cfiToLoad != null
                                                 Timber.tag("NavDiag").d("onChapterInitiallyScrolled for chapter $targetChapterIndex. Was CFI scroll: $wasCfiScroll")
+                                                logTtsChapterDiag("Chapter initially scrolled. targetChapter=$targetChapterIndex wasCfiScroll=$wasCfiScroll")
                                                 initialScrollTargetForChapter = null
                                                 cfiToLoad = null
                                                 fragmentToLoad = null
@@ -2573,6 +3216,7 @@ fun EpubReaderHost(
 
                                                 if (ttsShouldStartOnChapterLoad && !hasRequestedExtractionForThisChapter) {
                                                     Timber.d("Auto-starting TTS for new chapter ($targetChapterIndex).")
+                                                    logTtsChapterDiag("Auto-starting TTS extraction for chapter load")
                                                     hasRequestedExtractionForThisChapter = true
                                                     scope.launch {
                                                         delay(200)
@@ -2630,11 +3274,15 @@ fun EpubReaderHost(
 
                                                 scope.launch {
                                                     if (currentChapterIndex < chapters.size - 1) {
+                                                        clearPendingTtsRelocationState("auto_scroll_chapter_end")
+                                                        Timber.tag(TAG_LINK_NAV)
+                                                            .d("[CHAPTER-NAV] source=AUTO_SCROLL_END, from=$currentChapterIndex, to=${currentChapterIndex + 1}")
                                                         Timber.d("Screen: Moving to next chapter (${currentChapterIndex + 1}).")
                                                         initialScrollTargetForChapter = ChapterScrollPosition.START
                                                         currentScrollYPosition = 0
                                                         currentScrollHeightValue = 0
                                                         currentChapterIndex++
+                                                        logTtsChapterDiag("Auto-scroll moved vertical reader to next chapter. newChapter=$currentChapterIndex")
                                                         isAutoScrollPlaying = true
                                                     } else {
                                                         Timber.d("Screen: Reached end of book. Stopping auto-scroll.")
@@ -2652,11 +3300,15 @@ fun EpubReaderHost(
                                                         isSeamlessTransitioning = true
                                                         webViewRefForTts?.evaluateJavascript("javascript:CfiBridge.onCfiExtracted(window.getCurrentCfi());", null)
                                                         scope.launch {
+                                                            clearPendingTtsRelocationState("overscroll_top_seamless")
                                                             delay(20)
                                                             initialScrollTargetForChapter = ChapterScrollPosition.END
                                                             currentScrollYPosition = 0
                                                             currentScrollHeightValue = 0
+                                                            Timber.tag(TAG_LINK_NAV)
+                                                                .d("[CHAPTER-NAV] source=OVERSCROLL_TOP_SEAMLESS, from=$targetChapterIndex, to=${targetChapterIndex - 1}")
                                                             currentChapterIndex--
+                                                            logTtsChapterDiag("Seamless overscroll moved to previous chapter. newChapter=$currentChapterIndex")
                                                             if (showBars) showBars = false
                                                             delay(300)
                                                             isSeamlessTransitioning = false
@@ -2674,11 +3326,15 @@ fun EpubReaderHost(
                                                         isSeamlessTransitioning = true
                                                         webViewRefForTts?.evaluateJavascript("javascript:CfiBridge.onCfiExtracted(window.getCurrentCfi());", null)
                                                         scope.launch {
+                                                            clearPendingTtsRelocationState("overscroll_bottom_seamless")
                                                             delay(20)
                                                             initialScrollTargetForChapter = ChapterScrollPosition.START
                                                             currentScrollYPosition = 0
                                                             currentScrollHeightValue = 0
+                                                            Timber.tag(TAG_LINK_NAV)
+                                                                .d("[CHAPTER-NAV] source=OVERSCROLL_BOTTOM_SEAMLESS, from=$targetChapterIndex, to=${targetChapterIndex + 1}")
                                                             currentChapterIndex++
+                                                            logTtsChapterDiag("Seamless overscroll moved to next chapter. newChapter=$currentChapterIndex")
                                                             if (showBars) showBars = false
                                                             delay(300)
                                                             isSeamlessTransitioning = false
@@ -2695,11 +3351,18 @@ fun EpubReaderHost(
                                                         null
                                                     )
                                                     scope.launch {
+                                                        clearPendingTtsRelocationState("pull_to_turn_prev")
+                                                        if (isActiveReaderTtsForCurrentBook()) {
+                                                            detachVerticalReaderFromTts("pull_to_turn_prev")
+                                                        }
                                                         delay(50)
                                                         initialScrollTargetForChapter = ChapterScrollPosition.END
                                                         currentScrollYPosition = 0
                                                         currentScrollHeightValue = 0
+                                                        Timber.tag(TAG_LINK_NAV)
+                                                            .d("[CHAPTER-NAV] source=PULL_TO_TURN_PREV, from=$targetChapterIndex, to=${targetChapterIndex - 1}")
                                                         currentChapterIndex--
+                                                        logTtsChapterDiag("Pull-to-turn moved to previous chapter. newChapter=$currentChapterIndex")
                                                         if (showBars) showBars = false
                                                         Timber.d("Changed to previous chapter: $currentChapterIndex, will scroll to END")
                                                     }
@@ -2715,11 +3378,18 @@ fun EpubReaderHost(
                                                         null
                                                     )
                                                     scope.launch {
+                                                        clearPendingTtsRelocationState("pull_to_turn_next")
+                                                        if (isActiveReaderTtsForCurrentBook()) {
+                                                            detachVerticalReaderFromTts("pull_to_turn_next")
+                                                        }
                                                         delay(50)
                                                         initialScrollTargetForChapter = ChapterScrollPosition.START
                                                         currentScrollYPosition = 0
                                                         currentScrollHeightValue = 0
+                                                        Timber.tag(TAG_LINK_NAV)
+                                                            .d("[CHAPTER-NAV] source=PULL_TO_TURN_NEXT, from=$targetChapterIndex, to=${targetChapterIndex + 1}")
                                                         currentChapterIndex++
+                                                        logTtsChapterDiag("Pull-to-turn moved to next chapter. newChapter=$currentChapterIndex")
                                                         if (showBars) showBars = false
                                                     }
                                                 }
@@ -2751,15 +3421,124 @@ fun EpubReaderHost(
                                             currentFontSize = currentFontSizeEm,
                                             currentLineHeight = currentLineHeight,
                                             currentParagraphGap = currentParagraphGap,
+                                            currentImageSize = currentImageSize,
+                                            currentHorizontalMargin = currentHorizontalMargin,
+                                            currentVerticalMargin = currentVerticalMargin,
                                             currentFontFamily = currentFontFamily,
                                             customFontPath = currentCustomFontPath,
                                             currentTextAlign = currentTextAlign,
                                             activeTextureId = activeTextureId,
+                                            activeTextureAlpha = activeTextureAlpha,
                                             onHighlightClicked = {
                                                 lastHighlightClickTime = System.currentTimeMillis()
                                                 showBars = false
                                                 showFormatAdjustmentBars = false
                                                 Timber.d("Highlight clicked - Forcing bars hidden")
+                                            },
+                                            onInternalLinkClick = { url ->
+                                                scope.launch {
+                                                    val basePath = "file://${epubBook.extractionBasePath}/"
+                                                    val relativeUrl = url.removePrefix(basePath)
+                                                    val pathPart = relativeUrl.substringBefore('#')
+                                                    val fragmentPart = relativeUrl.substringAfter('#', "").takeIf { it.isNotEmpty() }
+
+                                                    val decodedPath = try { java.net.URLDecoder.decode(pathPart, "UTF-8") } catch(e: Exception) { pathPart }
+                                                    val targetChapterIndex = chapters.indexOfFirst { it.absPath == decodedPath }
+
+                                                    Timber.tag(TAG_LINK_NAV).d("InternalLinkClick -> url: $url")
+                                                    Timber.tag(TAG_LINK_NAV).d("InternalLinkClick -> basePath: $basePath")
+                                                    Timber.tag(TAG_LINK_NAV).d("InternalLinkClick -> relativeUrl: $relativeUrl")
+                                                    Timber.tag(TAG_LINK_NAV).d("InternalLinkClick -> pathPart: $pathPart")
+                                                    Timber.tag(TAG_LINK_NAV).d("InternalLinkClick -> decodedPath: $decodedPath")
+                                                    Timber.tag(TAG_LINK_NAV).d("InternalLinkClick -> fragmentPart: $fragmentPart")
+                                                    Timber.tag(TAG_LINK_NAV).d("InternalLinkClick -> targetChapterIndex: $targetChapterIndex (current is $currentChapterIndex)")
+
+                                                    if (targetChapterIndex != -1) {
+                                                        if (targetChapterIndex != currentChapterIndex) {
+                                                            Timber.tag(TAG_LINK_NAV).d("[CHAPTER-NAV] source=INTERNAL_LINK, from=$currentChapterIndex, to=$targetChapterIndex, fragment='$fragmentPart'")
+                                                            initialScrollTargetForChapter = null
+                                                            fragmentToLoad = fragmentPart
+                                                            currentScrollYPosition = 0
+                                                            currentScrollHeightValue = 0
+                                                            currentChapterIndex = targetChapterIndex
+                                                        } else {
+                                                            Timber.tag(TAG_LINK_NAV).d("InternalLinkClick -> Target is current chapter. Evaluating JS for fragment.")
+                                                            if (fragmentPart != null) {
+                                                                val js = """
+                                                                    (function() {
+                                                                        var targetId = '$fragmentPart';
+                                                                        var el = document.getElementById(targetId) || document.querySelector('[name="' + targetId + '"]');
+                                                                        if (el) {
+                                                                            var targetScrollY = window.scrollY + el.getBoundingClientRect().top - (window.VIEWPORT_PADDING_TOP + 10);
+                                                                            window.scrollTo({ top: targetScrollY, behavior: 'auto' });
+                                                                            return -2;
+                                                                        }
+                                                                        if (window.virtualization && window.virtualization.chunksData) {
+                                                                            for (var i = 0; i < window.virtualization.chunksData.length; i++) {
+                                                                                var chunkHtml = window.virtualization.chunksData[i];
+                                                                                if (chunkHtml && (chunkHtml.indexOf('id="' + targetId + '"') !== -1 || chunkHtml.indexOf('name="' + targetId + '"') !== -1 || chunkHtml.indexOf("id='" + targetId + "'") !== -1 || chunkHtml.indexOf("name='" + targetId + "'") !== -1)) {
+                                                                                    return i;
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                        return -1;
+                                                                    })()
+                                                                """.trimIndent()
+                                                                webViewRefForTts?.evaluateJavascript(js) { result ->
+                                                                    val chunkIdx = result?.toIntOrNull() ?: -1
+                                                                    if (chunkIdx >= 0) {
+                                                                        if (chunkIdx >= loadedChunkCount) {
+                                                                            val chunksToInject = (loadedChunkCount..chunkIdx)
+                                                                            chunksToInject.forEach { idx ->
+                                                                                val content = chapterChunks.getOrNull(idx)
+                                                                                if (content != null) {
+                                                                                    val escaped = escapeJsString(content)
+                                                                                    webViewRefForTts?.evaluateJavascript(
+                                                                                        "javascript:window.virtualization.appendChunk($idx, '$escaped');",
+                                                                                        null
+                                                                                    )
+                                                                                }
+                                                                            }
+                                                                            loadUpToChunkIndex = chunkIdx
+                                                                            loadedChunkCount = max(loadedChunkCount, chunkIdx + 1)
+                                                                        }
+                                                                        val scrollJs = """
+                                                                            (function() {
+                                                                                var chunkIndex = $chunkIdx;
+                                                                                var fragmentId = '$fragmentPart';
+                                                                                var chunkDiv = document.querySelector('.chunk-container[data-chunk-index="' + chunkIndex + '"]');
+                                                                                if (chunkDiv) {
+                                                                                    if (chunkDiv.innerHTML === "" && window.virtualization && window.virtualization.chunksData[chunkIndex]) {
+                                                                                        chunkDiv.innerHTML = window.virtualization.chunksData[chunkIndex];
+                                                                                        chunkDiv.style.height = "";
+                                                                                    }
+                                                                                    setTimeout(function() {
+                                                                                        var el = document.getElementById(fragmentId) || document.querySelector('[name="' + fragmentId + '"]');
+                                                                                        if (el) {
+                                                                                            var targetScrollY = window.scrollY + el.getBoundingClientRect().top - (window.VIEWPORT_PADDING_TOP + 10);
+                                                                                            window.scrollTo({ top: targetScrollY, behavior: 'auto' });
+                                                                                        } else {
+                                                                                            var targetScrollY = window.scrollY + chunkDiv.getBoundingClientRect().top - window.VIEWPORT_PADDING_TOP;
+                                                                                            window.scrollTo({ top: targetScrollY, behavior: 'auto' });
+                                                                                        }
+                                                                                    }, 150);
+                                                                                }
+                                                                            })()
+                                                                        """.trimIndent()
+                                                                        webViewRefForTts?.evaluateJavascript(scrollJs, null)
+                                                                    } else if (chunkIdx == -1) {
+                                                                        webViewRefForTts?.evaluateJavascript("javascript:window.scrollTo(0,0);", null)
+                                                                    }
+                                                                }
+                                                            } else {
+                                                                webViewRefForTts?.evaluateJavascript("javascript:window.scrollTo(0,0);", null)
+                                                            }
+                                                        }
+                                                        if (showBars) showBars = false
+                                                    } else {
+                                                        Timber.tag(TAG_LINK_NAV).w("Could not find chapter for internal link: $url")
+                                                    }
+                                                }
                                             },
                                             onWebViewInstanceCreated = { webView ->
                                                 webViewRefForTts = webView
@@ -2809,9 +3588,14 @@ fun EpubReaderHost(
                                                     }
 
                                                     Timber.d("Vertical: Final compiled TTS chunks size: ${ttsChunks.size}")
+                                                    logTtsChapterDiag(
+                                                        "Vertical TTS text ready. targetChapter=$targetChapterIndex " +
+                                                            "chunkCount=${ttsChunks.size} visibleChapter=$currentChapterIndex"
+                                                    )
 
                                                     if (ttsChunks.isNotEmpty()) {
-                                                        if (currentTtsMode == TtsPlaybackManager.TtsMode.CLOUD && credits <= 0) {
+                                                        logTtsChapterDiag("Vertical TTS extraction produced ${ttsChunks.size} chunks for chapter $targetChapterIndex")
+                                                        if (BuildConfig.FLAVOR != "oss" && currentTtsMode == TtsPlaybackManager.TtsMode.CLOUD && credits <= 0) {
                                                             showInsufficientCreditsDialog = true
                                                             ttsShouldStartOnChapterLoad = false
                                                             return@launch
@@ -2827,21 +3611,27 @@ fun EpubReaderHost(
                                                         ttsChapterIndex = targetChapterIndex
 
                                                         ttsController.start(
-                                                            chunks = ttsChunks,
+                                                            chunks = ttsChunks.withTtsReplacements(ttsReplacementPreferences, bookId),
                                                             bookTitle = epubBook.title,
                                                             chapterTitle = chapterTitle,
                                                             coverImageUri = coverUriString,
+                                                            chapterIndex = targetChapterIndex,
+                                                            totalChapters = chapters.size,
                                                             ttsMode = currentTtsMode,
                                                             playbackSource = "READER",
                                                             authToken = token
                                                         )
                                                     } else {
                                                         Timber.w("No TTS chunks were created from JSON, not starting TTS.")
+                                                        logTtsChapterDiag("Vertical TTS extraction produced 0 chunks for chapter $targetChapterIndex")
                                                         if (ttsShouldStartOnChapterLoad) {
                                                             Timber.d("Empty chapter detected during start. Advancing UI to next chapter.")
                                                             val nextIdx = targetChapterIndex + 1
                                                             if (nextIdx < chapters.size) {
-                                                                initialScrollTargetForChapter = ChapterScrollPosition.START
+                                                                Timber.tag(TAG_LINK_NAV)
+                                                                    .d("[CHAPTER-NAV] source=TTS_EMPTY_CHAPTER_SKIP, from=$targetChapterIndex, to=$nextIdx")
+                                                                initialScrollTargetForChapter =
+                                                                    ChapterScrollPosition.START
                                                                 currentScrollYPosition = 0
                                                                 currentScrollHeightValue = 0
                                                                 currentChapterIndex = nextIdx
@@ -2872,6 +3662,7 @@ fun EpubReaderHost(
 
                                                     summarizeBookContent(
                                                         content = content,
+                                                        context = context,
                                                         authToken = token,
                                                         onUsageReceived = { cost: Double?, freeRemaining: Int? ->
                                                             currentCost = cost
@@ -3123,16 +3914,20 @@ fun EpubReaderHost(
                     }
 
                     RenderMode.PAGINATED -> {
-                        val contentBottomPadding = if (pageInfoMode != PageInfoMode.HIDDEN) PAGE_INFO_BAR_HEIGHT else 0.dp
+                        val pageInfoReserve = if (pageInfoMode != PageInfoMode.HIDDEN) pageInfoBarHeight else 0.dp
+                        val contentTopPadding = if (pageInfoPosition == PageInfoPosition.TOP) pageInfoReserve else 0.dp
+                        val contentBottomPadding = if (pageInfoPosition == PageInfoPosition.BOTTOM) pageInfoReserve else 0.dp
 
                         BoxWithConstraints(
                             modifier = Modifier
                                 .fillMaxSize()
+                                .padding(top = contentTopPadding)
                                 .padding(bottom = contentBottomPadding)
                                 .testTag("ReaderContainer")
                         ) {
                             PaginatedReaderScreen(
                                 book = epubBook,
+                                bookId = readerCacheBookId,
                                 isDarkTheme = isDarkTheme,
                                 effectiveBg = effectiveBg,
                                 effectiveText = effectiveText,
@@ -3141,6 +3936,9 @@ fun EpubReaderHost(
                                 fontSizeMultiplier = currentFontSizeEm,
                                 lineHeightMultiplier = currentLineHeight,
                                 paragraphGapMultiplier = currentParagraphGap,
+                                imageSizeMultiplier = currentImageSize,
+                                horizontalMarginMultiplier = currentHorizontalMargin,
+                                verticalMarginMultiplier = currentVerticalMargin,
                                 fontFamily = activeFontFamily,
                                 textAlign = currentTextAlign,
                                 activeHighlightPalette = currentHighlightPalette,
@@ -3152,9 +3950,20 @@ fun EpubReaderHost(
                                     offset = ttsState.startOffsetInSource
                                 ).takeIf { ttsState.currentText != null && ttsState.sourceCfi != null && ttsState.startOffsetInSource != -1 },
                                 activeTextureId = activeTextureId,
-                                removeEdgePadding = removeEdgePadding,
+                                activeTextureAlpha = activeTextureAlpha,
                                 initialChapterIndexInBook = lastKnownLocator?.chapterIndex,
-                                modifier = Modifier.alpha(if (isPagerInitialized) 1f else 0f),
+                                fallbackLocatorForReconfiguration = paginatedReconfigurationAnchor ?: lastKnownLocator,
+                                onReconfigurationAnchorCaptured = { locator ->
+                                    paginatedReconfigurationAnchor = locator
+                                    lastKnownLocator = locator
+                                },
+                                onReconfigurationRestoreActiveChanged = { isActive ->
+                                    isPaginatedReconfigurationRestoring = isActive
+                                    if (!isActive) {
+                                        paginatedReconfigurationAnchor = null
+                                    }
+                                },
+                                modifier = Modifier.alpha(if (isPagerInitialized && !isPaginatedReconfigurationRestoring) 1f else 0f),
                                 onPaginatorReady = { newPaginator ->
                                     paginator = newPaginator
                                 },
@@ -3231,7 +4040,10 @@ fun EpubReaderHost(
                                 onStartTtsFromSelection = { cfi, offset ->
                                     startTtsFromSelectionPaginated(cfi, offset)
                                 },
-                                userHighlights = userHighlights.filter { it.chapterIndex == (currentChapterInPaginatedMode ?: -1) },
+                                userHighlights = userHighlights.filter { highlight ->
+                                    val currentChapter = currentChapterInPaginatedMode ?: return@filter false
+                                    highlight.chapterIndex in (currentChapter - 1)..(currentChapter + 1)
+                                },
                                 onHighlightCreated = { cfi, text, colorId ->
                                     Timber.d("EpubReaderScreen: onHighlightCreated. CFI: $cfi")
                                     val color = HighlightColor.entries.find { it.id == colorId } ?: HighlightColor.YELLOW
@@ -3434,17 +4246,19 @@ fun EpubReaderHost(
 
                 // Page Info Bar (Vertical)
                 AnimatedVisibility(
-                    visible = renderMode == RenderMode.VERTICAL_SCROLL && isPageInfoVisible,
+                    visible = currentRenderMode == RenderMode.VERTICAL_SCROLL && isPageInfoVisible,
                     enter = fadeIn(animationSpec = tween(200)),
                     exit = fadeOut(animationSpec = tween(200)),
-                    modifier = Modifier.align(Alignment.BottomCenter)
+                    modifier = Modifier.align(
+                        if (pageInfoPosition == PageInfoPosition.TOP) Alignment.TopCenter else Alignment.BottomCenter
+                    )
                 ) {
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(PAGE_INFO_BAR_HEIGHT)
+                            .height(pageInfoBarHeight)
                             .background(infoBarBgColor)
-                            .padding(bottom = bottomPadding + pageInfoBottomPadding)
+                            .then(activeTextureModifier)
                             .padding(horizontal = 16.dp),
                         contentAlignment = Alignment.Center
                     ) {
@@ -3480,17 +4294,19 @@ fun EpubReaderHost(
 
                 // Page Info Bar (Paginated)
                 AnimatedVisibility(
-                    visible = renderMode == RenderMode.PAGINATED && paginator != null && isPageInfoVisible && paginatedPagerState.pageCount > 0,
+                    visible = currentRenderMode == RenderMode.PAGINATED && paginator != null && isPageInfoVisible && paginatedPagerState.pageCount > 0,
                     enter = fadeIn(animationSpec = tween(200)),
                     exit = fadeOut(animationSpec = tween(200)),
-                    modifier = Modifier.align(Alignment.BottomCenter)
+                    modifier = Modifier.align(
+                        if (pageInfoPosition == PageInfoPosition.TOP) Alignment.TopCenter else Alignment.BottomCenter
+                    )
                 ) {
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(PAGE_INFO_BAR_HEIGHT)
+                            .height(pageInfoBarHeight)
                             .background(infoBarBgColor)
-                            .padding(bottom = bottomPadding + pageInfoBottomPadding)
+                            .then(activeTextureModifier)
                             .padding(horizontal = 16.dp),
                         contentAlignment = Alignment.Center
                     ) {
@@ -3782,6 +4598,8 @@ fun EpubReaderHost(
                     volumeScrollEnabled = volumeScrollEnabled,
                     isPageTurnAnimationEnabled = isPageTurnAnimationEnabled,
                     hiddenTools = hiddenTools,
+                    toolOrder = toolOrder,
+                    bottomTools = bottomTools,
                     onCustomizeTools = { showCustomizeToolsSheet = true },
                     onNavigateBack = { triggerSaveAndExit() },
                     isKeepScreenOn = isKeepScreenOn,
@@ -3859,9 +4677,75 @@ fun EpubReaderHost(
                     searchFocusRequester = searchFocusRequester,
                     modifier = Modifier.align(Alignment.TopCenter),
                     onOpenTtsSettings = { showTtsSettingsSheet = true },
+                    onOpenTtsReplacements = { showTtsReplacementsSheet = true },
                     onOpenDictionarySettings = { showDictionarySettingsSheet = true },
                     onOpenThemeSettings = { showThemePanel = true },
                     onOpenVisualOptions = { showVisualOptionsSheet = true },
+                    onOpenAiHub = { showAiHubSheet = true },
+                    onOpenSlider = {
+                        when (currentRenderMode) {
+                            RenderMode.VERTICAL_SCROLL -> {
+                                sliderStartPage = currentPageInChapter
+                                sliderCurrentPage = currentPageInChapter.toFloat()
+                                isPageSliderVisible = true
+                                showBars = false
+                                scope.launch {
+                                    webViewRefForTts?.let { webView ->
+                                        startPageThumbnail = captureWebViewVisibleArea(webView)
+                                    }
+                                }
+                            }
+                            RenderMode.PAGINATED -> {
+                                if (paginatedPagerState.pageCount > 0) {
+                                    sliderStartPage = paginatedPagerState.currentPage + 1
+                                    sliderCurrentPage = (paginatedPagerState.currentPage + 1).toFloat()
+                                    isPageSliderVisible = true
+                                    showBars = false
+                                    startPageThumbnail = null
+                                } else {
+                                    bannerMessage = BannerMessage("Book is not paginated yet.")
+                                }
+                            }
+                        }
+                    },
+                    onOpenDrawer = {
+                        scope.launch { drawerState.open() }
+                    },
+                    onToggleFormat = {
+                        showFormatAdjustmentBars = !showFormatAdjustmentBars
+                        if (showFormatAdjustmentBars) {
+                            searchState.showSearchResultsPanel = false
+                            isPageSliderVisible = false
+                        }
+                    },
+                    onToggleSearch = {
+                        searchState.isSearchActive = true
+                        searchState.showSearchResultsPanel = true
+                        showBars = true
+                        showFormatAdjustmentBars = false
+                    },
+                    onToggleTts = {
+                        if (isTtsSessionActive) {
+                            Timber.d("TTS button clicked: Stopping TTS")
+                            userStoppedTts = true
+                            ttsController.stop()
+                        } else {
+                            when {
+                                ContextCompat.checkSelfPermission(
+                                    context,
+                                    Manifest.permission.POST_NOTIFICATIONS
+                                ) == PackageManager.PERMISSION_GRANTED -> {
+                                    startTts()
+                                }
+                                activity?.shouldShowRequestPermissionRationale(Manifest.permission.POST_NOTIFICATIONS) == true -> {
+                                    showPermissionRationaleDialog = true
+                                }
+                                else -> {
+                                    permissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                                }
+                            }
+                        }
+                    },
                     onToggleReflow = if (onToggleReflow != null) {
                         {
                             val activeChapter = if (currentRenderMode == RenderMode.PAGINATED) {
@@ -3910,6 +4794,10 @@ fun EpubReaderHost(
                         currentTtsMode = currentTtsMode,
                         isCollapsed = isTtsCollapsed,
                         onCollapseChange = { isTtsCollapsed = it },
+                        onLocateCurrentChunk = {
+                            logTtsChapterDiag("Locate current chunk requested from TTS overlay")
+                            queuePendingTtsLocate(TTS_LOCATE_REASON_OVERLAY)
+                        },
                         onOpenTtsSettings = { showTtsSettingsSheet = true },
                         onClose = {
                             userStoppedTts = true
@@ -4023,8 +4911,12 @@ fun EpubReaderHost(
                     ttsState = ttsState,
                     isProUser = isProUser,
                     hiddenTools = hiddenTools,
+                    toolOrder = toolOrder,
+                    bottomTools = bottomTools,
                     currentTtsMode = currentTtsMode,
                     onOpenAiHub = { showAiHubSheet = true },
+                    onOpenDictionarySettings = { showDictionarySettingsSheet = true },
+                    onOpenThemeSettings = { showThemePanel = true },
                     onOpenSlider = {
                         when (currentRenderMode) {
                             RenderMode.VERTICAL_SCROLL -> {
@@ -4102,6 +4994,12 @@ fun EpubReaderHost(
                     onLineHeightChange = { currentLineHeight = it },
                     currentParagraphGap = currentParagraphGap,
                     onParagraphGapChange = { currentParagraphGap = it },
+                    currentImageSize = currentImageSize,
+                    onImageSizeChange = { currentImageSize = it },
+                    currentHorizontalMargin = currentHorizontalMargin,
+                    onHorizontalMarginChange = { currentHorizontalMargin = it },
+                    currentVerticalMargin = currentVerticalMargin,
+                    onVerticalMarginChange = { currentVerticalMargin = it },
                     currentFont = currentFontFamily,
                     currentCustomFontName = if(currentCustomFontPath != null) {
                         customFonts.find { it.path == currentCustomFontPath }?.displayName ?: "Custom Font"
@@ -4118,6 +5016,9 @@ fun EpubReaderHost(
                         currentFontSizeEm = DEFAULT_FONT_SIZE_VAL
                         currentLineHeight = DEFAULT_LINE_HEIGHT_VAL
                         currentParagraphGap = DEFAULT_PARAGRAPH_GAP_VAL
+                        currentImageSize = DEFAULT_IMAGE_SIZE_VAL
+                        currentHorizontalMargin = DEFAULT_HORIZONTAL_MARGIN_VAL
+                        currentVerticalMargin = DEFAULT_VERTICAL_MARGIN_VAL
                         currentFontFamily = ReaderFont.ORIGINAL
                         currentCustomFontPath = null
                         currentTextAlign = ReaderTextAlign.DEFAULT
@@ -4127,11 +5028,7 @@ fun EpubReaderHost(
                         isFormatLocal = it
                         saveFormatIsLocal(context, bookId, it)
                     },
-                    onClose = { showFormatAdjustmentBars = false },
-                    modifier = Modifier
-                        .align(Alignment.BottomCenter)
-                        .padding(bottom = bottomPadding + 16.dp)
-                        .padding(horizontal = 16.dp)
+                    onClose = { showFormatAdjustmentBars = false }
                 )
 
                 val effectiveCurrentChapterIndex = if (currentRenderMode == RenderMode.PAGINATED) {
@@ -4195,7 +5092,7 @@ fun EpubReaderHost(
                     onClearRecap = { recapResult = null }
                 )
 
-                if (isNavigatingToPosition) {
+                if (isNavigatingToPosition && currentRenderMode == RenderMode.PAGINATED) {
                     Box(
                         modifier = Modifier
                             .fillMaxSize()
@@ -4313,7 +5210,7 @@ fun EpubReaderHost(
                             },
                             onCopy = {
                                 val clipboardManager = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                                val clip = ClipData.newPlainText("Copied Text", targetHighlight.text)
+                                val clip = ClipData.newPlainText(context.getString(R.string.clip_label_copied_text), targetHighlight.text)
                                 clipboardManager.setPrimaryClip(clip)
                                 highlightToNoteCfi = null
                             },
@@ -4416,12 +5313,31 @@ fun EpubReaderHost(
             )
         }
 
+        TtsWordReplacementsSheet(
+            isVisible = showTtsReplacementsSheet,
+            bookId = bookId,
+            bookTitle = epubBook.title,
+            preferences = ttsReplacementPreferences,
+            onPreferencesChange = updateTtsReplacementPreferences,
+            onDismiss = { showTtsReplacementsSheet = false },
+        )
+
         if (showCustomizeToolsSheet) {
             CustomizeToolsSheet(
                 hiddenTools = hiddenTools,
+                toolOrder = toolOrder,
+                bottomTools = bottomTools,
                 onUpdate = { newHiddenSet ->
                     hiddenTools = newHiddenSet
                     saveHiddenTools(context, newHiddenSet)
+                },
+                onOrderUpdate = { newOrder ->
+                    toolOrder = newOrder
+                    saveToolOrder(context, newOrder)
+                },
+                onPlacementUpdate = { newBottomTools ->
+                    bottomTools = newBottomTools
+                    saveBottomTools(context, newBottomTools)
                 },
                 onDismiss = { showCustomizeToolsSheet = false }
             )
@@ -4467,15 +5383,15 @@ fun EpubReaderHost(
                     pageInfoMode = it
                     savePageInfoMode(context, it)
                 },
+                pageInfoPosition = pageInfoPosition,
+                onPageInfoPositionChange = {
+                    pageInfoPosition = it
+                    savePageInfoPosition(context, it)
+                },
                 pullToTurnEnabled = pullToTurnEnabled,
                 onPullToTurnChange = {
                     pullToTurnEnabled = it
                     savePullToTurn(context, it)
-                },
-                removeEdgePadding = removeEdgePadding,
-                onRemoveEdgePaddingChange = {
-                    removeEdgePadding = it
-                    saveRemoveEdgePadding(context, it)
                 },
                 pullToTurnMultiplier = pullToTurnMultiplier,
                 onPullToTurnMultiplierChange = {
@@ -4512,6 +5428,11 @@ fun EpubReaderHost(
             ReaderThemePanel(
                 isVisible = true,
                 currentThemeId = currentThemeId,
+                globalTextureTransparency = globalTextureTransparency,
+                onGlobalTextureTransparencyChange = {
+                    globalTextureTransparency = it
+                    saveGlobalTextureTransparency(context, it)
+                },
                 onThemeSelected = {
                     currentThemeId = it
                     saveReaderThemeId(context, it)
@@ -4527,13 +5448,13 @@ fun EpubReaderHost(
             AlertDialog(
                 onDismissRequest = { showInsufficientCreditsDialog = false },
                 icon = { Icon(painterResource(id = R.drawable.crown), contentDescription = null) },
-                title = { Text("Out of Credits") },
-                text = { Text("You don't have enough credits. Get Episteme Pro for 10 free Summaries per day, or add more credits to use Summaries, Cloud TTS and Story Recap.") },
+                title = { Text(stringResource(R.string.dialog_out_of_credits_title)) },
+                text = { Text(stringResource(R.string.dialog_out_of_credits_desc)) },
                 confirmButton = {
                     TextButton(onClick = {
                         showInsufficientCreditsDialog = false
                         onNavigateToPro()
-                    }) { Text("Get Pro / Add Credits") }
+                    }) { Text(stringResource(R.string.action_get_pro_or_add_credits)) }
                 },
                 dismissButton = {
                     TextButton(onClick = { showInsufficientCreditsDialog = false }) {

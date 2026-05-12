@@ -44,6 +44,7 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.RectangleShape
@@ -83,7 +84,9 @@ fun VerticalScrollbar(
 
             if (viewportRatio >= 1f) return@derivedStateOf null
 
-            val thumbHeight = (viewportHeight * viewportRatio).coerceIn(80f, viewportHeight / 2)
+            val maxThumbHeight = viewportHeight / 2f
+            val minThumbHeight = minOf(80f, maxThumbHeight)
+            val thumbHeight = (viewportHeight * viewportRatio).coerceIn(minThumbHeight, maxThumbHeight)
 
             val firstItemIndex = listState.firstVisibleItemIndex
             val firstItemOffset = listState.firstVisibleItemScrollOffset
@@ -199,7 +202,7 @@ internal fun ThumbnailWithIndicator(
         ) {
             Image(
                 bitmap = thumbnail.asImageBitmap(),
-                contentDescription = "Start page thumbnail",
+                contentDescription = stringResource(R.string.content_desc_start_page_thumbnail),
                 contentScale = ContentScale.FillBounds,
                 modifier = Modifier.fillMaxSize()
             )
@@ -230,7 +233,7 @@ internal fun BookmarkButton(
         AnimatedVisibility(visible = isBookmarked, enter = fadeIn(), exit = fadeOut()) {
             Icon(
                 painter = painterResource(id = R.drawable.bookmark),
-                contentDescription = "Bookmark",
+                contentDescription = stringResource(R.string.content_desc_bookmark),
                 modifier = Modifier.size(24.dp),
                 tint = MaterialTheme.colorScheme.primary
             )
@@ -239,15 +242,45 @@ internal fun BookmarkButton(
 }
 
 @Composable
-internal fun ZoomPercentageIndicator(percentage: Int) {
+internal fun ZoomPercentageIndicator(
+    percentage: Int,
+    onResetZoomClick: () -> Unit
+) {
     Surface(
         shape = RoundedCornerShape(8.dp), color = MaterialTheme.colorScheme.scrim.copy(alpha = 0.8f)
     ) {
-        Text(
-            text = "$percentage%",
-            color = Color.White,
-            style = MaterialTheme.typography.bodyLarge,
+        androidx.compose.foundation.layout.Row(
+            verticalAlignment = Alignment.CenterVertically,
             modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
-        )
+        ) {
+            Text(
+                text = "$percentage%",
+                color = Color.White,
+                style = MaterialTheme.typography.bodyLarge
+            )
+
+            Spacer(modifier = Modifier.width(8.dp))
+
+            // Divider
+            Box(
+                modifier = Modifier
+                    .width(1.dp)
+                    .height(16.dp)
+                    .background(Color.White.copy(alpha = 0.5f))
+            )
+
+            Spacer(modifier = Modifier.width(8.dp))
+
+            // Reset Zoom Button
+            Icon(
+                painter = painterResource(id = R.drawable.zoom_out),
+                contentDescription = stringResource(R.string.content_desc_reset_zoom),
+                tint = Color.White,
+                modifier = Modifier
+                    .size(20.dp)
+                    .clip(RoundedCornerShape(4.dp))
+                    .clickable(onClick = onResetZoomClick)
+            )
+        }
     }
 }

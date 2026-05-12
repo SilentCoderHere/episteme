@@ -109,28 +109,34 @@ class MobiParser(private val context: Context) {
     private external fun parseMobiFile(filePath: String): ParsedMobiData?
 
     companion object {
-        const val EXTRACTED_EPUB_DIR_NAME = "extracted_epubs"
-
-        init {
+        private val nativeLoadError: Throwable? = try {
             System.loadLibrary("mobi")
             System.loadLibrary("native-lib")
+            null
+        } catch (t: Throwable) {
+            Timber.e(t, "MOBI native parser is unavailable on this device.")
+            t
         }
-    }
 
-    private fun getBookExtractionDir(bookIdentifier: String): File {
-        val parentDir = File(context.cacheDir, EXTRACTED_EPUB_DIR_NAME)
-        if (!parentDir.exists()) {
-            parentDir.mkdirs()
-        }
-        return File(parentDir, bookIdentifier)
+        val isNativeParserAvailable: Boolean
+            get() = nativeLoadError == null
+
+        fun nativeParserUnavailableMessage(): String =
+            nativeLoadError?.message ?: "MOBI native parser is unavailable on this device."
     }
 
     suspend fun createMobiBook(
         inputStream: InputStream,
         bookId: String,
         originalBookNameHint: String,
-        parseContent: Boolean = true
+        parseContent: Boolean = true,
+        extractionDirOverride: File? = null
     ): EpubBook? = withContext(Dispatchers.IO) {
+        if (!isNativeParserAvailable) {
+            Timber.e("Skipping MOBI parsing: ${nativeParserUnavailableMessage()}")
+            return@withContext null
+        }
+
         val tempFile = File.createTempFile("temp_mobi_", ".mobi", context.cacheDir)
         try {
             tempFile.outputStream().use { output ->
@@ -162,8 +168,12 @@ class MobiParser(private val context: Context) {
         val bookTitle = parsedData.title ?: originalBookNameHint
         val bookAuthor = parsedData.author ?: "Unknown Author"
 
-        val extractionDir = File(context.cacheDir, "imported_file_$bookId")
-        extractionDir.mkdirs()
+        val extractionDir = extractionDirOverride?.let(ImportedFileCache::prepareDirectory)
+            ?: if (parseContent) {
+                ImportedFileCache.prepareActiveBookDir(context, bookId)
+            } else {
+                ImportedFileCache.createTemporaryBookDir(context, bookId, "metadata")
+            }
 
         val sequentialImageMap = parsedData.resources
             .filter { it.mediaType.startsWith("image/") }

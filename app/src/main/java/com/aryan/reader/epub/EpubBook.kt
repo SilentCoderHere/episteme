@@ -23,6 +23,7 @@ import android.graphics.Bitmap
 import com.aryan.reader.epub.EpubParser.EpubPageTarget
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.Transient
+import java.io.File
 
 @Serializable
 data class EpubTocEntry(
@@ -46,5 +47,19 @@ data class EpubBook(
     val extractionBasePath: String = "",
     val css: Map<String, String> = emptyMap(),
     @Transient
-    val chaptersForPagination: List<EpubChapter> = chapters
+    val chaptersForPagination: List<EpubChapter> = chapters,
+    val seriesName: String? = null,
+    val seriesIndex: Double? = null,
+    val description: String? = null,
 )
+
+fun EpubBook.hasReadableExtractedContent(): Boolean {
+    if (extractionBasePath.isBlank()) return false
+    val extractionDir = File(extractionBasePath)
+    if (!extractionDir.isDirectory) return false
+    if (chapters.isEmpty()) return extractionDir.list()?.isNotEmpty() == true
+
+    return chapters.all { chapter ->
+        File(extractionDir, chapter.htmlFilePath).isFile
+    }
+}

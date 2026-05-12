@@ -21,20 +21,19 @@
 package com.aryan.reader.data
 
 import androidx.room.Dao
-import androidx.room.Insert
-import androidx.room.OnConflictStrategy
 import androidx.room.Query
+import androidx.room.Upsert
 import kotlinx.coroutines.flow.Flow
 
 @Dao
 interface RecentFileDao {
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    @Upsert
     suspend fun insertOrUpdateFile(file: RecentFileEntity)
 
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    @Upsert
     suspend fun insertOrUpdateFiles(files: List<RecentFileEntity>)
 
-    @Query("SELECT bookId, uriString, type, displayName, timestamp, coverImagePath, title, author, lastChapterIndex, lastPage, lastPositionCfi, progressPercentage, isRecent, isAvailable, lastModifiedTimestamp, isDeleted, locatorBlockIndex, locatorCharOffset, sourceFolderUri, isReflowPreferred, customName, fileSize FROM recent_files WHERE isDeleted = 0 ORDER BY timestamp DESC")
+    @Query("SELECT bookId, uriString, type, displayName, timestamp, coverImagePath, title, author, lastChapterIndex, lastPage, lastPositionCfi, progressPercentage, isRecent, isAvailable, lastModifiedTimestamp, isDeleted, locatorBlockIndex, locatorCharOffset, sourceFolderUri, isReflowPreferred, customName, fileSize, seriesName, seriesIndex, description FROM recent_files WHERE isDeleted = 0 ORDER BY timestamp DESC")
     fun getRecentFiles(): Flow<List<RecentFileSummary>>
 
     @Query("SELECT * FROM recent_files WHERE sourceFolderUri = :sourceFolderUri AND isDeleted = 0")
@@ -46,7 +45,7 @@ interface RecentFileDao {
     @Query("UPDATE recent_files SET isReflowPreferred = :isPreferred WHERE bookId = :bookId")
     suspend fun updateReflowPreference(bookId: String, isPreferred: Boolean)
 
-    @Query("SELECT bookId, uriString, type, displayName, timestamp, coverImagePath, title, author, lastChapterIndex, lastPage, lastPositionCfi, progressPercentage, isRecent, isAvailable, lastModifiedTimestamp, isDeleted, locatorBlockIndex, locatorCharOffset, sourceFolderUri, isReflowPreferred, customName, fileSize FROM recent_files WHERE isDeleted = 0 ORDER BY timestamp DESC LIMIT :limit")
+    @Query("SELECT bookId, uriString, type, displayName, timestamp, coverImagePath, title, author, lastChapterIndex, lastPage, lastPositionCfi, progressPercentage, isRecent, isAvailable, lastModifiedTimestamp, isDeleted, locatorBlockIndex, locatorCharOffset, sourceFolderUri, isReflowPreferred, customName, fileSize, seriesName, seriesIndex, description FROM recent_files WHERE isDeleted = 0 ORDER BY timestamp DESC LIMIT :limit")
     fun getRecentFilesList(limit: Int): List<RecentFileSummary>
 
     @Query("DELETE FROM recent_files WHERE bookId IN (:bookIds)")
@@ -91,8 +90,59 @@ interface RecentFileDao {
     @Query("UPDATE recent_files SET isRecent = 0, lastModifiedTimestamp = :timestamp WHERE bookId IN (:bookIds)")
     suspend fun markAsNotRecent(bookIds: List<String>, timestamp: Long)
 
-    @Query("SELECT * FROM recent_files WHERE sourceFolderUri IS NOT NULL AND coverImagePath IS NULL AND isDeleted = 0")
-    suspend fun getFolderBooksWithoutCovers(): List<RecentFileEntity>
+    @Query("""
+        SELECT * FROM recent_files
+        WHERE sourceFolderUri IS NOT NULL
+        AND isDeleted = 0
+        AND type IN ('PDF', 'EPUB', 'ODT', 'FODT', 'DOCX')
+        AND folderTextMetadataParsed = 0
+    """)
+    suspend fun getFolderBooksNeedingTextMetadata(): List<RecentFileEntity>
+
+    @Query("""
+        SELECT * FROM recent_files
+        WHERE sourceFolderUri = :sourceFolderUri
+        AND isDeleted = 0
+        AND type IN ('PDF', 'EPUB', 'ODT', 'FODT', 'DOCX')
+        AND folderTextMetadataParsed = 0
+    """)
+    suspend fun getFolderBooksNeedingTextMetadata(sourceFolderUri: String): List<RecentFileEntity>
+
+    @Query("""
+        SELECT COUNT(*) FROM recent_files
+        WHERE sourceFolderUri IS NOT NULL
+        AND isDeleted = 0
+        AND type IN ('PDF', 'EPUB', 'ODT', 'FODT', 'DOCX')
+        AND folderTextMetadataParsed = 0
+    """)
+    suspend fun countFolderBooksNeedingTextMetadata(): Int
+
+    @Query("""
+        SELECT COUNT(*) FROM recent_files
+        WHERE sourceFolderUri = :sourceFolderUri
+        AND isDeleted = 0
+        AND type IN ('PDF', 'EPUB', 'ODT', 'FODT', 'DOCX')
+        AND folderTextMetadataParsed = 0
+    """)
+    suspend fun countFolderBooksNeedingTextMetadata(sourceFolderUri: String): Int
+
+    @Query("""
+        UPDATE recent_files
+        SET
+            coverImagePath = COALESCE(:coverImagePath, coverImagePath),
+            title = COALESCE(:title, title),
+            author = COALESCE(:author, author),
+            fileSize = CASE WHEN :fileSize > 0 THEN :fileSize ELSE fileSize END,
+            folderTextMetadataParsed = 1
+        WHERE bookId = :bookId
+    """)
+    suspend fun updateExtractedMetadata(
+        bookId: String,
+        coverImagePath: String?,
+        title: String?,
+        author: String?,
+        fileSize: Long
+    )
 
     @Query("UPDATE recent_files SET sourceFolderUri = NULL WHERE sourceFolderUri IS NOT NULL")
     suspend fun detachAllFolderBooks()

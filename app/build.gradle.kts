@@ -9,6 +9,7 @@ plugins {
     id("org.jetbrains.kotlin.plugin.serialization") version "2.1.20"
     alias(libs.plugins.kotlin.ksp)
     id("com.diffplug.spotless") version "8.2.1"
+    alias(libs.plugins.kover)
 }
 
 val localProperties = Properties()
@@ -24,16 +25,15 @@ kotlin {
 android {
     namespace = "com.aryan.reader"
     compileSdk = 36
-    ndkVersion = "29.0.14206865"
 
     defaultConfig {
         applicationId = "com.aryan.reader"
         minSdk = 26
         targetSdk = 35
-        versionCode = 45
-        versionName = "1.0.45"
+        versionCode = 51
+        versionName = "1.0.47"
 
-        resourceConfigurations += setOf("en", "ar", "de", "tr")
+        resourceConfigurations += setOf("en", "ar", "de", "tr", "fr", "ru")
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         externalNativeBuild {
@@ -139,9 +139,38 @@ android {
             version = "3.22.1"
         }
     }
+    testOptions {
+        unitTests.isReturnDefaultValues = true
+        unitTests.all {
+            it.jvmArgs("-Xss2m")
+        }
+    }
+    configurations {
+        named("testImplementation") {
+            exclude(group = "org.slf4j", module = "slf4j-android")
+        }
+    }
+}
+
+kover {
+    reports {
+        filters {
+            excludes {
+                classes(
+                    "*.BuildConfig",
+                    "*.ComposableSingletons*",
+                    "*_Impl",
+                    "*Database_Impl",
+                    "*Dao_Impl"
+                )
+            }
+        }
+    }
 }
 //noinspection UseTomlInstead
 dependencies {
+
+    implementation(project(":shared"))
 
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
@@ -179,7 +208,7 @@ dependencies {
     implementation("androidx.appcompat:appcompat:1.7.1")
 
     //noinspection GradleDependency (Updating these might cause the custom toolbox in pagination to break)
-    implementation("androidx.navigation:navigation-compose:2.9.2")
+    implementation("androidx.navigation:navigation-compose:2.9.6")
     //noinspection GradleDependency
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.9.2")
     //noinspection GradleDependency
@@ -208,7 +237,6 @@ dependencies {
 
     implementation("com.jakewharton.timber:timber:5.0.1")
 
-    implementation("com.tom-roush:pdfbox-android:2.0.27.0")
     implementation("me.zhanghai.android.libarchive:library:1.1.6")
 
     implementation("androidx.paging:paging-runtime-ktx:3.3.6")
@@ -236,6 +264,13 @@ dependencies {
     debugImplementation("org.tensorflow:tensorflow-lite-gpu-api:2.17.0")
 
     implementation("androidx.core:core-splashscreen:1.2.0")
+
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("io.mockk:mockk-android:1.14.9")
+    testImplementation(libs.kotlinx.coroutines.test)
+    testImplementation("org.json:json:20251224")
+    testImplementation("org.robolectric:robolectric:4.16.1")
+    testImplementation("org.slf4j:slf4j-nop:2.0.17")
 }
 
 spotless {

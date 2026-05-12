@@ -46,6 +46,8 @@ import org.jsoup.Jsoup
 import java.io.File
 import java.net.URLDecoder
 
+private const val DEBUG_CONTENT_STYLING = false
+
 @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
 class ContentStyler(
     private val baseTextStyle: TextStyle,
@@ -57,7 +59,8 @@ class ContentStyler(
     private val chapterAbsPath: String,
     private val extractionBasePath: String,
     private val userTextAlign: TextAlign?,
-    private val paragraphGapMultiplier: Float
+    private val paragraphGapMultiplier: Float,
+    private val adaptThemeColors: Boolean = true
 ) {
 
     fun style(semanticBlocks: List<SemanticBlock>): List<ContentBlock> {
@@ -163,10 +166,13 @@ class ContentStyler(
             }
 
             is SemanticMath -> {
+                val svgContent = block.svgContent
+                val nonBlankSvgContent = svgContent?.takeIf { it.isNotBlank() }
                 val finalSvgContent = when {
-                    block.isFromMathJax || block.svgContent.isNullOrBlank() -> block.svgContent
+                    block.isFromMathJax || nonBlankSvgContent == null -> svgContent
+                    !adaptThemeColors -> embedImagesInSvg(nonBlankSvgContent)
                     else -> {
-                        val themedSvg = applyThemeToSvg(block.svgContent)
+                        val themedSvg = applyThemeToSvg(nonBlankSvgContent)
                         embedImagesInSvg(themedSvg)
                     }
                 }
@@ -221,6 +227,10 @@ class ContentStyler(
     }
 
     private fun applyThemeToStyle(style: CssStyle): CssStyle {
+        if (!adaptThemeColors) {
+            return style
+        }
+
         val newSpanStyle = style.spanStyle.let { original ->
             val newColor = if (original.color.isSpecified) {
                 CssParser.adaptColorForTheme(original.color, isDarkTheme, isBackground = false, themeBackgroundColor, themeTextColor)
@@ -344,7 +354,9 @@ class ContentStyler(
         block: SemanticTextBlock,
         blockStyle: CssStyle
     ): AnnotatedString {
-        Timber.d("ContentStyler: Building annotated string. UserAlign=$userTextAlign, CSSAlign=${blockStyle.paragraphStyle.textAlign}")
+        if (DEBUG_CONTENT_STYLING) {
+            Timber.d("ContentStyler: Building annotated string. UserAlign=$userTextAlign, CSSAlign=${blockStyle.paragraphStyle.textAlign}")
+        }
 
         val builtString = buildAnnotatedString {
             val rootFontFamily = findFirstAvailableFontFamily(blockStyle.fontFamilies, fontFamilyMap)
@@ -392,7 +404,9 @@ class ContentStyler(
                 .merge(blockStyle.spanStyle)
                 .copy(fontFamily = effectiveBlockFontFamily)
 
-            Timber.d("ContentStyler: InitialSpanStyle. BaseFontSize=${baseTextStyle.fontSize}, BlockFontSize=${blockStyle.spanStyle.fontSize} -> Merged=${initialSpanStyle.fontSize}")
+            if (DEBUG_CONTENT_STYLING) {
+                Timber.d("ContentStyler: InitialSpanStyle. BaseFontSize=${baseTextStyle.fontSize}, BlockFontSize=${blockStyle.spanStyle.fontSize} -> Merged=${initialSpanStyle.fontSize}")
+            }
 
             withStyle(finalParagraphStyle) {
                 withStyle(initialSpanStyle) {
@@ -452,11 +466,11 @@ class ContentStyler(
                             }
                         }
 
-                        if (span.linkHref != null) {
-                            addStringAnnotation("URL", span.linkHref, span.start, span.end)
+                        span.linkHref?.let { linkHref ->
+                            addStringAnnotation("URL", linkHref, span.start, span.end)
                         }
-                        if (span.elementId != null) {
-                            addStringAnnotation("ID", span.elementId, span.start, span.end)
+                        span.elementId?.let { elementId ->
+                            addStringAnnotation("ID", elementId, span.start, span.end)
                         }
                     }
                 }

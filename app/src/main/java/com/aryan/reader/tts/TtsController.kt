@@ -39,6 +39,7 @@ import androidx.media3.session.SessionToken
 import com.aryan.reader.BuildConfig
 import com.aryan.reader.epubreader.loadTtsPitch
 import com.aryan.reader.epubreader.loadTtsSpeechRate
+import com.aryan.reader.isByokCloudTtsAvailable
 import com.aryan.reader.tts.TtsPlaybackManager.TtsState
 import com.google.common.util.concurrent.ListenableFuture
 import com.google.common.util.concurrent.MoreExecutors
@@ -72,7 +73,7 @@ fun loadTtsMode(context: Context): TtsPlaybackManager.TtsMode {
     val savedModeName = prefs.getString("tts_mode", TtsPlaybackManager.TtsMode.BASE.name)
         ?: TtsPlaybackManager.TtsMode.BASE.name
 
-    val isCloudAllowed = BuildConfig.TTS_WORKER_URL.isNotBlank()
+    val isCloudAllowed = BuildConfig.TTS_WORKER_URL.isNotBlank() || isByokCloudTtsAvailable(context)
 
     return if (isCloudAllowed) {
         try {
@@ -105,8 +106,14 @@ class TtsController(context: Context) : Player.Listener {
     }
 
     fun connect() {
-        if (mediaController != null || controllerFuture != null) return
+        if (mediaController != null || controllerFuture != null) {
+            Timber.tag(TTS_NOTIFICATION_DIAG_TAG).i(
+                "TtsController.connect skipped. hasController=${mediaController != null}, hasFuture=${controllerFuture != null}"
+            )
+            return
+        }
 
+        Timber.tag(TTS_NOTIFICATION_DIAG_TAG).i("TtsController.connect building MediaController.")
         val sessionToken = SessionToken(context, ComponentName(context, TtsService::class.java))
         val future = MediaController.Builder(context, sessionToken).buildAsync()
         controllerFuture = future
@@ -129,10 +136,14 @@ class TtsController(context: Context) : Player.Listener {
 
                     mediaController?.addListener(this)
                     Timber.d("MediaController connected.")
+                    Timber.tag(TTS_NOTIFICATION_DIAG_TAG).i(
+                        "MediaController connected. playbackState=${controller.playbackState}, isPlaying=${controller.isPlaying}, mediaItems=${controller.mediaItemCount}, customLayout=${controller.customLayout.size}"
+                    )
                     updateStateFromController()
                     startPolling()
                 } catch (e: Exception) {
                     Timber.w("Failed to connect MediaController: ${e.message}")
+                    Timber.tag(TTS_NOTIFICATION_DIAG_TAG).e(e, "MediaController connection failed.")
                     if (controllerFuture == future) {
                         controllerFuture = null
                     }
@@ -157,28 +168,40 @@ class TtsController(context: Context) : Player.Listener {
         bookTitle: String,
         chapterTitle: String?,
         coverImageUri: String?,
+        chapterIndex: Int? = null,
+        totalChapters: Int? = null,
+        continueSession: Boolean = false,
         ttsMode: TtsPlaybackManager.TtsMode,
         playbackSource: String = "READER",
         authToken: String? = null
     ) {
         if (chunks.isEmpty()) {
             Timber.w("TtsController: start called with empty chunks!")
+            Timber.tag(TTS_NOTIFICATION_DIAG_TAG).w("TtsController.start aborted because chunks is empty.")
             return
         }
         Timber.d("UI sending START command with mode: $ttsMode")
+        Timber.tag(TTS_NOTIFICATION_DIAG_TAG).i(
+            "TtsController.start. hasController=${mediaController != null}, chunks=${chunks.size}, continueSession=$continueSession, source=$playbackSource, mode=$ttsMode, book='${bookTitle.take(60)}', chapter='${chapterTitle.orEmpty().take(60)}', chapterIndex=$chapterIndex, totalChapters=$totalChapters"
+        )
 
         val textList = ArrayList(chunks.map { it.text })
+        val spokenTextList = ArrayList(chunks.map { it.spokenText.ifBlank { it.text } })
         val cfiList = ArrayList(chunks.map { it.sourceCfi })
         val offsetList = ArrayList(chunks.map { it.startOffsetInSource })
 
         val args = Bundle().apply {
             putStringArrayList(KEY_TEXT_CHUNKS, textList)
+            putStringArrayList(KEY_SPOKEN_TEXT_CHUNKS, spokenTextList)
             putStringArrayList(KEY_SOURCE_CFIS, cfiList)
             putIntegerArrayList(KEY_START_OFFSETS, offsetList)
             putString(KEY_SPEAKER_ID, _ttsState.value.speakerId)
             putString(KEY_BOOK_TITLE, bookTitle)
             putString(KEY_CHAPTER_TITLE, chapterTitle)
             putString(KEY_COVER_IMAGE_URI, coverImageUri)
+            chapterIndex?.let { putInt(KEY_CHAPTER_INDEX, it) }
+            totalChapters?.let { putInt(KEY_TOTAL_CHAPTERS, it) }
+            putBoolean(KEY_CONTINUE_SESSION, continueSession)
             putString(KEY_TTS_MODE, ttsMode.name)
             putString(KEY_PLAYBACK_SOURCE, playbackSource)
             putString(KEY_AUTH_TOKEN, authToken)
@@ -186,7 +209,15 @@ class TtsController(context: Context) : Player.Listener {
             putFloat("playback_pitch", loadTtsPitch(context))
         }
         Timber.tag("TTS_CLOUD_DIAG").d("TtsController sending START. Mode: $ttsMode, Chunks: ${chunks.size}, Token present: ${!authToken.isNullOrBlank()}")
-        mediaController?.sendCustomCommand(START_TTS_COMMAND, args)
+        val controller = mediaController
+        if (controller == null) {
+            Timber.tag(TTS_NOTIFICATION_DIAG_TAG).e("Cannot send START command because MediaController is null.")
+        } else {
+            val result = controller.sendCustomCommand(START_TTS_COMMAND, args)
+            Timber.tag(TTS_NOTIFICATION_DIAG_TAG).i(
+                "START command sent. playbackState=${controller.playbackState}, isPlaying=${controller.isPlaying}, mediaItems=${controller.mediaItemCount}, resultDone=${result.isDone}"
+            )
+        }
     }
 
     fun pause() {
@@ -238,6 +269,9 @@ class TtsController(context: Context) : Player.Listener {
     }
 
     override fun onEvents(player: Player, events: Player.Events) {
+        Timber.tag(TTS_NOTIFICATION_DIAG_TAG).i(
+            "Controller onEvents. playbackState=${player.playbackState}, isPlaying=${player.isPlaying}, playWhenReady=${player.playWhenReady}, mediaItems=${player.mediaItemCount}, currentIndex=${player.currentMediaItemIndex}, events=$events"
+        )
         updateStateFromController()
     }
 
@@ -245,15 +279,23 @@ class TtsController(context: Context) : Player.Listener {
         mediaController?.let { controller ->
             val customState = controller.customLayout.firstOrNull()?.extras ?: Bundle.EMPTY
             val currentMediaItem = controller.currentMediaItem
-            val currentTextFromMediaItem = currentMediaItem?.mediaMetadata?.subtitle?.toString()
+            val mediaItemExtras = currentMediaItem?.mediaMetadata?.extras
+            val currentTextFromMediaItem = mediaItemExtras?.getString("ttsText")
+                ?: currentMediaItem?.mediaMetadata?.subtitle?.toString()
             val isPlaybackActive = controller.isPlaying || controller.playbackState == Player.STATE_READY || controller.playbackState == Player.STATE_BUFFERING
             val serviceSpeaker = customState.getString("speakerId", _ttsState.value.speakerId)
             val sessionEndedByStop = customState.getBoolean("sessionEndedByStop", false)
             val isLoading = customState.getBoolean("isLoading", false)
             val sessionFinished = customState.getBoolean("sessionFinished", false)
             val playbackSource = customState.getString("playbackSource")
+            val serviceBookTitle = customState.getString("bookTitle")
+            val serviceChapterTitle = customState.getString("chapterTitle")
+            val serviceChapterIndex = customState.getInt("chapterIndex", -1).takeIf { it >= 0 }
+            val serviceTotalChapters = customState.getInt("totalChapters", -1).takeIf { it > 0 }
+            val serviceCurrentChunkIndex = customState.getInt("currentChunkIndex", -1)
+            val serviceTotalChunks = customState.getInt("totalChunks", 0)
+            val serviceBookProgressPercent = customState.getInt("bookProgressPercent", -1).takeIf { it >= 0 }
 
-            val mediaItemExtras = currentMediaItem?.mediaMetadata?.extras
             val sourceCfi = mediaItemExtras?.getString("sourceCfi")
             val startOffset = mediaItemExtras?.getInt("startOffset", -1) ?: -1
             val currentWordSourceCfi = customState.getString("currentWordSourceCfi")
@@ -270,6 +312,29 @@ class TtsController(context: Context) : Player.Listener {
                     if (isLoading) currentState.currentText else null
                 },
                 errorMessage = customState.getString("errorMessage"),
+                bookTitle = if (isPlaybackActive) {
+                    currentMediaItem?.mediaMetadata?.artist?.toString() ?: serviceBookTitle
+                } else {
+                    if (isLoading) currentState.bookTitle else serviceBookTitle
+                },
+                chapterTitle = if (isPlaybackActive || isLoading) {
+                    serviceChapterTitle ?: currentState.chapterTitle
+                } else {
+                    serviceChapterTitle
+                },
+                chapterIndex = if (isPlaybackActive || isLoading) {
+                    serviceChapterIndex ?: currentState.chapterIndex
+                } else {
+                    serviceChapterIndex
+                },
+                totalChapters = if (isPlaybackActive || isLoading) {
+                    serviceTotalChapters ?: currentState.totalChapters
+                } else {
+                    serviceTotalChapters
+                },
+                currentChunkIndex = serviceCurrentChunkIndex,
+                totalChunks = serviceTotalChunks,
+                bookProgressPercent = serviceBookProgressPercent,
                 speakerId = serviceSpeaker,
                 sourceCfi = if (isPlaybackActive) {
                     sourceCfi

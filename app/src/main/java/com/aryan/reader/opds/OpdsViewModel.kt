@@ -5,6 +5,8 @@ import android.content.Context
 import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.aryan.reader.shared.opds.SharedOpdsDownloadNamer
+import com.aryan.reader.shared.opds.SharedOpdsSearch
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -12,19 +14,10 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import okhttp3.Response
 import okhttp3.Request
 import timber.log.Timber
 import java.io.File
-
-data class OpdsScreenState(
-    val catalogs: List<OpdsCatalog> = emptyList(),
-    val currentCatalog: OpdsCatalog? = null,
-    val currentFeed: OpdsFeed? = null,
-    val isLoading: Boolean = false,
-    val errorMessage: String? = null,
-    val isViewingCatalog: Boolean = false,
-    val searchUrlTemplate: String? = null
-)
 
 class OpdsViewModel(application: Application) : AndroidViewModel(application) {
     private val repository = OpdsRepository(application)
@@ -93,16 +86,7 @@ class OpdsViewModel(application: Application) : AndroidViewModel(application) {
                     val body = response.body ?: throw Exception("Empty body")
                     val contentLength = body.contentLength()
 
-                    val ext = when (acquisition.formatName) {
-                        "EPUB" -> ".epub"
-                        "PDF" -> ".pdf"
-                        "MOBI" -> ".mobi"
-                        "FB2" -> ".fb2"
-                        "CBZ" -> ".cbz"
-                        "CBR" -> ".cbr"
-                        "TXT" -> ".txt"
-                        else -> ".epub"
-                    }
+                    val ext = resolveOpdsDownloadExtension(acquisition, response)
 
                     val safeTitle = entry.title.replace(Regex("[^a-zA-Z0-9.-]"), "_").take(50)
                     val tempFile = File(context.cacheDir, "opds_dl_${safeTitle}$ext")
@@ -146,6 +130,14 @@ class OpdsViewModel(application: Application) : AndroidViewModel(application) {
                 _downloadingState.update { it - entry.id }
             }
         }
+    }
+
+    private fun resolveOpdsDownloadExtension(acquisition: OpdsAcquisition, response: Response): String {
+        return SharedOpdsDownloadNamer.resolveExtension(
+            acquisition = acquisition,
+            contentDisposition = response.header("Content-Disposition"),
+            urlPathSegment = Uri.parse(acquisition.url).lastPathSegment
+        )
     }
 
     init {
@@ -201,17 +193,9 @@ class OpdsViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             _uiState.update { it.copy(isLoading = true, errorMessage = null) }
 
-            val template = if (!searchLink.contains("{searchTerms}")) {
-                repository.getSearchTemplate(searchLink) ?: searchLink
-            } else {
-                searchLink
-            }
-
-            val finalUrl = if (template.contains("{searchTerms}")) {
-                template.replace("{searchTerms}", Uri.encode(query))
-            } else {
-                val separator = if (template.contains("?")) "&" else "?"
-                "$template${separator}query=${Uri.encode(query)}"
+            val finalUrl = SharedOpdsSearch.buildSearchUrl(searchLink, query) { openSearchUrl ->
+                val catalog = _uiState.value.currentCatalog
+                repository.getSearchTemplate(openSearchUrl, catalog?.username, catalog?.password)
             }
 
             openFeedUrl(finalUrl)
